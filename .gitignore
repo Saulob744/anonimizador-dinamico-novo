@@ -1,0 +1,93 @@
+# ========================
+# 🔐 SEGURANÇA (CRÍTICO)
+# ========================
+.env
+.env.*
+*.env
+
+# arquivos com credenciais
+secrets.json
+credentials.json
+*.pem
+*.key
+
+# ========================
+# 🐍 PYTHON
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ambientes virtuais
+venv/
+.venv/
+env/
+ENV/
+
+# distribuição / build
+build/
+dist/
+*.egg-info/
+
+# ========================
+# 📓 JUPYTER
+# ========================
+.ipynb_checkpoints
+
+# ========================
+# 🧠 MODELOS / IA / CACHE
+# ========================
+*.model
+*.bin
+*.pt
+*.pkl
+*.joblib
+.cache/
+.spacy/
+
+# ========================
+# 🗄️ BANCO / DADOS
+# ========================
+*.db
+*.sqlite3
+*.csv
+*.parquet
+*.log
+
+# dumps de banco (SUPER IMPORTANTE)
+*.sql
+*.dump
+
+# ========================
+# 🧰 VS CODE
+# ========================
+.vscode/
+
+# ========================
+# 💻 SISTEMA OPERACIONAL
+# ========================
+.DS_Store
+Thumbs.db
+
+# ========================
+# 📦 NODE (caso use frontend)
+# ========================
+node_modules/
+
+# ========================
+# 🧪 TESTES / COBERTURA
+# ========================
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ========================
+# 📄 LOGS
+# ========================
+*.log
+
+# ========================
+# ⚠️ TEMPORÁRIOS
+# ========================
+*.tmp
+*.temp
