@@ -1,7 +1,18 @@
 import re
+import spacy
 from faker import Faker
 
 fake = Faker("pt_BR")
+
+# ========================
+# CARREGAMENTO DA IA
+# ========================
+try:
+    # Usamos o modelo Large para melhor precisão em nomes brasileiros
+    nlp = spacy.load("pt_core_news_lg")
+except Exception as e:
+    nlp = None
+    print(f"AVISO: IA (spaCy) não carregada. Usando apenas heurísticas. Erro: {e}")
 
 # ========================
 # MAPAS DE CONSISTÊNCIA
@@ -11,230 +22,144 @@ _cpf_map = {}
 _email_map = {}
 _phone_map = {}
 _generic_map = {}
-
 _person_name_cache = {}
 
 # ========================
 # CONFIGURAÇÕES
 # ========================
 SENSITIVE_KEYWORDS = [
-    "nome", "name",
-    "cpf",
-    "email",
-    "telefone", "phone", "celular",
-    "rg", "documento"
+    "nome", "name", "cpf", "email", "telefone", 
+    "phone", "celular", "rg", "documento"
 ]
 
+# Blacklist para evitar que crimes ou termos técnicos virem nomes de pessoas
 BLACKLIST_PALAVRAS = {
-    "roubo", "furto", "carro", "veículo", "rua", "avenida", 
-    "bairro", "cidade", "estado", "polícia", "delegacia", 
-    "boletim", "ocorrência", "crime", "vítima", "autor"
+    "roubo", "furto", "carro", "veículo", "rua", "avenida", "bairro", "cidade", 
+    "estado", "polícia", "delegacia", "boletim", "ocorrência", "crime", "vítima", 
+    "autor", "invasao", "domicilio", "injuria", "ameaca", "estelionato", 
+    "homicidio", "lesao", "militar", "civil", "guarnicao", "viatura"
 }
 
 # ========================
-# EXTRATOR UNIVERSAL DE PREFIXOS E PONTUAÇÃO (A MÁGICA AQUI)
+# PREFIXOS (MILITARES + CIVIS)
 # ========================
-# Captura qualquer variação de Sr, Sra, Sr(a), Dr, Dra, Prof, etc., com ou sem ponto
-PREFIX_REGEX = re.compile(r'^((?:sr|sra|sr\(a\)|senhor|senhora|dr|dra|doutor|doutora|prof|profa)\.?\s+)', re.IGNORECASE)
-# Captura qualquer pontuação grudada no final
+PATENTES = r"sd|cb|sgt|subten|ten|maj|cel|cap|asp|agent|pf|prf|senhor|senhora|sr|sra|dr|dra|prof|profa"
+PREFIX_REGEX = re.compile(rf'^((?:{PATENTES})\.?\s+)', re.IGNORECASE)
 SUFFIX_REGEX = re.compile(r'([.,;!?]+)$')
 
+# ========================
+# FUNÇÕES DE APOIO
+# ========================
 def separar_casca(texto: str):
-    """
-    Separa a string em 3 partes: Prefixo (ex: 'Sr. '), Miolo ('Carlos Eduardo') e Sufixo (ex: ',')
-    """
-    prefixo = ""
-    sufixo = ""
-    miolo = texto
-
-    # Extrai o prefixo (se existir)
+    prefixo, sufixo, miolo = "", "", texto
     match_prefix = PREFIX_REGEX.match(miolo)
     if match_prefix:
         prefixo = match_prefix.group(1)
-        miolo = miolo[len(prefixo):] # Remove o prefixo do miolo
-
-    # Extrai o sufixo (se existir)
+        miolo = miolo[len(prefixo):]
     match_suffix = SUFFIX_REGEX.search(miolo)
     if match_suffix:
         sufixo = match_suffix.group(1)
-        miolo = miolo[:-len(sufixo)] # Remove o sufixo do miolo
-
+        miolo = miolo[:-len(sufixo)]
     return prefixo, miolo, sufixo
 
-# ========================
-# NORMALIZAÇÃO
-# ========================
-def _normalize_key(value: str) -> str:
-    return value.strip().lower()
-
-# ========================
-# REGEX BÁSICOS
-# ========================
-CPF_REGEX = re.compile(r"\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\.\-]?\d{2}")
-EMAIL_REGEX = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+")
-
-_HAS_DIGIT = re.compile(r"\d")
-_VALID_NAME_WORD = re.compile(r"^[A-ZÀ-Ü][a-zà-ü]+$")
-_NAME_CONNECTOR = re.compile(r"^(de|da|do|dos|das|e)$", re.IGNORECASE)
-
-# ========================
-# DETECÇÃO DE COLUNA SENSÍVEL
-# ========================
 def is_sensitive_column(column_name: str) -> bool:
+    """Função exigida pelo main.py para classificar colunas"""
     col = column_name.lower()
     return any(k in col for k in SENSITIVE_KEYWORDS)
 
+def is_text_column_type(data_type: str) -> bool:
+    """Função exigida pelo main.py para identificar colunas de texto longo"""
+    return any(t in data_type.lower() for t in ["char", "text", "varchar"])
+
 # ========================
-# DETECÇÃO DE NOME
+# DETECÇÃO INTELIGENTE
 # ========================
 def is_person_name(value: str) -> bool:
-    if value in _person_name_cache:
-        return _person_name_cache[value]
+    if not value or value in _person_name_cache:
+        return _person_name_cache.get(value, False)
 
-    result = _check_person_name(value)
+    if not isinstance(value, str) or len(value) < 2 or re.search(r"\d", value):
+        return False
+
+    # Validação via spaCy (IA)
+    if nlp:
+        doc = nlp(value)
+        # Se a IA detectar como pessoa e não estiver na blacklist
+        result = any(ent.label_ == "PER" for ent in doc.ents) and value.lower() not in BLACKLIST_PALAVRAS
+    else:
+        # Fallback caso a IA falhe: padrão de Nome Próprio (Iniciais Maiúsculas)
+        result = bool(re.match(r"^[A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*$", value))
+    
     _person_name_cache[value] = result
     return result
 
-def _check_person_name(value: str) -> bool:
-    # Como a "casca" já foi removida antes de chamar essa função,
-    # o value aqui será sempre apenas o nome limpo (ex: "Carlos Eduardo").
-    if not isinstance(value, str):
-        return False
-
-    if len(value) < 5 or len(value) > 80:
-        return False
-
-    if _HAS_DIGIT.search(value):
-        return False
-
-    words = value.split()
-
-    if len(words) < 2 or len(words) > 4:
-        return False
-
-    valid_words = 0
-
-    for word in words:
-        if _NAME_CONNECTOR.match(word):
-            continue
-        if word.lower() in BLACKLIST_PALAVRAS:
-            return False
-        if not _VALID_NAME_WORD.match(word):
-            return False
-        valid_words += 1
-
-    return valid_words >= 2
-
 # ========================
-# FAKE GENERATORS
+# GERADORES FAKE (CONSISTENTES)
 # ========================
 def _fake_name(original: str) -> str:
-    # O original aqui já chega limpinho sem Sr. ou pontuação
-    key = _normalize_key(original)
+    key = original.strip().lower()
     if key not in _name_map:
         _name_map[key] = fake.name()
     return _name_map[key]
 
 def _fake_cpf(original: str) -> str:
-    key = _normalize_key(original)
+    key = re.sub(r"\D", "", original)
     if key not in _cpf_map:
-        cpf = re.sub(r"\D", "", fake.cpf())
-        _cpf_map[key] = cpf
+        _cpf_map[key] = re.sub(r"\D", "", fake.cpf())
     return _cpf_map[key]
 
 def _fake_email(original: str) -> str:
-    key = _normalize_key(original)
+    key = original.lower().strip()
     if key not in _email_map:
         _email_map[key] = fake.email()
     return _email_map[key]
 
 def _fake_phone(original: str) -> str:
-    key = _normalize_key(original)
+    key = re.sub(r"\D", "", original)
     if key not in _phone_map:
         _phone_map[key] = fake.phone_number()
     return _phone_map[key]
 
-def _fake_generic(original: str) -> str:
-    key = _normalize_key(original)
-    if key not in _generic_map:
-        _generic_map[key] = fake.word()
-    return _generic_map[key]
-
 # ========================
-# ANONIMIZAÇÃO DIRETA (Tabelas e Colunas)
+# INTERFACE COM O MAIN
 # ========================
 def anonymize_value(column_name: str, value):
-    if value is None:
-        return None
+    if value is None: return None
+    val_str = str(value)
+    col_lower = column_name.lower()
 
-    val = str(value)
-    col = column_name.lower()
+    # CPFs e Emails diretos
+    if re.fullmatch(r"\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\.\-]?\d{2}", val_str): return _fake_cpf(val_str)
+    if "@" in val_str and "." in val_str: return _fake_email(val_str)
 
-    if CPF_REGEX.fullmatch(val): return _fake_cpf(val)
-    if EMAIL_REGEX.fullmatch(val): return _fake_email(val)
-    if "telefone" in col or "phone" in col: return _fake_phone(val)
-
-    # Aplica o separador de casca mesmo para valores diretos na coluna
-    prefixo, miolo, sufixo = separar_casca(val)
+    # Nomes com patentes/prefixos
+    prefixo, miolo, sufixo = separar_casca(val_str)
     if is_person_name(miolo):
         return prefixo + _fake_name(miolo) + sufixo
 
-    if is_sensitive_column(col): return _fake_generic(val)
+    # Se for coluna sensível mas não caiu em nome (ex: RG)
+    if is_sensitive_column(column_name):
+        key = val_str.lower().strip()
+        if key not in _generic_map: _generic_map[key] = fake.word()
+        return _generic_map[key]
 
     return value
 
-# ========================
-# ANONIMIZAÇÃO DE TEXTO LONGO (Relatos)
-# ========================
 def anonymize_text_value(value):
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        return value
+    if not isinstance(value, str) or not value: return value
 
-    text = value
+    # 1. Regex para CPF e Email
+    text = re.sub(r"\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\.\-]?\d{2}", lambda m: _fake_cpf(m.group()), value)
+    
+    # 2. IA para nomes em textos
+    if nlp:
+        doc = nlp(text)
+        # Ordenamos por tamanho para não substituir nomes parciais dentro de nomes maiores
+        ents = sorted([e for e in doc.ents if e.label_ == "PER"], key=lambda x: len(x.text), reverse=True)
+        for ent in ents:
+            if ent.text.lower() not in BLACKLIST_PALAVRAS:
+                # Mantém pontuação e prefixos se a IA pegou junto
+                pref, mio, suf = separar_casca(ent.text)
+                text = text.replace(ent.text, pref + _fake_name(mio) + suf)
 
-    text = re.sub(CPF_REGEX, lambda m: _fake_cpf(m.group()), text)
-    text = re.sub(EMAIL_REGEX, lambda m: _fake_email(m.group()), text)
-
-    words = text.split()
-    new_words = []
-
-    i = 0
-    while i < len(words):
-
-        matched = False
-        
-        # Aumentamos para 5 para cobrir casos de nomes grandes (4 palavras + 1 prefixo)
-        for window_size in [5, 4, 3, 2]:
-            if i + (window_size - 1) < len(words):
-                candidate_raw = " ".join(words[i:i+window_size])
-                
-                # Desmonta a string: Tira o Sr., o nome, e a pontuação
-                prefixo, miolo, sufixo = separar_casca(candidate_raw)
-                
-                # Valida apenas o nome limpo
-                if is_person_name(miolo):
-                    fake_n = _fake_name(miolo)
-                    
-                    # Remonta perfeitamente e adiciona no texto
-                    new_words.append(prefixo + fake_n + sufixo)
-                    i += window_size
-                    matched = True
-                    break
-        
-        if matched:
-            continue
-
-        new_words.append(words[i])
-        i += 1
-
-    return " ".join(new_words)
-
-# ========================
-# TIPO DE TEXTO
-# ========================
-def is_text_column_type(data_type: str) -> bool:
-    return any(t in data_type.lower() for t in ["char", "text", "varchar"])
-
-
+    return text
