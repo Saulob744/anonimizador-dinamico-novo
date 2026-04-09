@@ -26,7 +26,7 @@ def connect(url: str) -> Engine:
 # =========================================
 # DATABASE
 # =========================================
-def create_database_if_not_exists(server_url: str, db_name: str) -> None:
+def recreate_database_if_not_exists(server_url: str, db_name: str) -> None:
     engine = create_engine(server_url, isolation_level="AUTOCOMMIT")
 
     with engine.connect() as conn:
