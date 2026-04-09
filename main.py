@@ -2,7 +2,6 @@ import logging
 import sys
 from tqdm import tqdm
 
-
 from config import (
     get_source_url,
     get_dest_url,
@@ -14,6 +13,7 @@ from config import (
 from db_utils import (
     connect,
     create_database_if_not_exists,
+    get_user_schemas,  # Nova importação
     get_tables,
     get_table_info,
     build_dependency_graph,
@@ -48,7 +48,7 @@ CHUNK_SIZE = 500
 # =========================================
 def print_banner():
     print("\n" + "=" * 60)
-    print("   Anonimizador de Banco de Dados PostgreSQL")
+    print("  Anonimizador de Banco de Dados PostgreSQL (Multi-Schema)")
     print("=" * 60 + "\n")
 
 
@@ -81,27 +81,28 @@ def anonymize_row(
 def process_table(
     source_engine,
     dest_engine,
+    schema: str,
     table_name: str,
     sensitive_columns: list[str],
     text_scan_columns: list[str],
 ) -> int:
-    total = get_row_count(source_engine, table_name)
+    total = get_row_count(source_engine, table_name, schema)
 
     if total == 0:
-        logger.info(f"  Tabela '{table_name}': vazia, pulando.")
+        logger.info(f"  Tabela '{schema}.{table_name}': vazia, pulando.")
         return 0
 
     processed = 0
 
     with tqdm(
         total=total,
-        desc=f"  {table_name}",
+        desc=f"  {schema}.{table_name}",
         unit="reg",
-        ncols=70,
+        ncols=80,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]",
     ) as pbar:
 
-        for chunk in fetch_rows_chunked(source_engine, table_name, CHUNK_SIZE):
+        for chunk in fetch_rows_chunked(source_engine, table_name, schema, CHUNK_SIZE):
 
             anon_rows = []
             for row in chunk:
@@ -115,7 +116,7 @@ def process_table(
                 except Exception as e:
                     logger.warning(f"Erro ao anonimizar linha: {e}")
 
-            insert_rows(dest_engine, table_name, anon_rows)
+            insert_rows(dest_engine, table_name, schema, anon_rows)
 
             processed += len(anon_rows)
             pbar.update(len(anon_rows))
@@ -202,66 +203,80 @@ def main():
         logger.error(f"Erro na conexão destino: {e}")
         sys.exit(1)
 
-    # 🔹 Copiar schema
-    try:
-        logger.info("Copiando estrutura do banco...")
-        copy_schema(source_engine, dest_engine)
-        logger.info("Estrutura copiada\n")
-    except Exception as e:
-        logger.error(f"Erro ao copiar schema: {e}")
-        sys.exit(1)
-
-    # 🔹 Ordenação
-    tables = get_tables(source_engine)
-    ordered_tables = build_dependency_graph(source_engine, tables)
-
-    logger.info(f"Tabelas encontradas: {len(ordered_tables)}")
-    logger.info(f"Ordem: {', '.join(ordered_tables)}\n")
-
-    # 🔹 Classificação
-    sensitive_map = {}
-    text_scan_map = {}
-
-    for table in ordered_tables:
-        info = get_table_info(source_engine, table)
-
-        sensitive, text_scan = classify_columns(info)
-
-        sensitive_map[table] = sensitive
-        text_scan_map[table] = text_scan
-
-        logger.info(
-            f"{table} -> sensiveis={len(sensitive)} | texto={len(text_scan)}"
-        )
-
-    print()
-
-    # 🔹 Execução
-    logger.info("Iniciando anonimização...\n")
-
+    # 🔹 Desabilitar FKs no destino antes de começar as inserções globais
     disable_fk_constraints(dest_engine)
+
+    # 🔹 Obter Schemas
+    schemas = get_user_schemas(source_engine)
+    if not schemas:
+        logger.warning("Nenhum schema de usuário encontrado no banco de origem.")
+        sys.exit(0)
+    
+    logger.info(f"Schemas encontrados: {', '.join(schemas)}\n")
 
     total_records = 0
     failed_tables = []
 
-    for table in ordered_tables:
+    # 🔹 Processamento Iterativo por Schema
+    for current_schema in schemas:
+        print("\n" + "-" * 50)
+        logger.info(f"INICIANDO PROCESSAMENTO DO SCHEMA: '{current_schema}'")
+        print("-" * 50)
+
+        # Copiar schema
         try:
-            count = process_table(
-                source_engine,
-                dest_engine,
-                table,
-                sensitive_map.get(table, []),
-                text_scan_map.get(table, []),
-            )
-            total_records += count
-
+            logger.info(f"Copiando estrutura do schema '{current_schema}'...")
+            copy_schema(source_engine, dest_engine, current_schema)
+            logger.info("Estrutura copiada\n")
         except Exception as e:
-            logger.error(f"Erro na tabela '{table}': {e}")
-            failed_tables.append(table)
+            logger.error(f"Erro ao copiar schema '{current_schema}': {e}")
+            continue
 
+        # Ordenação
+        tables = get_tables(source_engine, current_schema)
+        ordered_tables = build_dependency_graph(source_engine, tables, current_schema)
+
+        logger.info(f"Tabelas encontradas no schema '{current_schema}': {len(ordered_tables)}")
+        
+        # Classificação
+        sensitive_map = {}
+        text_scan_map = {}
+
+        for table in ordered_tables:
+            info = get_table_info(source_engine, table, current_schema)
+
+            sensitive, text_scan = classify_columns(info)
+
+            sensitive_map[table] = sensitive
+            text_scan_map[table] = text_scan
+
+            logger.info(
+                f"{current_schema}.{table} -> sensiveis={len(sensitive)} | texto={len(text_scan)}"
+            )
+
+        print()
+        logger.info(f"Iniciando anonimização do schema '{current_schema}'...\n")
+
+        # Execução das tabelas no schema atual
+        for table in ordered_tables:
+            try:
+                count = process_table(
+                    source_engine,
+                    dest_engine,
+                    current_schema,
+                    table,
+                    sensitive_map.get(table, []),
+                    text_scan_map.get(table, []),
+                )
+                total_records += count
+
+            except Exception as e:
+                logger.error(f"Erro na tabela '{current_schema}.{table}': {e}")
+                failed_tables.append(f"{current_schema}.{table}")
+
+    # 🔹 Finalização e reabilitação de constraints
     enable_fk_constraints(dest_engine)
 
-    # 🔹 Final
     print("\n" + "=" * 60)
     logger.info("FINALIZADO")
     logger.info(f"Registros processados: {total_records}")
@@ -270,13 +285,12 @@ def main():
     if failed_tables:
         logger.warning(f"Tabelas com erro: {failed_tables}")
     else:
-        logger.info("Tudo processado com sucesso")
+        logger.info("Tudo processado com sucesso!")
 
     print("=" * 60 + "\n")
 
     source_engine.dispose()
     dest_engine.dispose()
-    
 
 
 if __name__ == "__main__":

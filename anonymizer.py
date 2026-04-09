@@ -26,7 +26,6 @@ _first_name_map = {} # Vínculo: 'Roberto' -> 'Clarice'
 _cpf_map = {}
 _email_map = {}
 _phone_map = {}
-_generic_map = {}
 _person_name_cache = {}
 
 # ========================
@@ -94,41 +93,30 @@ def is_person_name(value: str) -> bool:
     return result
 
 # ========================
-# GERADORES FAKE (CORRIGIDO)
+# GERADORES FAKE
 # ========================
 def _fake_name(original: str) -> str:
-    """Garante sincronia total entre nomes completos e primeiros nomes."""
-    # 1. Normalização rigorosa
     clean_original = " ".join(original.strip().split())
     key = clean_original.lower()
     parts = clean_original.split()
     first_name_orig = parts[0].lower()
 
-    # 2. Se o nome COMPLETO já existe no mapa, retorna ele
     if key in _name_map:
         return _name_map[key]
 
-    # 3. Se o PRIMEIRO NOME já foi mapeado antes (através de um nome completo)
     if first_name_orig in _first_name_map:
         fake_first = _first_name_map[first_name_orig]
-        
-        # Se o input era só o primeiro nome, retorna o fake_first
         if len(parts) == 1:
             return fake_first
-        
-        # Se for nome completo, usa o primeiro nome já conhecido e gera um novo sobrenome
         new_full_name = f"{fake_first} {fake.last_name()}"
         _name_map[key] = new_full_name
         return new_full_name
 
-    # 4. Se é um nome totalmente novo:
     new_first = fake.first_name()
     new_last = fake.last_name()
     new_full = f"{new_first} {new_last}"
     
-    # Registra o vínculo do primeiro nome para usos futuros
     _first_name_map[first_name_orig] = new_first
-    # Registra o nome completo
     _name_map[key] = new_full
     
     return new_first if len(parts) == 1 else new_full
@@ -138,6 +126,18 @@ def _fake_cpf(original: str) -> str:
     if key not in _cpf_map:
         _cpf_map[key] = re.sub(r"\D", "", fake.cpf())
     return _cpf_map[key]
+
+def _fake_email(original: str) -> str:
+    key = original.lower().strip()
+    if key not in _email_map:
+        _email_map[key] = fake.company_email()
+    return _email_map[key]
+
+def _fake_phone(original: str) -> str:
+    key = re.sub(r"\D", "", original)
+    if key not in _phone_map:
+        _phone_map[key] = re.sub(r"\D", "", fake.cellphone_number())
+    return _phone_map[key]
 
 # ========================
 # INTERFACE COM O MAIN
@@ -156,9 +156,17 @@ def anonymize_value(column_name: str, value):
     if is_person_name(miolo):
         return prefixo + _fake_name(miolo) + sufixo
 
+    # CORREÇÃO: Direciona o fake correto dependendo do nome da coluna
     if is_sensitive_column(column_name):
-        # Evita o erro 'corrupti' gerando um nome humano para colunas sensíveis
-        return _fake_name(val_str)
+        col_lower = column_name.lower()
+        if "email" in col_lower:
+            return _fake_email(val_str)
+        elif any(k in col_lower for k in ["telefone", "phone", "celular"]):
+            return _fake_phone(val_str)
+        elif any(k in col_lower for k in ["rg", "documento"]):
+            return fake.bban() # Gera um doc genérico
+        else:
+            return _fake_name(val_str)
 
     return value
 
@@ -176,9 +184,7 @@ def anonymize_text_value(value):
             original_ent = ent.text
             if original_ent.lower() not in BLACKLIST_PALAVRAS and original_ent.lower() not in TERMOS_PROIBIDOS:
                 pref, mio, suf = separar_casca(original_ent)
-                # O _fake_name agora garante a consistência entre 'Roberto Almeida' e 'Roberto'
                 nome_fake = pref + _fake_name(mio) + suf
-                # Substituição com \b para garantir que troque palavras exatas
                 text = re.sub(rf"\b{re.escape(original_ent)}\b", nome_fake, text, flags=re.IGNORECASE)
 
     # 3. Camada Final (Patentes)
