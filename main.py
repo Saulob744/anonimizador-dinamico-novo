@@ -1,208 +1,153 @@
 import logging
 import sys
+import sqlalchemy as sa
 from tqdm import tqdm
+from config import get_source_url, get_dest_url, get_server_url, get_dest_db_name, get_source_db_name
+import db_utils
+import anonymizer
 
-from config import (
-    get_source_url,
-    get_dest_url,
-    get_server_url,
-    get_dest_db_name,
-    get_source_db_name,
-)
-
-from db_utils import (
-    connect,
-    recreate_database_if_not_exists,  # Nome padronizado conforme db_utils atualizado
-    get_user_schemas,
-    get_tables,
-    get_table_info,
-    build_dependency_graph,
-    copy_schema,
-    get_row_count,
-    fetch_rows_chunked,
-    insert_rows,
-    disable_fk_constraints,
-    enable_fk_constraints,
-)
-
-# Importação conforme a nova estrutura do anonymizer.py
-from anonymizer import (
-    anonymize_value,
-    anonymize_text_value,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 500
+CHUNK_SIZE = 1000
 
-def print_banner():
-    print("\n" + "=" * 60)
-    print("   Anonimizador Inteligente PostgreSQL (IA + PoS Tagging)")
-    print("=" * 60 + "\n")
-
-# =========================================
-# ANONIMIZAÇÃO DE LINHA
-# =========================================
-def anonymize_row(row: dict, column_treatments: dict) -> dict:
-    result = dict(row)
-
-    for col, treatment in column_treatments.items():
-        if result[col] is None or treatment == "SKIP":
-            continue
-            
-        # O tratamento agora é decidido pela inteligência do anonymizer
-        if treatment == "TEXT_SCAN":
-            # Para campos de texto livre (IA e Gramática)
-            result[col] = anonymize_text_value(result[col])
-        elif treatment == "ANONYMIZE":
-            # Para campos diretos (Nome, CPF isolado)
-            result[col] = anonymize_value(col, result[col])
-
-    return result
-
-# =========================================
-# PROCESSAMENTO DE TABELA
-# =========================================
-def process_table(
-    source_engine,
-    dest_engine,
-    schema: str,
-    table_name: str,
-    column_treatments: dict,
-) -> int:
-    total = get_row_count(source_engine, table_name, schema)
-    if total == 0:
-        return 0
-
-    processed = 0
-    with tqdm(
-        total=total,
-        desc=f"   {schema}.{table_name}",
-        unit="reg",
-        ncols=80,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]",
-    ) as pbar:
-
-        for chunk in fetch_rows_chunked(source_engine, table_name, schema, CHUNK_SIZE):
-            anon_rows = []
-            for row in chunk:
-                try:
-                    # O tratamento é baseado no mapeamento prévio das colunas
-                    anon = anonymize_row(dict(row), column_treatments)
-                    anon_rows.append(anon)
-                except Exception as e:
-                    logger.warning(f"Erro na linha de {table_name}: {e}")
-
-            if anon_rows:
-                insert_rows(dest_engine, table_name, schema, anon_rows)
-            
-            processed += len(anon_rows)
-            pbar.update(len(anon_rows))
-
-    return processed
-
-# =========================================
-# CLASSIFICAÇÃO DE COLUNAS
-# =========================================
 def classify_columns(info: dict) -> dict:
-    """
-    Decide o tratamento de cada coluna.
-    """
+    """Mapeia o que deve ser feito com cada coluna da tabela."""
     pk_cols = set(info["primary_keys"])
     fk_cols = set()
     for fk in info["foreign_keys"]:
         fk_cols.update(fk.get("constrained_columns", []))
 
-    excluded = pk_cols | fk_cols
     treatments = {}
-
     for col in info["columns"]:
-        col_name = col["name"]
-        col_type = str(col.get("type", "")).lower()
+        name = col["name"]
+        ctype = str(col["type"]).lower()
 
-        if col_name in excluded:
-            treatments[col_name] = "SKIP"
-            continue
-
-        # Se for texto (TEXT, VARCHAR, etc), usamos o SCAN inteligente
-        if any(t in col_type for t in ["text", "char", "varying"]):
-            treatments[col_name] = "TEXT_SCAN"
-        # Para outros tipos, tentamos a anonimização direta
+        # 1. Ignorar campos de Data, Hora e Booleanos (Evita o DatetimeFieldOverflow)
+        if any(t in ctype for t in ["date", "time", "timestamp", "bool"]):
+            treatments[name] = "SKIP"
+            
+        # 2. Textos passam pela Inteligência Artificial
+        elif any(t in ctype for t in ["char", "text", "varying"]):
+            treatments[name] = "TEXT_SCAN"
+            
+        # 3. Outros campos (Inteiros, IDs, etc) passam pela anonimização direta
         else:
-            treatments[col_name] = "ANONYMIZE"
-
+            treatments[name] = "ANONYMIZE"
+            
     return treatments
 
-# =========================================
-# MAIN
-# =========================================
-def main():
-    print_banner()
+def process_row_anon(row: dict, treatments: dict) -> dict:
+    """Aplica as regras de anonimização em uma única linha."""
+    new_row = dict(row)
+    for col, method in treatments.items():
+        if new_row[col] is None or method == "SKIP":
+            continue
+        
+        if method == "TEXT_SCAN":
+            new_row[col] = anonymizer.anonymize_text_value(str(new_row[col]))
+        elif method == "ANONYMIZE":
+            new_row[col] = anonymizer.anonymize_value(col, new_row[col])
+            
+    return new_row
 
+def run_pipeline(mode: str):
+    """Executa o pipeline principal com base na escolha do usuário."""
     source_url = get_source_url()
     dest_url = get_dest_url(source_url)
-    server_url = get_server_url(source_url)
-    dest_db_name = get_dest_db_name(source_url)
-    source_db_name = get_source_db_name(source_url)
-
-    logger.info(f"Banco origem  : {source_db_name}")
-    logger.info(f"Banco destino : {dest_db_name}\n")
-
-    source_engine = connect(source_url)
-
-    # RECRIA O BANCO (Função agora encerra conexões e limpa o destino)
+    
+    logger.info("Iniciando conexão com os bancos...")
+    src_engine = db_utils.connect(source_url)
+    
     try:
-        recreate_database_if_not_exists(server_url, dest_db_name)
+        db_utils.recreate_database_if_not_exists(get_server_url(source_url), get_dest_db_name(source_url))
     except Exception as e:
-        logger.error(f"Erro ao recriar banco: {e}")
+        logger.error(f"Erro ao recriar banco de destino: {e}")
         sys.exit(1)
+        
+    dest_engine = db_utils.connect(dest_url)
+
+    # 1. Desliga FKs para inserção ultra-rápida (PostgreSQL)
+    db_utils.set_replication_mode(dest_engine, 'replica')
+
+    schemas = db_utils.get_user_schemas(src_engine)
     
-    dest_engine = connect(dest_url)
-    disable_fk_constraints(dest_engine)
-
-    schemas = get_user_schemas(source_engine)
-    
-    total_records = 0
-    failed_tables = []
-
-    for current_schema in schemas:
-        logger.info(f">>> PROCESSANDO SCHEMA: '{current_schema}'")
-        copy_schema(source_engine, dest_engine, current_schema)
-
-        tables = get_tables(source_engine, current_schema)
-        ordered_tables = build_dependency_graph(source_engine, tables, current_schema)
+    for schema in schemas:
+        # 1. Pega as tabelas PRIMEIRO
+        tables = db_utils.get_tables(src_engine, schema)
+        
+        # 2. O PULO DO GATO: Se o schema estiver vazio, ignora e vai para o próximo
+        if not tables:
+            logger.info(f"Ignorando Schema '{schema}' (Vazio na origem).")
+            continue
+            
+        # 3. Se tem tabelas, aí sim a gente cria a estrutura no destino
+        logger.info(f"Copiando estrutura do Schema '{schema}'...")
+        db_utils.copy_schema(src_engine, dest_engine, schema)
+        
+        ordered_tables = db_utils.build_dependency_graph(src_engine, tables, schema)
 
         for table in ordered_tables:
-            info = get_table_info(source_engine, table, current_schema)
-            column_treatments = classify_columns(info)
+            logger.info(f"Processando Tabela: {schema}.{table} | Modo: {mode}")
+            
+            with src_engine.connect() as conn:
+                total_rows = conn.execute(sa.text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')).scalar()
+                
+            if total_rows == 0:
+                continue
+                
+            info = db_utils.get_table_info(src_engine, table, schema)
+            treatments = classify_columns(info)
 
-            try:
-                count = process_table(
-                    source_engine,
-                    dest_engine,
-                    current_schema,
-                    table,
-                    column_treatments,
-                )
-                total_records += count
-            except Exception as e:
-                logger.error(f"Falha técnica em {current_schema}.{table}: {e}")
-                failed_tables.append(f"{current_schema}.{table}")
+            with tqdm(total=total_rows, desc=table, unit="reg", ncols=80) as pbar:
+                # Streaming em lotes (Chunks)
+                for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, CHUNK_SIZE):
+                    
+                    if mode == "MIGRATE_ONLY":
+                        # Cópia Fiel: Apenas converte para dicionário e envia
+                        final_rows = [dict(row) for row in chunk]
+                    else:
+                        # Full Pipeline: Anonimiza linha por linha
+                        final_rows = [process_row_anon(dict(row), treatments) for row in chunk]
+                        
+                    db_utils.insert_rows(dest_engine, table, schema, final_rows)
+                    pbar.update(len(final_rows))
 
-    enable_fk_constraints(dest_engine)
-    logger.info(f"FINALIZADO. Total de registros: {total_records}")
+    # 2. Religa restrições de FKs no final
+    db_utils.set_replication_mode(dest_engine, 'origin')
+    
+    # 3. FAXINA FINAL: Remove o schema 'public' gerado por padrão pelo PostgreSQL se ele estiver vazio
+    try:
+        insp_dest = sa.inspect(dest_engine)
+        if 'public' in insp_dest.get_schema_names():
+            tables_in_public = insp_dest.get_table_names(schema='public')
+            if not tables_in_public:
+                with dest_engine.begin() as conn:
+                    conn.execute(sa.text("DROP SCHEMA public;"))
+                logger.info("🗑️ Schema 'public' nativo (vazio) foi removido do destino.")
+    except Exception as e:
+        logger.warning(f"Não foi possível remover o schema public vazio: {e}")
 
-    if failed_tables:
-        logger.warning(f"Tabelas com erro: {failed_tables}")
-
-    source_engine.dispose()
+    logger.info("🎉 Operação finalizada com sucesso!")
+    
+    src_engine.dispose()
     dest_engine.dispose()
 
 if __name__ == "__main__":
-    main()
+    print("\n" + "=" * 50)
+    print(" 🛡️ AEGIS TOOLKIT - Dados Seguros & Migração")
+    print("=" * 50)
+    print("1. Migração Pura (Cópia fiel de um banco para outro)")
+    print("2. Pipeline Completo (Copiar + Aplicar Anonimização IA)")
+    print("=" * 50)
+    
+    escolha = input("Selecione uma opção (1 ou 2): ").strip()
+    
+    if escolha == '1':
+        print("\n🚀 Iniciando MODO CÓPIA RÁPIDA...\n")
+        run_pipeline(mode="MIGRATE_ONLY")
+    elif escolha == '2':
+        print("\n🎭 Iniciando MODO ANONIMIZAÇÃO COMPLETA...\n")
+        run_pipeline(mode="FULL_ANON")
+    else:
+        print("\n❌ Opção inválida. Encerrando.")

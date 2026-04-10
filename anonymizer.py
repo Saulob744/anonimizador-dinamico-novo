@@ -2,7 +2,6 @@ import re
 import spacy
 import random
 import string
-from datetime import datetime, date
 from faker import Faker
 
 fake = Faker("pt_BR")
@@ -11,56 +10,65 @@ fake = Faker("pt_BR")
 # CARREGAMENTO DA IA
 # ========================
 try:
-    nlp = spacy.load("pt_core_news_lg")
+    # Manter o tagger ativado (removido do disable) para ele saber a diferença entre Substantivo e Nome Próprio
+    nlp = spacy.load("pt_core_news_lg", disable=["parser", "lemmatizer", "textcat"])
 except Exception as e:
     nlp = None
-    print(f"ERRO: Modelo spaCy não encontrado.")
+    print(f"AVISO: Modelo spaCy não encontrado. A detecção de nomes será limitada. Erro: {e}")
 
 # ========================
-# MAPAS DE MEMÓRIA (Persistência Global)
+# MAPAS DE MEMÓRIA (Cache de Consistência)
 # ========================
 _name_map = {}
 _first_name_map = {}
 _cpf_map = {}
-_universal_fake_map = {} # Cache para Chassis, Placas e IDs
+_universal_fake_map = {}
+_used_fakes = set() 
 
 # ========================
 # REGEX DE SEGURANÇA
 # ========================
 CPF_REGEX = re.compile(r"\b\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\.\-]?\d{2}\b")
-# Detecta Chassis/Placas: Sequências de 5+ chars que misturam letras e números
-ALFANUMERICO_REGEX = re.compile(r'\b(?=[A-Z]*\d)(?=[\d]*[A-Z])[A-Z\d]{5,}\b', re.IGNORECASE)
+ID_UNIVERSAL_REGEX = re.compile(r'\b(?=.*[0-9])[a-zA-Z0-9\.\-/]{5,}\b')
 PATENTES_PREFIXO = r"sd|cb|sgt|subten|ten|maj|cel|cap|asp|agent|pf|prf|inspetor|sr|dra?|prof"
+UUID_REGEX = re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b')
+HASH_REGEX = re.compile(r'\b[0-9a-fA-F]{32}\b|\b[0-9a-fA-F]{40}\b|\b[0-9a-fA-F]{64}\b')
 
 # ========================
-# CÉREBRO DE GERAÇÃO FAKE
+# GERAÇÃO FAKE & ANTI-COLISÃO
 # ========================
-
-def get_dynamic_fake(original_val: str) -> str:
-    """
-    Anonimiza IDs, Chassis e Placas mantendo o formato original.
-    Ex: 9C2-KF3 -> 4R1-HG8
-    """
-    key = str(original_val).strip().upper()
+def get_dynamic_id(original_val: str) -> str:
+    val_str = str(original_val).strip()
+    if len(val_str) < 3: return val_str
+    
+    key = f"ID_{val_str.upper()}"
     if key in _universal_fake_map:
         return _universal_fake_map[key]
     
-    fake_val = ""
-    for char in str(original_val):
-        if char.isalpha():
-            fake_val += random.choice(string.ascii_uppercase)
-        elif char.isdigit():
-            fake_val += random.choice(string.digits)
-        else:
-            fake_val += char
+    while True:
+        fake_val = ""
+        for char in val_str:
+            if char.isalpha():
+                if char.isupper():
+                    fake_val += random.choice(string.ascii_uppercase)
+                else:
+                    fake_val += random.choice(string.ascii_lowercase)
+            elif char.isdigit():
+                fake_val += random.choice(string.digits)
+            else:
+                fake_val += char
+                
+        if fake_val not in _used_fakes:
+            _used_fakes.add(fake_val)
+            break
             
     _universal_fake_map[key] = fake_val
     return fake_val
 
 def _fake_name(original: str) -> str:
-    if not original or len(original) < 2: return original
+    if not original or len(original) < 3: return original
     clean_orig = " ".join(original.strip().split())
-    key = clean_orig.lower()
+    key = f"NAME_{clean_orig.lower()}"
     
     if key in _name_map: return _name_map[key]
 
@@ -84,60 +92,65 @@ def _fake_cpf(original: str) -> str:
     return _cpf_map[digits]
 
 # ========================
-# MOTOR DE ANÁLISE GRAMATICAL
+# RADARES DE CONTEÚDO
 # ========================
+def is_standalone_code(val_str: str) -> bool:
+    if val_str.count(' ') > 1: return False 
+    length = len(val_str)
+    has_digit = any(c.isdigit() for c in val_str)
+    has_alpha = any(c.isalpha() for c in val_str)
+    if length >= 16 and not val_str.isspace(): return True
+    if length >= 5 and has_digit and has_alpha: return True
+    if length >= 8 and has_digit and not has_alpha: return True
+    return False
 
-def is_actually_a_person(ent_text, ent_doc_part):
-    # Se contém números, não é uma pessoa (provavelmente chassi ou placa)
-    if any(char.isdigit() for char in ent_text): return False
+def is_false_positive_person(ent_text: str) -> bool:
+    """
+    Converte para minúsculo para forçar a IA a usar o dicionário gramatical.
+    Ex: 'Fuzil' -> 'fuzil' (Substantivo Comum / NOUN).
+    Ex: 'Livia' -> 'livia' (Nome Próprio / PROPN).
+    """
+    if not nlp: return False
+    doc_lower = nlp(ent_text.lower())
     
-    has_proper_noun = any(token.pos_ == "PROPN" for token in ent_doc_part)
-    is_common_object = all(token.pos_ == "NOUN" and not token.text[0].isupper() for token in ent_doc_part)
-    
-    if is_common_object and not has_proper_noun: return False
-    if len(ent_text) < 3 and not ent_text.isupper(): return False
-        
-    return True
-
-# ========================
-# LÓGICA DE PROCESSAMENTO DE TEXTO
-# ========================
+    # Se não houver NENHUM Nome Próprio na palavra em minúsculo, é porque era um objeto.
+    has_propn = any(token.pos_ == "PROPN" for token in doc_lower)
+    return not has_propn
 
 def anonymize_text_value(value):
     if not value or not isinstance(value, str): return value
 
-    # 1. NOVO: Padrões Alfanuméricos (Chassis, Placas, IDs)
-    # Detecta e troca mantendo o formato sem precisar de listas
-    value = ALFANUMERICO_REGEX.sub(lambda m: get_dynamic_fake(m.group()), value)
+    value = HASH_REGEX.sub(lambda m: get_dynamic_id(m.group()), value)
+    value = UUID_REGEX.sub(lambda m: get_dynamic_id(m.group()), value)
+    value = ID_UNIVERSAL_REGEX.sub(lambda m: get_dynamic_id(m.group()), value)
 
-    # 2. Inteligência de IA para Nomes
-    work_text = value.title() if value.isupper() else value
-    if nlp:
+    if nlp and any(c.isupper() for c in value):
+        # Transforma "FUZIL" em "Fuzil" para a IA analisar
+        work_text = value.title() if value.isupper() else value
         doc = nlp(work_text)
-        ents = sorted(doc.ents, key=lambda x: x.start_char, reverse=True)
-        for ent in ents:
-            if ent.label_ == "PER":
-                orig_segment = value[ent.start_char:ent.end_char]
-                if is_actually_a_person(orig_segment, ent):
-                    value = value[:ent.start_char] + _fake_name(orig_segment) + value[ent.end_char:]
+        
+        # Processa de trás pra frente
+        for ent in reversed(doc.ents):
+            if ent.label_ == "PER" and not any(c.isdigit() for c in ent.text):
+                
+                # NOVO: O filtro passa a prova real na palavra
+                if is_false_positive_person(ent.text):
+                    continue # Descobriu que era um objeto disfarçado de pessoa. Pula!
+                    
+                value = value[:ent.start_char] + _fake_name(ent.text) + value[ent.end_char:]
 
-    # 3. NOVO: Fallback para Prefixos de Negócio (ENVOLVIDO - , NOME: )
-    # Trata nomes que a IA ignora por estarem colados em hifens
     business_prefixes = ["ENVOLVIDO - ", "AUTOR - ", "VITIMA - ", "NOME: ", "NOME - "]
     for pref in business_prefixes:
         if pref.upper() in value.upper():
-            # Regex para pegar o nome após o prefixo até encontrar um separador de campo
             regex_pref = rf"(?i)({re.escape(pref)})([\w\sÀ-Üà-ü]+?)(?=\s{{2,}}|$|\n)"
             def replace_pref(match):
                 p_encontrado = match.group(1)
                 nome_potencial = match.group(2).strip()
-                # Valida se não é uma palavra de sistema (ex: FURTO)
                 if len(nome_potencial) > 3 and not any(x in nome_potencial.upper() for x in ["FURTO", "SIMPLES", "VEICULO"]):
                     return f"{p_encontrado}{_fake_name(nome_potencial)}"
                 return match.group(0)
             value = re.compile(regex_pref).sub(replace_pref, value)
 
-    # 4. CPFs e Patentes
     value = CPF_REGEX.sub(lambda m: _fake_cpf(m.group()), value)
     pattern_patente = rf'\b({PATENTES_PREFIXO})\.?\s+([A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)*)\b'
     value = re.sub(pattern_patente, lambda m: f"{m.group(1)} {_fake_name(m.group(2))}" if len(m.group(2)) > 3 else m.group(0), value, flags=re.IGNORECASE)
@@ -147,6 +160,11 @@ def anonymize_text_value(value):
 def anonymize_value(column_name: str, value):
     if value is None: return None
     val_str = str(value).strip()
+    
     if "cpf" in column_name.lower() or CPF_REGEX.fullmatch(val_str):
         return _fake_cpf(val_str)
+        
+    if is_standalone_code(val_str):
+        return get_dynamic_id(val_str)
+        
     return anonymize_text_value(val_str)
