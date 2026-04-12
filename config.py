@@ -2,16 +2,26 @@ import os
 from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(encoding="utf-8")
 
 
 def get_source_url() -> str:
     url = os.getenv("DB_SOURCE")
+
     if not url:
         raise ValueError(
             "A variável de ambiente DB_SOURCE não está definida.\n"
             "Crie um arquivo .env com: DB_SOURCE=postgresql://user:pass@host:5432/banco"
         )
+
+    #  limpeza crítica
+    url = url.strip()
+
+    #  remove caracteres inválidos (blindagem total)
+    url = url.encode("utf-8", "ignore").decode("utf-8")
+
+    print("DEBUG URL:", repr(url))  # pode remover depois
+
     return url
 
 

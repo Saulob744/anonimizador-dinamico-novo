@@ -1,208 +1,106 @@
 import logging
 import sys
+import sqlalchemy as sa
 from tqdm import tqdm
+from config import get_source_url, get_dest_url, get_server_url, get_dest_db_name, get_source_db_name
+import db_utils
+import anonymizer
 
-from config import (
-    get_source_url,
-    get_dest_url,
-    get_server_url,
-    get_dest_db_name,
-    get_source_db_name,
-)
-
-from db_utils import (
-    connect,
-    recreate_database_if_not_exists,  # Nome padronizado conforme db_utils atualizado
-    get_user_schemas,
-    get_tables,
-    get_table_info,
-    build_dependency_graph,
-    copy_schema,
-    get_row_count,
-    fetch_rows_chunked,
-    insert_rows,
-    disable_fk_constraints,
-    enable_fk_constraints,
-)
-
-# Importação conforme a nova estrutura do anonymizer.py
-from anonymizer import (
-    anonymize_value,
-    anonymize_text_value,
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-
+# Configuração de Log
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE = 500
+CHUNK_SIZE = 1500  # Tamanho do lote para processamento
 
-def print_banner():
-    print("\n" + "=" * 60)
-    print("   Anonimizador Inteligente PostgreSQL (IA + PoS Tagging)")
-    print("=" * 60 + "\n")
-
-# =========================================
-# ANONIMIZAÇÃO DE LINHA
-# =========================================
-def anonymize_row(row: dict, column_treatments: dict) -> dict:
-    result = dict(row)
-
-    for col, treatment in column_treatments.items():
-        if result[col] is None or treatment == "SKIP":
-            continue
-            
-        # O tratamento agora é decidido pela inteligência do anonymizer
-        if treatment == "TEXT_SCAN":
-            # Para campos de texto livre (IA e Gramática)
-            result[col] = anonymize_text_value(result[col])
-        elif treatment == "ANONYMIZE":
-            # Para campos diretos (Nome, CPF isolado)
-            result[col] = anonymize_value(col, result[col])
-
-    return result
-
-# =========================================
-# PROCESSAMENTO DE TABELA
-# =========================================
-def process_table(
-    source_engine,
-    dest_engine,
-    schema: str,
-    table_name: str,
-    column_treatments: dict,
-) -> int:
-    total = get_row_count(source_engine, table_name, schema)
-    if total == 0:
-        return 0
-
-    processed = 0
-    with tqdm(
-        total=total,
-        desc=f"   {schema}.{table_name}",
-        unit="reg",
-        ncols=80,
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]",
-    ) as pbar:
-
-        for chunk in fetch_rows_chunked(source_engine, table_name, schema, CHUNK_SIZE):
-            anon_rows = []
-            for row in chunk:
-                try:
-                    # O tratamento é baseado no mapeamento prévio das colunas
-                    anon = anonymize_row(dict(row), column_treatments)
-                    anon_rows.append(anon)
-                except Exception as e:
-                    logger.warning(f"Erro na linha de {table_name}: {e}")
-
-            if anon_rows:
-                insert_rows(dest_engine, table_name, schema, anon_rows)
-            
-            processed += len(anon_rows)
-            pbar.update(len(anon_rows))
-
-    return processed
-
-# =========================================
-# CLASSIFICAÇÃO DE COLUNAS
-# =========================================
 def classify_columns(info: dict) -> dict:
-    """
-    Decide o tratamento de cada coluna.
-    """
-    pk_cols = set(info["primary_keys"])
-    fk_cols = set()
-    for fk in info["foreign_keys"]:
-        fk_cols.update(fk.get("constrained_columns", []))
-
-    excluded = pk_cols | fk_cols
+    """Mapeia o tratamento de cada coluna baseado no tipo de dado."""
     treatments = {}
-
     for col in info["columns"]:
-        col_name = col["name"]
-        col_type = str(col.get("type", "")).lower()
+        name = col["name"]
+        ctype = str(col["type"]).lower()
 
-        if col_name in excluded:
-            treatments[col_name] = "SKIP"
-            continue
-
-        # Se for texto (TEXT, VARCHAR, etc), usamos o SCAN inteligente
-        if any(t in col_type for t in ["text", "char", "varying"]):
-            treatments[col_name] = "TEXT_SCAN"
-        # Para outros tipos, tentamos a anonimização direta
+        # SKIP: Ignora datas, horas e booleanos para evitar erros de conversão
+        if any(t in ctype for t in ["date", "time", "timestamp", "bool"]):
+            treatments[name] = "SKIP"
         else:
-            treatments[col_name] = "ANONYMIZE"
-
+            # Tudo o que for texto ou código potencial entra para análise
+            treatments[name] = "ANONYMIZE"
+            
     return treatments
 
-# =========================================
-# MAIN
-# =========================================
-def main():
-    print_banner()
-
+def run_pipeline(mode: str):
+    """Pipeline principal de Migração e Anonimização."""
     source_url = get_source_url()
     dest_url = get_dest_url(source_url)
-    server_url = get_server_url(source_url)
-    dest_db_name = get_dest_db_name(source_url)
-    source_db_name = get_source_db_name(source_url)
-
-    logger.info(f"Banco origem  : {source_db_name}")
-    logger.info(f"Banco destino : {dest_db_name}\n")
-
-    source_engine = connect(source_url)
-
-    # RECRIA O BANCO (Função agora encerra conexões e limpa o destino)
+    
+    logger.info("Conectando aos bancos de dados...")
+    src_engine = db_utils.connect(source_url)
+    
     try:
-        recreate_database_if_not_exists(server_url, dest_db_name)
+        db_utils.recreate_database_if_not_exists(get_server_url(source_url), get_dest_db_name(source_url))
     except Exception as e:
-        logger.error(f"Erro ao recriar banco: {e}")
+        logger.error(f"Erro ao preparar banco de destino: {e}")
         sys.exit(1)
+        
+    dest_engine = db_utils.connect(dest_url)
+
+    # Modo réplica para acelerar inserção (Desativa Triggers e FKs temporariamente)
+    db_utils.set_replication_mode(dest_engine, 'replica')
+
+    schemas = db_utils.get_user_schemas(src_engine)
     
-    dest_engine = connect(dest_url)
-    disable_fk_constraints(dest_engine)
-
-    schemas = get_user_schemas(source_engine)
-    
-    total_records = 0
-    failed_tables = []
-
-    for current_schema in schemas:
-        logger.info(f">>> PROCESSANDO SCHEMA: '{current_schema}'")
-        copy_schema(source_engine, dest_engine, current_schema)
-
-        tables = get_tables(source_engine, current_schema)
-        ordered_tables = build_dependency_graph(source_engine, tables, current_schema)
+    for schema in schemas:
+        tables = db_utils.get_tables(src_engine, schema)
+        if not tables:
+            continue
+            
+        logger.info(f"Processando Schema: {schema}")
+        db_utils.copy_schema(src_engine, dest_engine, schema)
+        ordered_tables = db_utils.build_dependency_graph(src_engine, tables, schema)
 
         for table in ordered_tables:
-            info = get_table_info(source_engine, table, current_schema)
-            column_treatments = classify_columns(info)
+            info = db_utils.get_table_info(src_engine, table, schema)
+            treatments = classify_columns(info)
 
-            try:
-                count = process_table(
-                    source_engine,
-                    dest_engine,
-                    current_schema,
-                    table,
-                    column_treatments,
-                )
-                total_records += count
-            except Exception as e:
-                logger.error(f"Falha técnica em {current_schema}.{table}: {e}")
-                failed_tables.append(f"{current_schema}.{table}")
+            with src_engine.connect() as conn:
+                total_rows = conn.execute(sa.text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')).scalar()
+                
+            if total_rows == 0: continue
+                
+            with tqdm(total=total_rows, desc=f"Tabela: {table}", unit="reg") as pbar:
+                for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, CHUNK_SIZE):
+                    
+                    rows = [dict(row) for row in chunk]
+                    
+                    if mode == "FULL_ANON":
+                        # Aplica a anonimização inteligente em cada linha
+                        for row in rows:
+                            for col, method in treatments.items():
+                                if method == "ANONYMIZE" and row[col] is not None:
+                                    row[col] = anonymizer.anonymize_value(col, row[col])
+                                    
+                    db_utils.insert_rows(dest_engine, table, schema, rows)
+                    pbar.update(len(rows))
 
-    enable_fk_constraints(dest_engine)
-    logger.info(f"FINALIZADO. Total de registros: {total_records}")
-
-    if failed_tables:
-        logger.warning(f"Tabelas com erro: {failed_tables}")
-
-    source_engine.dispose()
+    db_utils.set_replication_mode(dest_engine, 'origin')
+    logger.info("🎉 Processo de anonimização e migração concluído!")
+    
+    src_engine.dispose()
     dest_engine.dispose()
 
 if __name__ == "__main__":
-    main()
+    print("\n" + "=" * 50)
+    print(" 🛡️ AEGIS TOOLKIT - SISTEMA DE ANONIMIZAÇÃO IA")
+    print("=" * 50)
+    print("1. Migração Pura (Apenas cópia)")
+    print("2. Pipeline Completo (IA + Consistência de Dados)")
+    print("=" * 50)
+    
+    escolha = input("Selecione a opção: ").strip()
+    
+    if escolha == '1':
+        run_pipeline(mode="MIGRATE_ONLY")
+    elif escolha == '2':
+        run_pipeline(mode="FULL_ANON")
+    else:
+        print("Opção inválida.")
