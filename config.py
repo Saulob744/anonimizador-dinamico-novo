@@ -5,47 +5,64 @@ from dotenv import load_dotenv
 load_dotenv(encoding="utf-8")
 
 
+# =========================
+# SOURCE
+# =========================
 def get_source_url() -> str:
     url = os.getenv("DB_SOURCE")
 
     if not url:
         raise ValueError(
-            "A variável de ambiente DB_SOURCE não está definida.\n"
-            "Crie um arquivo .env com: DB_SOURCE=postgresql://user:pass@host:5432/banco"
+            "DB_SOURCE não definido no .env\n"
+            "Ex: postgresql+psycopg://user:pass@host:5432/banco"
         )
 
-    #  limpeza crítica
-    url = url.strip()
-
-    #  remove caracteres inválidos (blindagem total)
-    url = url.encode("utf-8", "ignore").decode("utf-8")
-
-    print("DEBUG URL:", repr(url))  # pode remover depois
-
-    return url
+    return _sanitize_db_url(url)
 
 
-def get_dest_url(source_url: str) -> str:
-    parsed = urlparse(source_url)
-    db_name = parsed.path.lstrip("/")
-    new_db_name = f"{db_name}_anon"
-    new_path = f"/{new_db_name}"
-    new_parsed = parsed._replace(path=new_path)
-    return urlunparse(new_parsed)
+# =========================
+# DESTINO (NOVO MODELO FIXO VIA ENV)
+# =========================
+def get_dest_url() -> str:
+    url = os.getenv("DB_TARGET")
+
+    if url:
+        return _sanitize_db_url(url)
+
+    # fallback automático: usa source + _anon
+    source = get_source_url()
+    parsed = urlparse(source)
+
+    db_name = parsed.path.lstrip("/") or "database"
+    new_db = f"/{db_name}_anon"
+
+    return urlunparse(parsed._replace(path=new_db))
 
 
-def get_server_url(source_url: str) -> str:
-    parsed = urlparse(source_url)
-    new_parsed = parsed._replace(path="/postgres")
-    return urlunparse(new_parsed)
+# =========================
+# SERVER URL (ADMIN POSTGRES)
+# =========================
+def get_server_url() -> str:
+    source = get_source_url()
+    parsed = urlparse(source)
+
+    return urlunparse(parsed._replace(path="/postgres"))
 
 
-def get_dest_db_name(source_url: str) -> str:
-    parsed = urlparse(source_url)
-    db_name = parsed.path.lstrip("/")
-    return f"{db_name}_anon"
+# =========================
+# NOME DO BANCO
+# =========================
+def get_source_db_name() -> str:
+    return urlparse(get_source_url()).path.lstrip("/")
 
 
-def get_source_db_name(source_url: str) -> str:
-    parsed = urlparse(source_url)
+def get_dest_db_name() -> str:
+    parsed = urlparse(get_dest_url())
     return parsed.path.lstrip("/")
+
+
+# =========================
+# SEGURANÇA DE URL
+# =========================
+def _sanitize_db_url(url: str) -> str:
+    return url.strip().encode("utf-8", "ignore").decode("utf-8")
