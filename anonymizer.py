@@ -4,39 +4,31 @@ import random
 import string
 from faker import Faker
 
-# Inicializa o Faker para o contexto brasileiro
 fake = Faker("pt_BR")
 
-# ========================
-# CARREGAMENTO DA IA
-# ========================
 try:
     nlp = spacy.load("pt_core_news_lg", disable=["parser", "lemmatizer", "textcat"])
-except Exception as e:
+except Exception:
     nlp = None
-    print(f"AVISO: spaCy 'pt_core_news_lg' não encontrado.")
 
-# ========================
-# MAPAS DE MEMÓRIA (Consistência Global)
-# ========================
 _memory = {
-    "PER": {}, "CPF": {}, "EMAIL": {}, "CEP": {}, "PHONE": {}, "ID_DYNAM": {}
+    "PER": {}, "CPF": {}, "EMAIL": {}, "PHONE": {}, 
+    "ID_DYNAM": {}, "ID_NUMERIC": {}, "RG": {}
 }
 _used_fakes = set()
 
-# Regex para dados conhecidos (Melhoradas)
 REGEX_RULES = {
-    "CPF": re.compile(r"\b\d{3}[\.\-]?\d{3}[\.\-]?\d{3}[\.\-]?\d{2}\b"),
+    "CPF": re.compile(r"(\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b)"),
     "EMAIL": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b"),
-    "CEP": re.compile(r"\b\d{5}[\-]?\d{3}\b"),
-    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})[-\s]?\d{4}\b"),
-    # Regex Genérica para Códigos (Placas, Chassis, Tokens, Protocolos)
-    "GENERIC_CODE": re.compile(r"\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9\-\.]{5,20}\b")
+    "PHONE": re.compile(r"(\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})[-\s]?\d{4}\b)"),
 }
 
 # ========================
-# NÚCLEO DE INTELIGÊNCIA
+# FUNÇÕES DE APOIO
 # ========================
+
+def _clean_val(val):
+    return re.sub(r'[^a-zA-Z0-9]', '', str(val))
 
 def _get_consistent(val, category, func):
     v = str(val).strip()
@@ -44,102 +36,116 @@ def _get_consistent(val, category, func):
         _memory[category][v] = func(v)
     return _memory[category][v]
 
-def _gen_fake_id(orig):
-    """Gera um ID falso mantendo rigorosamente o formato original."""
+def _gen_fake_numeric(orig):
+    orig_clean = _clean_val(orig)
+    if not orig_clean: return random.randint(10000, 99999)
+    res = "".join(random.choice("123456789") if i==0 else random.choice("0123456789") for i in range(len(orig_clean)))
+    return int(res)
+
+def _gen_structure_preserved_id(orig):
+    """Gera um fake mantendo rigorosamente a estrutura original (inclusive RGs curtos)."""
     while True:
-        fake_val = "".join(
-            random.choice(string.ascii_uppercase) if c.isupper() else
-            random.choice(string.ascii_lowercase) if c.islower() else
-            random.choice(string.digits) if c.isdigit() else c
-            for c in orig
-        )
-        if fake_val not in _used_fakes:
-            _used_fakes.add(fake_val)
-            return fake_val
+        res = ""
+        for char in orig:
+            if char.isupper(): res += random.choice(string.ascii_uppercase)
+            elif char.islower(): res += random.choice(string.ascii_lowercase)
+            elif char.isdigit(): res += random.choice(string.digits)
+            else: res += char 
+        if res not in _used_fakes:
+            _used_fakes.add(res)
+            return res
 
-def is_dynamic_sensitive(val_str):
+def is_likely_an_id(s):
     """
-    Detecta dinamicamente se a string é um código sensível (Placa, Chassi, Token).
-    Usa análise de mistura de caracteres (Entropia).
+    Detecta se uma string é um ID Único (RG, Chassi, Placa, Protocolo).
+    Melhorado para capturar sequências numéricas a partir de 5 dígitos.
     """
-    s = val_str.strip()
-    if not s or " " in s or len(s) < 5: return False
+    s_clean = _clean_val(s)
+    # Ignora datas (8 dígitos com barras ou traços geralmente são datas)
+    if "/" in s or (len(s_clean) == 8 and "-" in s): return False
     
-    # 1. Se parece com um documento conhecido via Regex
-    for rule in ["CPF", "EMAIL", "CEP", "PHONE"]:
-        if REGEX_RULES[rule].fullmatch(s): return True
-
-    # 2. Análise de Código Alfanumérico (Mistura de Letras e Números)
-    has_digit = any(c.isdigit() for c in s)
-    has_alpha = any(c.isalpha() for c in s)
-    has_special = any(c in "-." for c in s)
-
-    # Se tem letras e números misturados, é um forte candidato a código/ID
-    if (has_digit and has_alpha) or (len(s) >= 12 and has_digit):
-        # Validação com IA: se for uma palavra dicionarizada, ignoramos
-        if nlp and len(s) < 15: # Palavras longas raramente são comuns
-            doc = nlp(s.lower())
-            if any(t.pos_ in ["NOUN", "VERB", "ADJ"] and not t.is_stop for t in doc):
-                return False
-        return True
-    
+    # Se tem entre 5 e 25 caracteres e não tem espaços
+    if 5 <= len(s_clean) <= 25 and " " not in s.strip():
+        # Caso 1: Mistura de letras e números (Chassi, RG com UF, Placa)
+        if any(c.isdigit() for c in s_clean) and any(c.isalpha() for c in s_clean):
+            return True
+        # Caso 2: Apenas números mas em formato de ID (RG antigo, IDs de sistema)
+        if s_clean.isdigit():
+            return True
+            
     return False
 
-def anonymize_value(col_name, value):
-    if value is None: return None
+# ========================
+# NÚCLEO DE ANONIMIZAÇÃO
+# ========================
+
+def anonymize_value(col_name, value, is_numeric=False):
+    if value is None: return None, None
+    
     val_str = str(value).strip()
     col_lower = str(col_name).lower()
 
-    # 1. Checagem por Nome de Coluna ou Formato exato (CPF, Email, Fone)
-    if "cpf" in col_lower or REGEX_RULES["CPF"].fullmatch(val_str):
-        fake_cpf = _get_consistent(val_str, "CPF", lambda x: fake.cpf())
-        if "." not in val_str or len(val_str) <= 11:
-            return fake_cpf.replace(".", "").replace("-", "")
-        return fake_cpf
+    # 1. TRATAMENTO NUMÉRICO (BIGINT/INT)
+    if is_numeric:
+        return _get_consistent(val_str, "ID_NUMERIC", _gen_fake_numeric), "DOCS"
 
-    if "email" in col_lower or REGEX_RULES["EMAIL"].fullmatch(val_str):
-        return _get_consistent(val_str, "EMAIL", lambda x: fake.safe_email())
+    # 2. IDENTIFICAÇÃO POR PREFIXO (ENVOLVIDO - , CHASSI - )
+    if " - " in val_str:
+        prefix, content = val_str.split(" - ", 1)
+        up_prefix = prefix.upper()
+        if any(k in up_prefix for k in ["ENVOLVIDO", "AUTOR", "VITIMA", "CONDUTOR"]):
+            fake_n = _get_consistent(content, "PER", lambda x: f"{fake.first_name()} {fake.last_name()}".upper())
+            return f"{prefix} - {fake_n}", "PER"
+        if any(k in up_prefix for k in ["CHASSI", "PLACA", "RG", "CPF", "DOC"]):
+            fake_id = _get_consistent(content, "ID_DYNAM", _gen_structure_preserved_id)
+            return f"{prefix} - {fake_id}", "DOCS"
+
+    # 3. IDENTIFICAÇÃO POR NOME DE COLUNA (PESSOAS E RG)
+    if any(k in col_lower for k in ["nome", "usuario", "pessoa", "autor", "vitima", "proprietario"]):
+        fake_n = _get_consistent(val_str, "PER", lambda x: f"{fake.first_name()} {fake.last_name()}".upper())
+        return fake_n, "PER"
     
-    if "fone" in col_lower or "tel" in col_lower or REGEX_RULES["PHONE"].fullmatch(val_str):
-        return _get_consistent(val_str, "PHONE", lambda x: fake.cellphone_number())
+    if "rg" in col_lower:
+        return _get_consistent(val_str, "RG", _gen_structure_preserved_id), "DOCS"
 
-    # 2. Detecção Dinâmica (Placas, Chassis, Tokens em colunas avulsas)
-    if is_dynamic_sensitive(val_str):
-        return _get_consistent(val_str, "ID_DYNAM", _gen_fake_id)
+    # 4. REGEX DE DOCUMENTOS PADRÃO (CPF, EMAIL)
+    if REGEX_RULES["CPF"].fullmatch(val_str):
+        fake_cpf = _get_consistent(val_str, "CPF", lambda x: fake.cpf())
+        return (fake_cpf if "." in val_str else _clean_val(fake_cpf)), "DOCS"
+    
+    if REGEX_RULES["EMAIL"].fullmatch(val_str):
+        return _get_consistent(val_str, "EMAIL", lambda x: fake.safe_email()), "CONTACTS"
 
-    # 3. Se não for um valor "puro", trata como bloco de texto (NLP)
-    return anonymize_text_block(val_str)
+    # 5. HEURÍSTICA DE CÓDIGOS (CAPTURA RGs CURTOS E CHASSIS SOLTOS)
+    if is_likely_an_id(val_str):
+        return _get_consistent(val_str, "ID_DYNAM", _gen_structure_preserved_id), "DOCS"
+
+    # 6. BLOCOS DE TEXTO (Narrativas)
+    txt_anon = anonymize_text_block(val_str)
+    category = "PER" if txt_anon != val_str else None
+    return txt_anon, category
 
 def anonymize_text_block(text):
-    """
-    Escaneia textos e limpa nomes, documentos e CÓDIGOS dinâmicos.
-    """
-    if not text: return text
+    if not text or len(text) < 3: return text
 
-    # A. Limpeza de Documentos Conhecidos (Regex)
-    text = REGEX_RULES["EMAIL"].sub(lambda m: _get_consistent(m.group(), "EMAIL", lambda x: fake.safe_email()), text)
-    text = REGEX_RULES["CPF"].sub(lambda m: _get_consistent(m.group(), "CPF", lambda x: fake.cpf()), text)
-    text = REGEX_RULES["PHONE"].sub(lambda m: _get_consistent(m.group(), "PHONE", lambda x: fake.cellphone_number()), text)
+    # Passo A: IA para nomes
+    if nlp and any(c.isupper() for c in text):
+        doc = nlp(text.title())
+        for ent in reversed(doc.ents):
+            if ent.label_ == "PER" and not any(c.isdigit() for c in ent.text):
+                orig_name = text[ent.start_char:ent.end_char]
+                fake_n = _get_consistent(orig_name, "PER", lambda x: f"{fake.first_name()} {fake.last_name()}".upper())
+                text = text[:ent.start_char] + fake_n + text[ent.end_char:]
 
-    # B. Identificação Dinâmica de CÓDIGOS no meio do texto (Placas, Chassis, Tokens)
-    # Procuramos por palavras que pareçam códigos e não nomes
+    # Passo B: Scan de palavras (Pega o '3344556' no meio de um texto se houver)
     words = text.split()
+    new_words = []
     for word in words:
         clean_word = word.strip(".,()[]{}")
-        if is_dynamic_sensitive(clean_word):
-            fake_code = _get_consistent(clean_word, "ID_DYNAM", _gen_fake_id)
-            text = text.replace(clean_word, fake_code)
-
-    # C. IA do spaCy para Nomes de Pessoas (Entidades PER)
-    if nlp and any(c.isupper() for c in text):
-        doc = nlp(text)
-        # Processamos de trás para frente para não errar os índices ao substituir
-        for ent in reversed(doc.ents):
-            if ent.label_ == "PER":
-                # Filtro extra: nomes raramente têm números
-                if any(c.isdigit() for c in ent.text): continue
-                
-                fake_n = _get_consistent(ent.text, "PER", lambda x: f"{fake.first_name()} {fake.last_name()}")
-                text = text[:ent.start_char] + fake_n + text[ent.end_char:]
-                
-    return text
+        if is_likely_an_id(clean_word) and not REGEX_RULES["CPF"].fullmatch(clean_word):
+            fake_id = _get_consistent(clean_word, "ID_DYNAM", _gen_structure_preserved_id)
+            new_words.append(word.replace(clean_word, fake_id))
+        else:
+            new_words.append(word)
+    
+    return " ".join(new_words)
