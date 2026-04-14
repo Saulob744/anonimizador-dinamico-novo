@@ -1,7 +1,17 @@
+# Web Framework
 streamlit
+
+# Database & ORM
 sqlalchemy
 psycopg2-binary
-spacy
-faker
+
+# Data Processing
 pandas
 python-dotenv
+
+# Anonymization & NLP
+faker
+spacy
+
+# Modelo de IA para Português (Essencial para o anonymizer.py)
+https://github.com/explosion/spacy-models/releases/download/pt_core_news_lg-3.7.0/pt_core_news_lg-3.7.0-py3-none-any.whl
