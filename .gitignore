@@ -1,6 +1,14 @@
 # ========================
 # 🔐 SEGURANÇA (CRÍTICO)
 # ========================
+venv/
+venv_novo/
+__pycache__/
+*.pyc
+*.whl
+.env
+.idea/
+.vscode/
 .env
 .env.*
 *.env

@@ -4,7 +4,7 @@ import db_utils
 import anonymizer
 import importlib
 from datetime import datetime
-
+import urllib.parse  # Adicione este import no topo do app.py
 # ==================================================
 # FORÇAR ATUALIZAÇÃO DOS MÓDULOS (Evita erro de cache)
 # ==================================================
@@ -25,8 +25,13 @@ st.markdown("""
 # ==================================================
 # FUNÇÕES DE APOIO DA INTERFACE
 # ==================================================
+
+
 def build_url(user, password, host, port, db):
-    return f"postgresql://{user}:{password}@{host}:{port}/{db}"
+    # Codifica usuário e senha para evitar erro em caracteres como @, # ou á, é, í
+    safe_user = urllib.parse.quote_plus(user)
+    safe_password = urllib.parse.quote_plus(password)
+    return f"postgresql://{safe_user}:{safe_password}@{host}:{port}/{db}"
 
 def classify_columns(info: dict) -> dict:
     """Define como cada coluna será tratada baseada no tipo e PK."""

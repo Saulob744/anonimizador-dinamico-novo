@@ -13,16 +13,16 @@ _TABLE_CACHE = {}
 # CONEXÃO
 # ==================================================
 def connect(url: str) -> Engine:
-    """Conecta ao banco garantindo UTF-8 e reciclagem de conexão."""
+    """Conecta ao banco garantindo tratamento de caracteres brasileiros."""
     return create_engine(
         url,
         pool_pre_ping=True,
         pool_recycle=3600,
+        # Forçamos o cliente a aceitar o que vier e o driver a usar latin1 se falhar
         connect_args={
-            "options": "-c client_encoding=utf8"
+            "options": "-c client_encoding=latin1" 
         }
     )
-
 # ==================================================
 # BANCO DESTINO
 # ==================================================
