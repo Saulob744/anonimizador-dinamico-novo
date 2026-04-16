@@ -13,7 +13,11 @@ importlib.reload(anonymizer)
 # ==================================================
 # CONFIG UI
 # ==================================================
-st.set_page_config(page_title="🛡️ Aegis Anonymizer Pro", page_icon="🛡️", layout="wide")
+st.set_page_config(
+    page_title="🛡️ Aegis Anonymizer Pro",
+    page_icon="🛡️",
+    layout="wide"
+)
 
 # ==================================================
 # HELPERS
@@ -22,6 +26,7 @@ def build_url(user, password, host, port, db):
     safe_user = urllib.parse.quote_plus(user)
     safe_password = urllib.parse.quote_plus(password)
     return f"postgresql://{safe_user}:{safe_password}@{host}:{port}/{db}"
+
 
 def classify_columns(info: dict) -> dict:
     treatments = {}
@@ -42,20 +47,21 @@ def classify_columns(info: dict) -> dict:
 
     return treatments
 
+
 # ==================================================
 # STATE
 # ==================================================
-if 'stats' not in st.session_state:
+if "stats" not in st.session_state:
     st.session_state.stats = {
         "PER": 0,
         "DOCS": 0,
         "CONTACTS": 0,
         "TEXT": 0,
-        "total_rows": 0
+        "total_rows": 0,
     }
 
 # ==================================================
-# UI
+# SIDEBAR
 # ==================================================
 with st.sidebar:
     st.title("🛡️ Aegis Control")
@@ -85,10 +91,10 @@ st.title("🛡️ Aegis Pipeline")
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Total", f"{st.session_state.stats['total_rows']:,}")
-m2.metric("Pessoas", st.session_state.stats['PER'])
-m3.metric("Docs", st.session_state.stats['DOCS'])
-m4.metric("Contatos", st.session_state.stats['CONTACTS'])
-m5.metric("Textos", st.session_state.stats['TEXT'])
+m2.metric("Pessoas", st.session_state.stats["PER"])
+m3.metric("Docs", st.session_state.stats["DOCS"])
+m4.metric("Contatos", st.session_state.stats["CONTACTS"])
+m5.metric("Textos", st.session_state.stats["TEXT"])
 
 status = st.empty()
 progress = st.progress(0)
@@ -99,7 +105,7 @@ progress = st.progress(0)
 if btn_iniciar:
 
     if src_db.strip() == dst_db.strip():
-        st.error("Banco origem e destino NÃO podem ser iguais")
+        st.error("❌ Banco origem e destino NÃO podem ser iguais")
         st.stop()
 
     try:
@@ -113,8 +119,8 @@ if btn_iniciar:
         db_utils.recreate_database_if_not_exists(admin_url, dst_db)
         dst_engine = db_utils.connect(dst_url)
 
-        # 🔥 CRÍTICO: desativa FK globalmente
-        db_utils.set_replication_mode(dst_engine, 'replica')
+        # 🔥 desativa FK
+        db_utils.set_replication_mode(dst_engine, "replica")
 
         schemas = db_utils.get_user_schemas(src_engine)
 
@@ -126,7 +132,8 @@ if btn_iniciar:
 
             db_utils.copy_schema(src_engine, dst_engine, schema)
 
-            tables = db_utils.get_tables(src_engine, schema)
+            raw_tables = db_utils.get_tables(src_engine, schema)
+            tables = db_utils.build_dependency_graph(src_engine, raw_tables, schema)
 
             for table in tables:
                 status.write(f"⚙️ {schema}.{table}")
@@ -136,7 +143,9 @@ if btn_iniciar:
 
                 db_utils.truncate_table(dst_engine, table, schema)
 
-                for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, chunk_size):
+                for chunk in db_utils.fetch_rows_streaming(
+                    src_engine, table, schema, chunk_size
+                ):
                     rows = [dict(r) for r in chunk]
 
                     if "Anonimização" in modo:
@@ -146,6 +155,7 @@ if btn_iniciar:
                                     continue
 
                                 val_orig = r[col]
+
                                 res_val, cat = anonymizer.anonymize_value(
                                     col, val_orig, is_numeric=(treat == "NUMERIC")
                                 )
@@ -164,19 +174,19 @@ if btn_iniciar:
 
                 st.toast(f"{table} OK", icon="✅")
 
-            # 🔥 CRÍTICO: ajustar sequences por schema
+            # 🔥 ajustar sequences
             db_utils.fix_sequences(dst_engine, schema)
 
         # 🔥 reativa FK
-        db_utils.set_replication_mode(dst_engine, 'origin')
+        db_utils.set_replication_mode(dst_engine, "origin")
 
         status.success("✅ FINALIZADO")
         st.balloons()
 
     except Exception as e:
-        status.error(f"Erro: {e}")
+        status.error(f"❌ Erro: {e}")
 
         try:
-            db_utils.set_replication_mode(dst_engine, 'origin')
-        except:
+            db_utils.set_replication_mode(dst_engine, "origin")
+        except Exception:
             pass
