@@ -11,18 +11,37 @@ fake = Faker("pt_BR")
 
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
-    "RG": re.compile(r"\b\d{1,2}\.?\d{3}\.?\d{3}-?[0-9Xx]\b"),
-    "PHONE": re.compile(r"\b(?:\(?\d{2}\)?\s?)?(?:9?\d{4})-?\d{4}\b"),
+    "RG": re.compile(r"\b\d{1,2}\.?\d{3,5}\.?\d{3}-?[0-9Xx]\b"),
+    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9?\d{4})-?\d{4}\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
+    "CEP": re.compile(r"\b\d{5}-?\d{3}\b"),
+    "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
+    "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{10,17}\b", re.IGNORECASE),
+    "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
 
-# nomes completos em maiúsculo ou misto
+# nomes mais realistas
 REGEX_NAME = re.compile(
-    r'\b[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}(?:\s+[A-ZÁÀÂÃÉÈÍÓÚÇa-záàâãéèíóúç]{2,})+\b'
+    r'\b[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+'
+    r'(?:\s+[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+){1,3}\b'
 )
 
-_memory = {"PER": {}, "CPF": {}, "RG": {}, "PHONE": {}, "EMAIL": {}, "ID": {}}
+# =========================
+# MEMÓRIA
+# =========================
 
+_memory = {
+    "PER": {},
+    "CPF": {},
+    "RG": {},
+    "PHONE": {},
+    "EMAIL": {},
+    "CEP": {},
+    "PLATE": {},
+    "CHASSI": {},
+    "IP": {},
+    "ID": {}
+}
 
 # =========================
 # HELPERS
@@ -36,10 +55,20 @@ def limit(val, size):
     return str(val)[:size]
 
 
+def _normalize(v):
+    return str(v).strip().upper()
+
+
+# 🔧 FIX IMPORTANTE: função segura e consistente
 def _get(val, cat, fn):
-    v = str(val).upper()
+    v = _normalize(val)
+
+    if cat not in _memory:
+        _memory[cat] = {}
+
     if v not in _memory[cat]:
-        _memory[cat][v] = fn(v)
+        _memory[cat][v] = fn()
+
     return _memory[cat][v]
 
 
@@ -48,40 +77,60 @@ def mask_pattern(x):
         random.choice(string.digits) if c.isdigit()
         else random.choice(string.ascii_uppercase) if c.isalpha()
         else c
-        for c in x
+        for c in str(x)
     )
+
+# =========================
+# NAMES DETECTOR
+# =========================
+
+def _replace_names(text):
+    nomes = REGEX_NAME.findall(text)
+
+    for n in set(nomes):
+        text = text.replace(n, fake.name().upper())
+
+    return text
 
 
 # =========================
-# TEXTO LIVRE (CENTRAL)
+# TEXTO LIVRE (INTELIGENTE E NÃO AGRESSIVO)
 # =========================
 
 def anonymize_text(val):
     if not isinstance(val, str):
         return val
 
-    # NOMES
-    nomes = REGEX_NAME.findall(val)
-    for nome in set(nomes):
-        val = val.replace(nome, fake.name().upper())
+    text = val
 
-    # CPF
-    val = REGEX["CPF"].sub(lambda m: fake.cpf(), val)
+    # nomes primeiro
+    text = _replace_names(text)
 
-    # RG
-    val = REGEX["RG"].sub(lambda m: fake.rg(), val)
+    def repl(cat, fn):
+        return lambda m: _get(m.group(), cat, fn)
 
-    # TELEFONE
-    val = REGEX["PHONE"].sub(lambda m: fake.phone_number(), val)
+    # substituições seguras
+    text = REGEX["CPF"].sub(repl("CPF", fake.cpf), text)
+    text = REGEX["RG"].sub(repl("RG", fake.rg), text)
+    text = REGEX["PHONE"].sub(repl("PHONE", fake.phone_number), text)
+    text = REGEX["EMAIL"].sub(repl("EMAIL", fake.email), text)
+    text = REGEX["CEP"].sub(repl("CEP", fake.postcode), text)
+    text = REGEX["PLATE"].sub(repl("PLATE", fake.license_plate), text)
+    text = REGEX["CHASSI"].sub(
+    lambda m: _get(m.group(), "CHASSI", lambda: mask_pattern(m.group())),
+    text
+        )
 
-    # EMAIL
-    val = REGEX["EMAIL"].sub(lambda m: fake.email(), val)
+    text = REGEX["IP"].sub(
+        lambda m: _get(m.group(), "IP", lambda: "0.0.0.0"),
+        text
+    )
 
-    return limit(val, 500)
+    return limit(text, 500)
 
 
 # =========================
-# FUNÇÃO PRINCIPAL
+# FUNÇÃO PRINCIPAL (CONTROLADA)
 # =========================
 
 def anonymize_value(col, val, is_numeric=False):
@@ -89,41 +138,48 @@ def anonymize_value(col, val, is_numeric=False):
     if val is None:
         return val, None
 
-    val = str(val)
+    val_str = str(val)
     col_lower = col.lower()
 
     # =========================
-    # COLUNAS SENSÍVEIS DIRETAS
+    # COLUNAS EXPLÍCITAS
     # =========================
 
     if "cpf" in col_lower:
-        return _get(val, "CPF", lambda _: fake.cpf()), "CPF"
+        return _get(val_str, "CPF", fake.cpf), "CPF"
 
     if "rg" in col_lower:
-        return _get(val, "RG", lambda _: fake.rg()), "RG"
+        return _get(val_str, "RG", fake.rg), "RG"
 
     if "telefone" in col_lower or "fone" in col_lower or "celular" in col_lower:
-        return _get(val, "PHONE", lambda _: fake.phone_number()), "PHONE"
+        return _get(val_str, "PHONE", fake.phone_number), "PHONE"
 
     if "email" in col_lower:
-        return _get(val, "EMAIL", lambda _: fake.email()), "EMAIL"
+        return _get(val_str, "EMAIL", fake.email), "EMAIL"
 
-    if "nome" in col_lower or "usuario" in col_lower or "usuário" in col_lower:
-        return _get(val, "PER", lambda _: fake.name().upper()), "PER"
-
-    # =========================
-    # TEXTO LIVRE (ALTAMENTE IMPORTANTE)
-    # =========================
-
-    if len(val) > 0:
-        val = anonymize_text(val)
-        return val, "TEXT"
+    if "nome" in col_lower or "usuario" in col_lower:
+        return _get(val_str, "PER", lambda: fake.name().upper()), "PER"
 
     # =========================
-    # CÓDIGOS
+    # DETECÇÃO DINÂMICA (MENOS AGRESSIVA)
     # =========================
 
-    if any(c.isdigit() for c in val) and any(c.isalpha() for c in val):
-        return _get(val, "ID", lambda _: mask_pattern(val)), "DOCS"
+    has_pii_pattern = any(
+        r.search(val_str)
+        for r in REGEX.values()
+    )
 
-    return val, None
+    has_name = bool(REGEX_NAME.search(val_str))
+
+    # só anonimiza se REALMENTE parecer dado sensível
+    if has_pii_pattern or has_name:
+        new_val = anonymize_text(val_str)
+
+        if new_val != val_str:
+            return new_val, "TEXT"
+
+    # =========================
+    # NÃO MEXE EM TEXTO NORMAL
+    # =========================
+
+    return val_str, None

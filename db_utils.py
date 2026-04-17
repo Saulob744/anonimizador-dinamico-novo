@@ -2,14 +2,80 @@ import logging
 from collections import defaultdict, deque
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.engine.url import make_url
+import subprocess
 
 logger = logging.getLogger(__name__)
 _TABLE_CACHE = {}
 
 # ==================================================
-# CONEXÃO
+# CONEXÃO INTELIGENTE (AUTO CREATE DB)
 # ==================================================
 def connect(url: str):
+    parsed = make_url(url)
+
+    # 🔥 ODBC (LocalDB etc)
+    if "odbc_connect" in url:
+        logger.warning("⚠️ ODBC detectado → pulando criação de banco")
+        return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
+
+    db_name = parsed.database
+    if not db_name:
+        raise ValueError("URL não contém nome do banco")
+
+    backend = parsed.get_backend_name()
+
+    # -----------------------------------------
+    # DEFINE BANCO ADMIN
+    # -----------------------------------------
+    if backend == "postgresql":
+        server_url = parsed.set(database="postgres")
+    elif backend == "mssql":
+        server_url = parsed.set(database="master")
+    else:
+        server_url = parsed.set(database=None)
+
+    engine_server = create_engine(
+        server_url,
+        isolation_level="AUTOCOMMIT",
+        future=True
+    )
+
+    # -----------------------------------------
+    # CREATE DATABASE
+    # -----------------------------------------
+    try:
+        with engine_server.connect() as conn:
+
+            if backend == "postgresql":
+                exists = conn.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                    {"name": db_name}
+                ).scalar()
+
+                if not exists:
+                    conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+
+            elif backend == "mysql":
+                conn.execute(text(f"CREATE DATABASE IF NOT EXISTS `{db_name}`"))
+
+            elif backend == "mssql":
+                conn.execute(text(f"""
+                    IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}')
+                    BEGIN
+                        DECLARE @sql NVARCHAR(MAX)
+                        SET @sql = 'CREATE DATABASE [{db_name}]'
+                        EXEC(@sql)
+                    END
+                """))
+
+    except Exception as e:
+        logger.error(f"❌ Erro ao criar banco: {e}")
+        raise
+
+    # -----------------------------------------
+    # CONEXÃO FINAL
+    # -----------------------------------------
     return create_engine(
         url,
         pool_pre_ping=True,
@@ -18,27 +84,45 @@ def connect(url: str):
     )
 
 # ==================================================
-# BANCO
+# UTILS
 # ==================================================
-def recreate_database_if_not_exists(server_url: str, db_name: str):
-    engine = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
+def get_db_type(engine):
+    return engine.dialect.name
 
-    with engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :name"),
-            {"name": db_name}
-        ).scalar()
+def format_table_name(engine, schema, table):
+    db_type = get_db_type(engine)
 
-        if not exists:
-            conn.execute(text(f'CREATE DATABASE "{db_name}"'))
-            logger.info(f"Banco criado: {db_name}")
+    if db_type == "mysql":
+        return f"`{schema}`.`{table}`"
+    elif db_type == "sqlite":
+        return f'"{table}"'
+    else:
+        return f'"{schema}"."{table}"'
+
+def disable_fk(conn, db_type):
+    try:
+        if db_type == "postgresql":
+            conn.execute(text("SET session_replication_role = 'replica'"))
+
+        elif db_type == "mysql":
+            conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+
+        elif db_type == "mssql":
+            conn.execute(text("EXEC sp_msforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT all'"))
+    except Exception as e:
+        logger.warning(f"FK disable falhou: {e}")
 
 # ==================================================
 # SCHEMAS
 # ==================================================
 def get_user_schemas(engine):
     insp = inspect(engine)
-    ignored = {"information_schema", "pg_catalog", "pg_toast"}
+    db_type = get_db_type(engine)
+
+    ignored = {"information_schema"}
+
+    if db_type == "postgresql":
+        ignored.update({"pg_catalog", "pg_toast"})
 
     return sorted([
         s for s in insp.get_schema_names()
@@ -60,7 +144,7 @@ def get_table_info(engine, table, schema):
     }
 
 # ==================================================
-# DEPENDÊNCIA (🔥 FUNDAMENTAL)
+# DEPENDÊNCIA
 # ==================================================
 def build_dependency_graph(engine, tables, schema):
     insp = inspect(engine)
@@ -91,7 +175,7 @@ def build_dependency_graph(engine, tables, schema):
     remaining = [t for t in tables if t not in ordered]
 
     if remaining:
-        logger.warning(f"Tabelas com dependência circular: {remaining}")
+        logger.warning(f"Dependência circular: {remaining}")
 
     return ordered + remaining
 
@@ -99,18 +183,27 @@ def build_dependency_graph(engine, tables, schema):
 # SCHEMA COPY
 # ==================================================
 def copy_schema(src_engine, dst_engine, schema):
+    db_type = get_db_type(dst_engine)
 
     with dst_engine.begin() as conn:
-        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        try:
+            if db_type == "postgresql":
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+            elif db_type == "mssql":
+                conn.execute(text(f"""
+                    IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}')
+                    EXEC('CREATE SCHEMA [{schema}]')
+                """))
+        except Exception:
+            pass
 
     meta = sa.MetaData()
-
     with src_engine.connect() as conn:
         meta.reflect(bind=conn, schema=schema)
 
     with dst_engine.begin() as conn:
         for table in meta.sorted_tables:
-            table.schema = schema
+            table.schema = schema if db_type != "sqlite" else None
 
             for col in table.columns:
                 col.server_default = None
@@ -121,10 +214,11 @@ def copy_schema(src_engine, dst_engine, schema):
 # STREAMING
 # ==================================================
 def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
+    table_ref = format_table_name(engine, schema, table)
 
     with engine.connect() as conn:
         result = conn.execution_options(stream_results=True).execute(
-            text(f'SELECT * FROM "{schema}"."{table}"')
+            text(f"SELECT * FROM {table_ref}")
         )
 
         while True:
@@ -134,7 +228,7 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
             yield rows
 
 # ==================================================
-# INSERT (🔥 SUPER ROBUSTO)
+# INSERT
 # ==================================================
 def insert_rows(engine, table_name, schema, rows):
     if not rows:
@@ -152,13 +246,12 @@ def insert_rows(engine, table_name, schema, rows):
         )
 
     table = _TABLE_CACHE[key]
+    db_type = get_db_type(engine)
 
     try:
         with engine.begin() as conn:
-            # 🔥 sempre desativa FK na conexão atual
-            conn.execute(text("SET session_replication_role = 'replica'"))
+            disable_fk(conn, db_type)
 
-            # 🔥 proteção contra tamanho de coluna
             for row in rows:
                 for col in table.columns:
                     val = row.get(col.name)
@@ -169,64 +262,68 @@ def insert_rows(engine, table_name, schema, rows):
             conn.execute(table.insert(), rows)
 
     except Exception as e:
-        logger.error(f"❌ Erro batch {schema}.{table_name}: {e}")
-
-        # 🔥 fallback linha a linha (evita tabela vazia)
-        for row in rows:
-            try:
-                with engine.begin() as conn:
-                    conn.execute(text("SET session_replication_role = 'replica'"))
-                    conn.execute(table.insert(), row)
-
-            except Exception as e2:
-                logger.error(f"⚠️ Linha ignorada em {table_name}: {e2}")
-
-# ==================================================
-# COUNT (debug)
-# ==================================================
-def get_row_count(engine, table, schema):
-    with engine.connect() as conn:
-        return conn.execute(
-            text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
-        ).scalar()
-
-# ==================================================
-# SEQUENCES (🔥 ESSENCIAL)
-# ==================================================
-def fix_sequences(engine, schema):
-
-    query = """
-    SELECT
-        sequence_name,
-        column_name,
-        table_name
-    FROM information_schema.sequences s
-    JOIN information_schema.columns c
-      ON c.column_default LIKE '%' || s.sequence_name || '%'
-    WHERE sequence_schema = :schema
-    """
-
-    with engine.begin() as conn:
-        rows = conn.execute(text(query), {"schema": schema}).fetchall()
-
-        for seq, col, table in rows:
-            conn.execute(text(f"""
-                SELECT setval('{schema}.{seq}',
-                COALESCE((SELECT MAX("{col}") FROM "{schema}"."{table}"), 1))
-            """))
-
-# ==================================================
-# REPLICATION
-# ==================================================
-def set_replication_mode(engine, mode='replica'):
-    with engine.begin() as conn:
-        conn.execute(text(f"SET session_replication_role = '{mode}'"))
+        logger.error(f"❌ Batch error {schema}.{table_name}: {e}")
 
 # ==================================================
 # TRUNCATE
 # ==================================================
 def truncate_table(engine, table_name, schema):
+    db_type = get_db_type(engine)
+    table_ref = format_table_name(engine, schema, table_name)
+
     with engine.begin() as conn:
-        conn.execute(
-            text(f'TRUNCATE TABLE "{schema}"."{table_name}" CASCADE')
-        )
+        try:
+            if db_type == "postgresql":
+                conn.execute(text(f'TRUNCATE TABLE {table_ref} CASCADE'))
+            else:
+                conn.execute(text(f'DELETE FROM {table_ref}'))
+        except Exception:
+            conn.execute(text(f'DELETE FROM {table_ref}'))
+
+# ==================================================
+# SEQUENCES
+# ==================================================
+def fix_sequences(engine, schema):
+    if get_db_type(engine) != "postgresql":
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            DO $$
+            DECLARE r RECORD;
+            BEGIN
+                FOR r IN
+                    SELECT sequence_name, table_name, column_name
+                    FROM information_schema.sequences s
+                    JOIN information_schema.columns c
+                    ON c.column_default LIKE '%' || s.sequence_name || '%'
+                    WHERE sequence_schema = '{schema}'
+                LOOP
+                    EXECUTE format(
+                        'SELECT setval(''%I.%I'', COALESCE((SELECT MAX(%I) FROM %I.%I),1))',
+                        '{schema}', r.sequence_name, r.column_name, '{schema}', r.table_name
+                    );
+                END LOOP;
+            END$$;
+        """))
+
+# ==================================================
+# REPLICATION
+# ==================================================
+def set_replication_mode(engine, mode='replica'):
+    if get_db_type(engine) == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text(f"SET session_replication_role = '{mode}'"))
+
+# ==================================================
+# LOCALDB
+# ==================================================
+def create_db_localdb(db_name):
+    subprocess.run(
+        [
+            "sqlcmd",
+            "-S", r"(localdb)\MSSQLLocalDB",
+            "-Q", f"IF DB_ID('{db_name}') IS NULL CREATE DATABASE [{db_name}]"
+        ],
+        check=True
+    )

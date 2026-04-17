@@ -3,6 +3,8 @@ import db_utils
 import anonymizer
 import importlib
 import urllib.parse
+import pyodbc
+import subprocess
 
 # ==================================================
 # RELOAD (DEV)
@@ -20,14 +22,100 @@ st.set_page_config(
 )
 
 # ==================================================
-# HELPERS
+# HELPERS MSSQL
 # ==================================================
-def build_url(user, password, host, port, db):
-    safe_user = urllib.parse.quote_plus(user)
-    safe_password = urllib.parse.quote_plus(password)
-    return f"postgresql://{safe_user}:{safe_password}@{host}:{port}/{db}"
+def get_sqlserver_driver():
+    drivers = pyodbc.drivers()
+    for d in reversed(drivers):
+        if "SQL Server" in d:
+            return d
+    raise Exception("Nenhum driver ODBC encontrado")
 
 
+def get_localdb_pipe(instance="MSSQLLocalDB"):
+    try:
+        result = subprocess.run(
+            ["sqllocaldb", "info", instance],
+            capture_output=True,
+            text=True
+        )
+
+        for line in result.stdout.splitlines():
+            if "Instance pipe name" in line:
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def create_db_localdb_if_not_exists(db_name):
+    try:
+        subprocess.run(
+            [
+                "sqlcmd",
+                "-S", r"(localdb)\MSSQLLocalDB",
+                "-Q", f"IF DB_ID('{db_name}') IS NULL CREATE DATABASE [{db_name}]"
+            ],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+    except Exception as e:
+        raise Exception(f"Erro ao criar banco no LocalDB: {e}")
+
+
+# ==================================================
+# BUILD URL
+# ==================================================
+def build_url(db_type, user, password, host, port, db):
+
+    if db_type == "mssql":
+        driver = get_sqlserver_driver()
+
+        # LOCALDB
+        if host and "localdb" in host.lower():
+            pipe = get_localdb_pipe()
+
+            if not pipe:
+                raise Exception("LocalDB não encontrado")
+
+            odbc_str = (
+                f"DRIVER={{{driver}}};"
+                f"SERVER={pipe};"
+                f"DATABASE={db};"
+                "Trusted_Connection=yes;"
+            )
+
+            params = urllib.parse.quote_plus(odbc_str)
+            return f"mssql+pyodbc:///?odbc_connect={params}"
+
+        # SQL SERVER NORMAL
+        else:
+            driver_encoded = urllib.parse.quote_plus(driver)
+
+            return (
+                f"mssql+pyodbc://@{host}:{port}/{db}"
+                f"?driver={driver_encoded}&trusted_connection=yes"
+            )
+
+    elif db_type == "postgresql":
+        safe_user = urllib.parse.quote_plus(user)
+        safe_password = urllib.parse.quote_plus(password)
+        return f"postgresql+psycopg://{safe_user}:{safe_password}@{host}:{port}/{db}"
+
+    elif db_type == "mysql":
+        safe_user = urllib.parse.quote_plus(user)
+        safe_password = urllib.parse.quote_plus(password)
+        return f"mysql+pymysql://{safe_user}:{safe_password}@{host}:{port}/{db}"
+
+    else:
+        raise ValueError(f"Banco não suportado: {db_type}")
+
+
+# ==================================================
+# CLASSIFICAÇÃO
+# ==================================================
 def classify_columns(info: dict) -> dict:
     treatments = {}
     pks = info.get("primary_keys", [])
@@ -66,10 +154,16 @@ if "stats" not in st.session_state:
 with st.sidebar:
     st.title("🛡️ Aegis Control")
 
+    db_type = st.selectbox(
+        "Tipo do Banco",
+        ["postgresql", "mysql", "mssql"]
+    )
+
     st.subheader("🔴 ORIGEM")
     src_host = st.text_input("Host", "localhost")
-    src_user = st.text_input("Usuário", "postgres")
+    src_user = st.text_input("Usuário", "")
     src_pass = st.text_input("Senha", type="password")
+    src_port = st.text_input("Porta", "5432")
     src_db = st.text_input("Banco Origem")
 
     st.divider()
@@ -104,22 +198,29 @@ progress = st.progress(0)
 # ==================================================
 if btn_iniciar:
 
+    if not src_db or not dst_db:
+        st.error("❌ Informe os bancos origem e destino")
+        st.stop()
+
     if src_db.strip() == dst_db.strip():
         st.error("❌ Banco origem e destino NÃO podem ser iguais")
         st.stop()
 
     try:
-        src_url = build_url(src_user, src_pass, src_host, "5432", src_db)
-        dst_url = build_url(src_user, src_pass, src_host, "5432", dst_db)
-        admin_url = build_url(src_user, src_pass, src_host, "5432", "postgres")
+        src_url = build_url(db_type, src_user, src_pass, src_host, src_port, src_db)
+        dst_url = build_url(db_type, src_user, src_pass, src_host, src_port, dst_db)
+
+        status.info("🔧 Preparando ambiente...")
+
+        # 🔥 FIX LOCALDB
+        if db_type == "mssql" and src_host and "localdb" in src_host.lower():
+            create_db_localdb_if_not_exists(dst_db)
 
         status.info("🔌 Conectando...")
 
         src_engine = db_utils.connect(src_url)
-        db_utils.recreate_database_if_not_exists(admin_url, dst_db)
         dst_engine = db_utils.connect(dst_url)
 
-        # 🔥 desativa FK
         db_utils.set_replication_mode(dst_engine, "replica")
 
         schemas = db_utils.get_user_schemas(src_engine)
@@ -143,9 +244,7 @@ if btn_iniciar:
 
                 db_utils.truncate_table(dst_engine, table, schema)
 
-                for chunk in db_utils.fetch_rows_streaming(
-                    src_engine, table, schema, chunk_size
-                ):
+                for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, chunk_size):
                     rows = [dict(r) for r in chunk]
 
                     if "Anonimização" in modo:
@@ -174,10 +273,8 @@ if btn_iniciar:
 
                 st.toast(f"{table} OK", icon="✅")
 
-            # 🔥 ajustar sequences
             db_utils.fix_sequences(dst_engine, schema)
 
-        # 🔥 reativa FK
         db_utils.set_replication_mode(dst_engine, "origin")
 
         status.success("✅ FINALIZADO")
