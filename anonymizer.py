@@ -12,22 +12,28 @@ fake = Faker("pt_BR")
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
     "RG": re.compile(r"\b\d{1,2}\.?\d{3,5}\.?\d{3}-?[0-9Xx]\b"),
-    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9?\d{4})-?\d{4}\b"),
+    "PHONE": re.compile(
+        r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"
+    ),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
     "CEP": re.compile(r"\b\d{5}-?\d{3}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{10,17}\b", re.IGNORECASE),
+    "CHASSI": re.compile(r"\b(?=.*\d)[A-HJ-NPR-Z0-9]{10,17}\b", re.IGNORECASE),
     "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
 
 # nomes mais realistas
 REGEX_NAME = re.compile(
-    r'\b[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+'
-    r'(?:\s+[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+){1,3}\b'
+    r'\b(?:'
+    r'[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}(?:\s+[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}){1,3}'  # CAPS
+    r'|'
+    r'[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+(?:\s+[a-záàâãéèíóúç]+){1,3}'  # normal
+    r')\b',
+    re.IGNORECASE
 )
 
 # =========================
-# MEMÓRIA
+# MEMÓRIA (CONSISTÊNCIA GLOBAL)
 # =========================
 
 _memory = {
@@ -39,27 +45,34 @@ _memory = {
     "CEP": {},
     "PLATE": {},
     "CHASSI": {},
-    "IP": {},
-    "ID": {}
+    "IP": {}
 }
 
 # =========================
 # HELPERS
 # =========================
 
-def only_digits(v):
-    return re.sub(r"\D", "", str(v))
+def _normalize(v):
+    return " ".join(str(v).strip().upper().split())
+
+
+def _normalize_name(v):
+    return " ".join(str(v).strip().lower().split())
 
 
 def limit(val, size):
     return str(val)[:size]
 
 
-def _normalize(v):
-    return str(v).strip().upper()
+def mask_pattern(x):
+    return "".join(
+        random.choice(string.digits) if c.isdigit()
+        else random.choice(string.ascii_uppercase) if c.isalpha()
+        else c
+        for c in str(x)
+    )
 
 
-# 🔧 FIX IMPORTANTE: função segura e consistente
 def _get(val, cat, fn):
     v = _normalize(val)
 
@@ -71,30 +84,50 @@ def _get(val, cat, fn):
 
     return _memory[cat][v]
 
+# =========================
+# VALIDAÇÃO DE NOMES
+# =========================
 
-def mask_pattern(x):
-    return "".join(
-        random.choice(string.digits) if c.isdigit()
-        else random.choice(string.ascii_uppercase) if c.isalpha()
-        else c
-        for c in str(x)
-    )
+def _is_valid_name(n):
+    partes = n.split()
+
+    if len(partes) < 2 or len(partes) > 4:
+        return False
+
+    # evita lixo tipo "DE DA DOS"
+    valid_parts = [p for p in partes if len(p) > 2]
+
+    if len(valid_parts) < 2:
+        return False
+
+    return True
 
 # =========================
-# NAMES DETECTOR
+# NAMES DETECTOR (SEGURO)
 # =========================
 
 def _replace_names(text):
-    nomes = REGEX_NAME.findall(text)
+    nomes = set(REGEX_NAME.findall(text))
 
-    for n in set(nomes):
-        text = text.replace(n, fake.name().upper())
+    for n in sorted(nomes, key=len, reverse=True):
+
+        if not _is_valid_name(n):
+            continue
+
+        fake_name = _get(_normalize_name(n), "PER", lambda: fake.name().upper())
+
+        # protege contra variações (case insensitive real)
+        text = re.sub(
+            rf"(?<!\w){re.escape(n)}(?!\w)",
+            fake_name,
+            text,
+            flags=re.IGNORECASE
+        )
 
     return text
 
-
 # =========================
-# TEXTO LIVRE (INTELIGENTE E NÃO AGRESSIVO)
+# TEXTO LIVRE
 # =========================
 
 def anonymize_text(val):
@@ -103,24 +136,27 @@ def anonymize_text(val):
 
     text = val
 
-    # nomes primeiro
-    text = _replace_names(text)
-
+    # 1. PII estruturado primeiro
     def repl(cat, fn):
         return lambda m: _get(m.group(), cat, fn)
 
-    # substituições seguras
     text = REGEX["CPF"].sub(repl("CPF", fake.cpf), text)
     text = REGEX["RG"].sub(repl("RG", fake.rg), text)
     text = REGEX["PHONE"].sub(repl("PHONE", fake.phone_number), text)
     text = REGEX["EMAIL"].sub(repl("EMAIL", fake.email), text)
     text = REGEX["CEP"].sub(repl("CEP", fake.postcode), text)
     text = REGEX["PLATE"].sub(repl("PLATE", fake.license_plate), text)
-    text = REGEX["CHASSI"].sub(
-    lambda m: _get(m.group(), "CHASSI", lambda: mask_pattern(m.group())),
-    text
-        )
 
+    # 2. nomes depois (evita conflito com CPF/RG etc)
+    text = _replace_names(text)
+
+    # 3. CHASSI (mais seguro)
+    text = REGEX["CHASSI"].sub(
+        lambda m: _get(m.group(), "CHASSI", lambda: mask_pattern(m.group())),
+        text
+    )
+
+    # 4. IP fixo (ou mascarado se quiser evoluir depois)
     text = REGEX["IP"].sub(
         lambda m: _get(m.group(), "IP", lambda: "0.0.0.0"),
         text
@@ -128,9 +164,8 @@ def anonymize_text(val):
 
     return limit(text, 500)
 
-
 # =========================
-# FUNÇÃO PRINCIPAL (CONTROLADA)
+# FUNÇÃO PRINCIPAL
 # =========================
 
 def anonymize_value(col, val, is_numeric=False):
@@ -151,7 +186,7 @@ def anonymize_value(col, val, is_numeric=False):
     if "rg" in col_lower:
         return _get(val_str, "RG", fake.rg), "RG"
 
-    if "telefone" in col_lower or "fone" in col_lower or "celular" in col_lower:
+    if any(x in col_lower for x in ["telefone", "fone", "celular"]):
         return _get(val_str, "PHONE", fake.phone_number), "PHONE"
 
     if "email" in col_lower:
@@ -161,17 +196,12 @@ def anonymize_value(col, val, is_numeric=False):
         return _get(val_str, "PER", lambda: fake.name().upper()), "PER"
 
     # =========================
-    # DETECÇÃO DINÂMICA (MENOS AGRESSIVA)
+    # DETECÇÃO DINÂMICA
     # =========================
 
-    has_pii_pattern = any(
-        r.search(val_str)
-        for r in REGEX.values()
-    )
-
+    has_pii_pattern = any(r.search(val_str) for r in REGEX.values())
     has_name = bool(REGEX_NAME.search(val_str))
 
-    # só anonimiza se REALMENTE parecer dado sensível
     if has_pii_pattern or has_name:
         new_val = anonymize_text(val_str)
 
@@ -179,7 +209,7 @@ def anonymize_value(col, val, is_numeric=False):
             return new_val, "TEXT"
 
     # =========================
-    # NÃO MEXE EM TEXTO NORMAL
+    # DEFAULT
     # =========================
 
     return val_str, None
