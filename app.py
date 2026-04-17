@@ -73,7 +73,6 @@ def build_url(db_type, user, password, host, port, db):
     if db_type == "mssql":
         driver = get_sqlserver_driver()
 
-        # LOCALDB
         if host and "localdb" in host.lower():
             pipe = get_localdb_pipe()
 
@@ -90,7 +89,6 @@ def build_url(db_type, user, password, host, port, db):
             params = urllib.parse.quote_plus(odbc_str)
             return f"mssql+pyodbc:///?odbc_connect={params}"
 
-        # SQL SERVER NORMAL
         else:
             driver_encoded = urllib.parse.quote_plus(driver)
 
@@ -102,7 +100,9 @@ def build_url(db_type, user, password, host, port, db):
     elif db_type == "postgresql":
         safe_user = urllib.parse.quote_plus(user)
         safe_password = urllib.parse.quote_plus(password)
-        return f"postgresql+psycopg://{safe_user}:{safe_password}@{host}:{port}/{db}"
+
+        # ✔ CORREÇÃO PRINCIPAL AQUI
+        return f"postgresql+psycopg2://{safe_user}:{safe_password}@{host}:{port}/{db}"
 
     elif db_type == "mysql":
         safe_user = urllib.parse.quote_plus(user)
@@ -212,7 +212,6 @@ if btn_iniciar:
 
         status.info("🔧 Preparando ambiente...")
 
-        # 🔥 FIX LOCALDB
         if db_type == "mssql" and src_host and "localdb" in src_host.lower():
             create_db_localdb_if_not_exists(dst_db)
 
