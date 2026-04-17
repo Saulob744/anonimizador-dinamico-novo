@@ -22,18 +22,27 @@ REGEX = {
     "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
 
-# nomes mais realistas
+# =========================
+# REGEX NOME (ROBUSTO)
+# =========================
+
 REGEX_NAME = re.compile(
-    r'\b(?:'
-    r'[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}(?:\s+[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}){1,3}'  # CAPS
+    r'\b('
+    # MAIÚSCULO
+    r'(?:[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}\s+){1,3}[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}'
     r'|'
-    r'[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+(?:\s+[a-záàâãéèíóúç]+){1,3}'  # normal
-    r')\b',
-    re.IGNORECASE
+    # Capitalizado com conectores
+    r'[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+'
+    r'(?:\s+(?:da|de|do|dos|das)?\s*[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+){1,2}'
+    r'|'
+    # minúsculo completo
+    r'[a-záàâãéèíóúç]{3,}'
+    r'(?:\s+[a-záàâãéèíóúç]{3,}){2,3}'
+    r')\b'
 )
 
 # =========================
-# MEMÓRIA (CONSISTÊNCIA GLOBAL)
+# MEMÓRIA
 # =========================
 
 _memory = {
@@ -74,7 +83,10 @@ def mask_pattern(x):
 
 
 def _get(val, cat, fn):
-    v = _normalize(val)
+    if cat == "PER":
+        v = _normalize_name(val)
+    else:
+        v = _normalize(val)
 
     if cat not in _memory:
         _memory[cat] = {}
@@ -89,34 +101,47 @@ def _get(val, cat, fn):
 # =========================
 
 def _is_valid_name(n):
-    partes = n.split()
+    partes = n.strip().split()
 
     if len(partes) < 2 or len(partes) > 4:
         return False
 
-    # evita lixo tipo "DE DA DOS"
-    valid_parts = [p for p in partes if len(p) > 2]
+    partes_validas = [
+        p for p in partes
+        if p.lower() not in ["da", "de", "do", "dos", "das"]
+    ]
 
-    if len(valid_parts) < 2:
+    if len(partes_validas) < 2:
+        return False
+
+    if re.search(r"\d", n):
+        return False
+
+    if len(n) > 40:
         return False
 
     return True
 
 # =========================
-# NAMES DETECTOR (SEGURO)
+# NAMES DETECTOR
 # =========================
 
 def _replace_names(text):
+
+    text = re.sub(r"\s+", " ", text)
+
     nomes = set(REGEX_NAME.findall(text))
+
+    # 🔥 evita frases grandes virarem nome
+    nomes = [n for n in nomes if len(n.split()) <= 4]
 
     for n in sorted(nomes, key=len, reverse=True):
 
         if not _is_valid_name(n):
             continue
 
-        fake_name = _get(_normalize_name(n), "PER", lambda: fake.name().upper())
+        fake_name = _get(n, "PER", lambda: fake.name().upper())
 
-        # protege contra variações (case insensitive real)
         text = re.sub(
             rf"(?<!\w){re.escape(n)}(?!\w)",
             fake_name,
@@ -136,10 +161,10 @@ def anonymize_text(val):
 
     text = val
 
-    # 1. PII estruturado primeiro
     def repl(cat, fn):
         return lambda m: _get(m.group(), cat, fn)
 
+    # 1. dados estruturados
     text = REGEX["CPF"].sub(repl("CPF", fake.cpf), text)
     text = REGEX["RG"].sub(repl("RG", fake.rg), text)
     text = REGEX["PHONE"].sub(repl("PHONE", fake.phone_number), text)
@@ -147,16 +172,16 @@ def anonymize_text(val):
     text = REGEX["CEP"].sub(repl("CEP", fake.postcode), text)
     text = REGEX["PLATE"].sub(repl("PLATE", fake.license_plate), text)
 
-    # 2. nomes depois (evita conflito com CPF/RG etc)
+    # 2. nomes
     text = _replace_names(text)
 
-    # 3. CHASSI (mais seguro)
+    # 3. chassi
     text = REGEX["CHASSI"].sub(
         lambda m: _get(m.group(), "CHASSI", lambda: mask_pattern(m.group())),
         text
     )
 
-    # 4. IP fixo (ou mascarado se quiser evoluir depois)
+    # 4. IP
     text = REGEX["IP"].sub(
         lambda m: _get(m.group(), "IP", lambda: "0.0.0.0"),
         text
@@ -176,10 +201,7 @@ def anonymize_value(col, val, is_numeric=False):
     val_str = str(val)
     col_lower = col.lower()
 
-    # =========================
-    # COLUNAS EXPLÍCITAS
-    # =========================
-
+    # colunas explícitas
     if "cpf" in col_lower:
         return _get(val_str, "CPF", fake.cpf), "CPF"
 
@@ -195,21 +217,10 @@ def anonymize_value(col, val, is_numeric=False):
     if "nome" in col_lower or "usuario" in col_lower:
         return _get(val_str, "PER", lambda: fake.name().upper()), "PER"
 
-    # =========================
-    # DETECÇÃO DINÂMICA
-    # =========================
+    # 🔥 SEMPRE processa texto livre
+    new_val = anonymize_text(val_str)
 
-    has_pii_pattern = any(r.search(val_str) for r in REGEX.values())
-    has_name = bool(REGEX_NAME.search(val_str))
-
-    if has_pii_pattern or has_name:
-        new_val = anonymize_text(val_str)
-
-        if new_val != val_str:
-            return new_val, "TEXT"
-
-    # =========================
-    # DEFAULT
-    # =========================
+    if new_val != val_str:
+        return new_val, "TEXT"
 
     return val_str, None
