@@ -12,32 +12,26 @@ fake = Faker("pt_BR")
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
     "RG": re.compile(r"\b\d{1,2}\.?\d{3,5}\.?\d{3}-?[0-9Xx]\b"),
-    "PHONE": re.compile(
-        r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"
-    ),
+    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
     "CEP": re.compile(r"\b\d{5}-?\d{3}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
     "CHASSI": re.compile(r"\b(?=.*\d)[A-HJ-NPR-Z0-9]{10,17}\b", re.IGNORECASE),
     "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+
+    # código mais restrito
+    "CODE": re.compile(r"\b[A-Z]{2,5}-\d+[A-Z0-9]*\b")
 }
 
 # =========================
-# REGEX NOME (ROBUSTO)
+# REGEX NOME (AJUSTADO)
 # =========================
 
 REGEX_NAME = re.compile(
     r'\b('
-    # MAIÚSCULO
-    r'(?:[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}\s+){1,3}[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}'
-    r'|'
-    # Capitalizado com conectores
-    r'[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+'
-    r'(?:\s+(?:da|de|do|dos|das)?\s*[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+){1,2}'
-    r'|'
-    # minúsculo completo
-    r'[a-záàâãéèíóúç]{3,}'
-    r'(?:\s+[a-záàâãéèíóúç]{3,}){2,3}'
+    r'(?:[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}|[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+)'
+    r'(?:\s+(?:da|de|do|dos|das))?'
+    r'(?:\s+(?:[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}|[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+)){1,2}'
     r')\b'
 )
 
@@ -45,17 +39,7 @@ REGEX_NAME = re.compile(
 # MEMÓRIA
 # =========================
 
-_memory = {
-    "PER": {},
-    "CPF": {},
-    "RG": {},
-    "PHONE": {},
-    "EMAIL": {},
-    "CEP": {},
-    "PLATE": {},
-    "CHASSI": {},
-    "IP": {}
-}
+_memory = {}
 
 # =========================
 # HELPERS
@@ -64,14 +48,11 @@ _memory = {
 def _normalize(v):
     return " ".join(str(v).strip().upper().split())
 
-
 def _normalize_name(v):
     return " ".join(str(v).strip().lower().split())
 
-
 def limit(val, size):
     return str(val)[:size]
-
 
 def mask_pattern(x):
     return "".join(
@@ -81,87 +62,90 @@ def mask_pattern(x):
         for c in str(x)
     )
 
-
 def _get(val, cat, fn):
-    if cat == "PER":
-        v = _normalize_name(val)
-    else:
-        v = _normalize(val)
+    key = (_normalize_name(val) if cat == "PER" else _normalize(val))
 
     if cat not in _memory:
         _memory[cat] = {}
 
-    if v not in _memory[cat]:
-        _memory[cat][v] = fn()
+    if key not in _memory[cat]:
+        _memory[cat][key] = fn()
 
-    return _memory[cat][v]
+    return _memory[cat][key]
 
 # =========================
-# VALIDAÇÃO DE NOMES
+# VALIDAÇÃO INTELIGENTE
 # =========================
 
 def _is_valid_name(n):
+
     partes = n.strip().split()
 
-    if len(partes) < 2 or len(partes) > 4:
+    # 1. tamanho típico de nome
+    if len(partes) < 2 or len(partes) > 3:
         return False
 
-    partes_validas = [
-        p for p in partes
-        if p.lower() not in ["da", "de", "do", "dos", "das"]
-    ]
-
-    if len(partes_validas) < 2:
+    # 2. não pode ter número
+    if any(re.search(r"\d", p) for p in partes):
         return False
 
-    if re.search(r"\d", n):
+    # 3. cada parte deve ter tamanho razoável
+    # evita "a de x", "q w e"
+    if any(len(p) < 3 for p in partes):
         return False
 
-    if len(n) > 40:
+    # 4. evitar palavras muito longas (frases disfarçadas)
+    if any(len(p) > 15 for p in partes):
+        return False
+
+    # 5. padrão de capitalização consistente
+    score = 0
+
+    for p in partes:
+        if p.isupper():
+            score += 1
+        elif p[0].isupper():
+            score += 1
+
+    # pelo menos 2 partes com padrão de nome
+    if score < 2:
+        return False
+
+    # 6. evita sequências "fraseadas"
+    # (muitas letras minúsculas contínuas → típico de texto)
+    if n.islower() and len(n) > 20:
+        return False
+
+    # 7. evita tokens muito variados (ex: "afirma que nao conhece")
+    # mede diversidade de tamanhos → frases são mais irregulares
+    tamanhos = [len(p) for p in partes]
+    if max(tamanhos) - min(tamanhos) > 10:
         return False
 
     return True
 
 # =========================
-# NAMES DETECTOR
+# NAMES
 # =========================
 
 def _replace_names(text):
 
-    text = re.sub(r"\s+", " ", text)
+    def repl(match):
+        nome = match.group()
 
-    # 1. detectar nomes
-    nomes = set(REGEX_NAME.findall(text))
-    nomes = [n for n in nomes if len(n.split()) <= 4]
-    nomes = [n for n in nomes if _is_valid_name(n)]
+        if not _is_valid_name(nome):
+            return nome
 
-    # 2. criar mapa NORMALIZADO
-    mapa = {}
+        return _get(nome, "PER", lambda: fake.first_name().upper() + " " + fake.last_name().upper())
 
-    for n in nomes:
-        key = _normalize_name(n)
-        if key not in mapa:
-            mapa[key] = fake.first_name().upper() + " " + fake.last_name().upper()
-
-    # 3. função segura de substituição
-    def substituir(match):
-        original = match.group()
-        key = _normalize_name(original)
-
-        return mapa.get(key, original)
-
-    # 4. pattern seguro (sem depender do mapa diretamente)
-    pattern = re.compile(REGEX_NAME.pattern, re.IGNORECASE)
-
-    text = pattern.sub(substituir, text)
-
-    return text
+    return REGEX_NAME.sub(repl, text)
 
 # =========================
 # TEXTO LIVRE
 # =========================
 
 def anonymize_text(val):
+
     if not isinstance(val, str):
         return val
 
@@ -170,7 +154,6 @@ def anonymize_text(val):
     def repl(cat, fn):
         return lambda m: _get(m.group(), cat, fn)
 
-    # 1. dados estruturados
     text = REGEX["CPF"].sub(repl("CPF", fake.cpf), text)
     text = REGEX["RG"].sub(repl("RG", fake.rg), text)
     text = REGEX["PHONE"].sub(repl("PHONE", fake.phone_number), text)
@@ -178,22 +161,36 @@ def anonymize_text(val):
     text = REGEX["CEP"].sub(repl("CEP", fake.postcode), text)
     text = REGEX["PLATE"].sub(repl("PLATE", fake.license_plate), text)
 
-    # 2. nomes
+    # nomes
     text = _replace_names(text)
 
-    # 3. chassi
     text = REGEX["CHASSI"].sub(
         lambda m: _get(m.group(), "CHASSI", lambda: mask_pattern(m.group())),
         text
     )
 
-    # 4. IP
     text = REGEX["IP"].sub(
         lambda m: _get(m.group(), "IP", lambda: "0.0.0.0"),
         text
     )
 
     return limit(text, 500)
+
+# =========================
+# DETECTOR DE CÓDIGO
+# =========================
+
+def is_probably_code(text):
+    if not isinstance(text, str):
+        return False
+
+    if len(text) > 40:
+        return False
+
+    if REGEX["CODE"].fullmatch(text.strip()):
+        return True
+
+    return False
 
 # =========================
 # FUNÇÃO PRINCIPAL
@@ -207,7 +204,10 @@ def anonymize_value(col, val, is_numeric=False):
     val_str = str(val)
     col_lower = col.lower()
 
-    # colunas explícitas
+    # 🔥 código isolado
+    if is_probably_code(val_str):
+        return _get(val_str, "CODE", lambda: mask_pattern(val_str)), "CODE"
+
     if "cpf" in col_lower:
         return _get(val_str, "CPF", fake.cpf), "CPF"
 
@@ -223,7 +223,6 @@ def anonymize_value(col, val, is_numeric=False):
     if "nome" in col_lower or "usuario" in col_lower:
         return _get(val_str, "PER", lambda: fake.name().upper()), "PER"
 
-    # 🔥 SEMPRE processa texto livre
     new_val = anonymize_text(val_str)
 
     if new_val != val_str:
