@@ -130,24 +130,30 @@ def _replace_names(text):
 
     text = re.sub(r"\s+", " ", text)
 
+    # 1. detectar nomes
     nomes = set(REGEX_NAME.findall(text))
-
-    # 🔥 evita frases grandes virarem nome
     nomes = [n for n in nomes if len(n.split()) <= 4]
+    nomes = [n for n in nomes if _is_valid_name(n)]
 
-    for n in sorted(nomes, key=len, reverse=True):
+    # 2. criar mapa NORMALIZADO
+    mapa = {}
 
-        if not _is_valid_name(n):
-            continue
+    for n in nomes:
+        key = _normalize_name(n)
+        if key not in mapa:
+            mapa[key] = fake.first_name().upper() + " " + fake.last_name().upper()
 
-        fake_name = _get(n, "PER", lambda: fake.name().upper())
+    # 3. função segura de substituição
+    def substituir(match):
+        original = match.group()
+        key = _normalize_name(original)
 
-        text = re.sub(
-            rf"(?<!\w){re.escape(n)}(?!\w)",
-            fake_name,
-            text,
-            flags=re.IGNORECASE
-        )
+        return mapa.get(key, original)
+
+    # 4. pattern seguro (sem depender do mapa diretamente)
+    pattern = re.compile(REGEX_NAME.pattern, re.IGNORECASE)
+
+    text = pattern.sub(substituir, text)
 
     return text
 
