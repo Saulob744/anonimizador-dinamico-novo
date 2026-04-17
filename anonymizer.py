@@ -27,10 +27,17 @@ REGEX = {
 # =========================
 
 REGEX_NAME = re.compile(
-    r'\b(?:'
-    r'[A-Z]{2,}(?:\s+(?:DA|DE|DO|DOS|DAS))?(?:\s+[A-Z]{2,}){1,3}'  # JOAO DA SILVA
+    r'\b('
+    # MAIÚSCULO
+    r'(?:[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}\s+){1,3}[A-ZÁÀÂÃÉÈÍÓÚÇ]{2,}'
     r'|'
-    r'[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+(?:\s+(?:da|de|do|dos|das))?(?:\s+[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+){1,3}'  # Nome normal
+    # Capitalizado com conectores
+    r'[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+'
+    r'(?:\s+(?:da|de|do|dos|das)?\s*[A-ZÁÀÂÃÉÈÍÓÚÇ][a-záàâãéèíóúç]+){1,2}'
+    r'|'
+    # minúsculo completo
+    r'[a-záàâãéèíóúç]{3,}'
+    r'(?:\s+[a-záàâãéèíóúç]{3,}){2,3}'
     r')\b'
 )
 
@@ -123,32 +130,30 @@ def _replace_names(text):
 
     text = re.sub(r"\s+", " ", text)
 
-    encontrados = REGEX_NAME.findall(text)
+    # 1. detectar nomes
+    nomes = set(REGEX_NAME.findall(text))
+    nomes = [n for n in nomes if len(n.split()) <= 4]
+    nomes = [n for n in nomes if _is_valid_name(n)]
 
+    # 2. criar mapa NORMALIZADO
     mapa = {}
 
-    # 🔥 FILTRA + NORMALIZA
-    for n in sorted(set(encontrados), key=len, reverse=True):
-
-        if not _is_valid_name(n):
-            continue
-
+    for n in nomes:
         key = _normalize_name(n)
-
         if key not in mapa:
             mapa[key] = fake.first_name().upper() + " " + fake.last_name().upper()
 
-    # 🔥 SUBSTITUIÇÃO CONTROLADA (UM POR UM)
-    for original in sorted(mapa.keys(), key=len, reverse=True):
+    # 3. função segura de substituição
+    def substituir(match):
+        original = match.group()
+        key = _normalize_name(original)
 
-        fake_name = mapa[original]
+        return mapa.get(key, original)
 
-        pattern = re.compile(
-            rf"(?<!\w){re.escape(original)}(?!\w)",
-            re.IGNORECASE
-        )
+    # 4. pattern seguro (sem depender do mapa diretamente)
+    pattern = re.compile(REGEX_NAME.pattern, re.IGNORECASE)
 
-        text = pattern.sub(fake_name, text)
+    text = pattern.sub(substituir, text)
 
     return text
 
