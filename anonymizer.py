@@ -81,48 +81,70 @@ def _is_valid_name(n):
 
     partes = n.strip().split()
 
-    # 1. tamanho típico de nome
-    if len(partes) < 2 or len(partes) > 3:
+    # regra básica
+    if len(partes) < 2 or len(partes) > 4:
         return False
 
-    # 2. não pode ter número
     if any(re.search(r"\d", p) for p in partes):
         return False
 
-    # 3. cada parte deve ter tamanho razoável
-    # evita "a de x", "q w e"
-    if any(len(p) < 3 for p in partes):
-        return False
-
-    # 4. evitar palavras muito longas (frases disfarçadas)
-    if any(len(p) > 15 for p in partes):
-        return False
-
-    # 5. padrão de capitalização consistente
     score = 0
 
+    # =========================
+    # 1. CAPITALIZAÇÃO (FORTE)
+    # =========================
     for p in partes:
+        if p[0].isupper():
+            score += 2
         if p.isupper():
             score += 1
-        elif p[0].isupper():
-            score += 1
 
-    # pelo menos 2 partes com padrão de nome
-    if score < 2:
-        return False
-
-    # 6. evita sequências "fraseadas"
-    # (muitas letras minúsculas contínuas → típico de texto)
-    if n.islower() and len(n) > 20:
-        return False
-
-    # 7. evita tokens muito variados (ex: "afirma que nao conhece")
-    # mede diversidade de tamanhos → frases são mais irregulares
+    # =========================
+    # 2. TAMANHO DAS PALAVRAS
+    # =========================
     tamanhos = [len(p) for p in partes]
-    if max(tamanhos) - min(tamanhos) > 10:
-        return False
 
-    return True
+    if all(3 <= len(p) <= 12 for p in partes):
+        score += 2
+
+    # nomes tendem a ter tamanhos variados
+    if max(tamanhos) - min(tamanhos) >= 2:
+        score += 1
+
+    # =========================
+    # 3. ESTRUTURA NATURAL
+    # =========================
+    conectores = {"da", "de", "do", "dos", "das"}
+    if any(p.lower() in conectores for p in partes):
+        score += 1
+
+    # =========================
+    # 4. PENALIDADES (CRÍTICO)
+    # =========================
+
+    # padrão marca/modelo (curto + tudo maiúsculo)
+    if n.isupper() and len(partes) == 2:
+        if all(len(p) <= 5 for p in partes):
+            score -= 4  # forte penalidade
+
+    # padrão industrial (palavras iguais tamanho)
+    if len(set(tamanhos)) == 1:
+        score -= 2
+
+    # muito curto (tipo VW GOL)
+    if sum(1 for p in partes if len(p) <= 4) == len(partes):
+        score -= 2
+
+    # duas palavras grandes e tudo maiúsculo (CAMINHAO SCANIA)
+    if len(partes) == 2 and n.isupper():
+        if all(len(p) >= 6 for p in partes):
+            score -= 3
+
+    # =========================
+    # 5. DECISÃO FINAL
+    # =========================
+
+    return score >= 3
 
 # =========================
 # NAMES
