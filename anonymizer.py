@@ -79,12 +79,32 @@ def _get(val, cat, fn):
 
 def _is_valid_name(n):
 
-    partes = n.strip().split()
+    n = n.strip()
+
+    # 🔴 evita frases grandes (proteção geral)
+    if len(n) > 40:
+        return False
+
+    partes = n.split()
 
     # regra básica
     if len(partes) < 2 or len(partes) > 4:
         return False
 
+    # 🔴 BLOQUEIO EXTRA: padrão marca/modelo (2 ou 3 palavras)
+    if n.isupper() and 2 <= len(partes) <= 3:
+        if sum(1 for p in partes if len(p) <= 6) >= 2:
+            return False
+
+    # 🔴 BLOQUEIO: endereço (primeira palavra curta tipo Rua/Av)
+    if len(partes[0]) <= 4 and partes[0][0].isupper():
+        return False
+
+    # 🔴 evita romano (XV de Novembro)
+    if re.match(r"^[IVXLCDM]+\b", partes[0]):
+        return False
+
+    # não pode ter número
     if any(re.search(r"\d", p) for p in partes):
         return False
 
@@ -107,9 +127,12 @@ def _is_valid_name(n):
     if all(3 <= len(p) <= 12 for p in partes):
         score += 2
 
-    # nomes tendem a ter tamanhos variados
     if max(tamanhos) - min(tamanhos) >= 2:
         score += 1
+
+    # 🔴 penaliza palavras muito longas (texto disfarçado)
+    if any(len(p) > 15 for p in partes):
+        score -= 2
 
     # =========================
     # 3. ESTRUTURA NATURAL
@@ -119,26 +142,34 @@ def _is_valid_name(n):
         score += 1
 
     # =========================
-    # 4. PENALIDADES (CRÍTICO)
+    # 4. PENALIDADES
     # =========================
 
-    # padrão marca/modelo (curto + tudo maiúsculo)
+    # padrão marca/modelo curto (VW GOL)
     if n.isupper() and len(partes) == 2:
         if all(len(p) <= 5 for p in partes):
-            score -= 4  # forte penalidade
+            score -= 4
 
-    # padrão industrial (palavras iguais tamanho)
+    # palavras com mesmo tamanho (muito artificial)
     if len(set(tamanhos)) == 1:
         score -= 2
 
-    # muito curto (tipo VW GOL)
+    # tudo muito curto
     if sum(1 for p in partes if len(p) <= 4) == len(partes):
         score -= 2
 
-    # duas palavras grandes e tudo maiúsculo (CAMINHAO SCANIA)
+    # duas palavras grandes técnicas
     if len(partes) == 2 and n.isupper():
         if all(len(p) >= 6 for p in partes):
             score -= 3
+
+    # 🔴 penaliza tudo minúsculo (texto comum)
+    if n.islower():
+        score -= 2
+
+    # 🔴 penaliza mistura estranha (ex: texto quebrado)
+    if sum(1 for p in partes if p[0].isupper()) < 2:
+        score -= 2
 
     # =========================
     # 5. DECISÃO FINAL
@@ -155,9 +186,11 @@ def _replace_names(text):
     def repl(match):
         nome = match.group()
 
+        # valida se é nome real
         if not _is_valid_name(nome):
             return nome
 
+        # usa sempre mesmo fake consistente
         return _get(nome, "PER", lambda: fake.first_name().upper() + " " + fake.last_name().upper())
 
     return REGEX_NAME.sub(repl, text)
