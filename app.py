@@ -126,10 +126,16 @@ def classify_columns(info: dict) -> dict:
 
         if name in pks:
             treatments[name] = "SKIP"
+
         elif any(t in ctype for t in ["int", "bigint", "numeric", "double", "real"]):
             treatments[name] = "NUMERIC"
+
         elif any(t in ctype for t in ["date", "time", "timestamp", "bool"]):
             treatments[name] = "SKIP"
+
+        elif any(k in name.lower() for k in ["cpf", "rg", "email", "telefone", "nome"]):
+            treatments[name] = "SENSITIVE"
+
         else:
             treatments[name] = "TEXT"
 
@@ -141,12 +147,15 @@ def classify_columns(info: dict) -> dict:
 # ==================================================
 if "stats" not in st.session_state:
     st.session_state.stats = {
-        "PER": 0,
-        "DOCS": 0,
-        "CONTACTS": 0,
-        "TEXT": 0,
-        "total_rows": 0,
-    }
+    "PER": 0,
+    "CPF": 0,
+    "RG": 0,
+    "PHONE": 0,
+    "EMAIL": 0,
+    "CODE": 0,
+    "TEXT": 0,
+    "total_rows": 0,
+}
 
 # ==================================================
 # SIDEBAR
@@ -186,8 +195,8 @@ st.title("🛡️ Aegis Pipeline")
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Total", f"{st.session_state.stats['total_rows']:,}")
 m2.metric("Pessoas", st.session_state.stats["PER"])
-m3.metric("Docs", st.session_state.stats["DOCS"])
-m4.metric("Contatos", st.session_state.stats["CONTACTS"])
+m3.metric("CPF/RG", st.session_state.stats["CPF"] + st.session_state.stats["RG"])
+m4.metric("Contatos", st.session_state.stats["PHONE"] + st.session_state.stats["EMAIL"])
 m5.metric("Textos", st.session_state.stats["TEXT"])
 
 status = st.empty()
@@ -254,15 +263,18 @@ if btn_iniciar:
 
                                 val_orig = r[col]
 
-                                res_val, cat = anonymizer.anonymize_value(
-                                    col, val_orig, is_numeric=(treat == "NUMERIC")
-                                )
+                                try:
+                                    res_val, cat = anonymizer.anonymize_value(col, val_orig)
+                                except Exception:
+                                    res_val, cat = val_orig, None
 
                                 r[col] = res_val
 
                                 if res_val != val_orig:
                                     st.session_state.stats["total_rows"] += 1
-                                    if cat in st.session_state.stats:
+                                    if cat:
+                                        if cat not in st.session_state.stats:
+                                            st.session_state.stats[cat] = 0
                                         st.session_state.stats[cat] += 1
 
                     db_utils.insert_rows(dst_engine, table, schema, rows)
