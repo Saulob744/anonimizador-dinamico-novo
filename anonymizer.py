@@ -22,11 +22,12 @@ REGEX = {
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
     
-    # NOVO: CHASSI (VIN) - 17 caracteres alfanuméricos
-    "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE),
+    # CHASSI: Pega de 8 a 17 caracteres desde que misture letra e número
+    "CHASSI": re.compile(r"\b(?=.*[A-Z])(?=.*\d)[A-Z0-9]{8,17}\b", re.IGNORECASE),    
     
-    # MELHORADO: Códigos com hífens ou misturas densas de letras e números
-    "CODE": re.compile(r"\b(?=[A-Z]*\d)(?=[\d]*[A-Z])[A-Z0-9-]{5,}\b", re.IGNORECASE),
+    # CÓDIGOS ÚNICOS: Pega qualquer coisa de 5 a 30 caracteres que tenha 
+    # pelo menos UM número e UMA letra (ex: tokens, IDs de sistema, protocolos)
+    "CODE": re.compile(r"\b(?=.*[A-Z])(?=.*\d)[A-Z0-9-]{5,30}\b", re.IGNORECASE),
     
     "NAME_FALLBACK": re.compile(
         r"\b[A-ZÀ-Ÿ][a-zà-ÿ]{2,}(?:\s+(?:da|de|do|dos|das))?(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]{2,}){1,3}\b"
