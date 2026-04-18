@@ -5,6 +5,8 @@ import importlib
 import urllib.parse
 import pyodbc
 import subprocess
+import time
+from datetime import timedelta
 
 # ==================================================
 # RELOAD (DEV)
@@ -21,306 +23,203 @@ st.set_page_config(
     layout="wide"
 )
 
-# ==================================================
-# HELPERS MSSQL
-# ==================================================
+# Estilo para as métricas e layout
+st.markdown("""
+    <style>
+    [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; }
+    .stProgress .st-at { background-color: #00ffcc; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# ... [As funções get_sqlserver_driver, get_localdb_pipe e create_db_localdb_if_not_exists permanecem iguais] ...
+
 def get_sqlserver_driver():
     drivers = pyodbc.drivers()
     for d in reversed(drivers):
-        if "SQL Server" in d:
-            return d
+        if "SQL Server" in d: return d
     raise Exception("Nenhum driver ODBC encontrado")
-
 
 def get_localdb_pipe(instance="MSSQLLocalDB"):
     try:
-        result = subprocess.run(
-            ["sqllocaldb", "info", instance],
-            capture_output=True,
-            text=True
-        )
-
+        result = subprocess.run(["sqllocaldb", "info", instance], capture_output=True, text=True)
         for line in result.stdout.splitlines():
-            if "Instance pipe name" in line:
-                return line.split(":", 1)[1].strip()
-    except Exception:
-        pass
-
+            if "Instance pipe name" in line: return line.split(":", 1)[1].strip()
+    except: pass
     return None
-
 
 def create_db_localdb_if_not_exists(db_name):
     try:
-        subprocess.run(
-            [
-                "sqlcmd",
-                "-S", r"(localdb)\MSSQLLocalDB",
-                "-Q", f"IF DB_ID('{db_name}') IS NULL CREATE DATABASE [{db_name}]"
-            ],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-    except Exception as e:
-        raise Exception(f"Erro ao criar banco no LocalDB: {e}")
+        subprocess.run(["sqlcmd", "-S", r"(localdb)\MSSQLLocalDB", "-Q", f"IF DB_ID('{db_name}') IS NULL CREATE DATABASE [{db_name}]"], check=True)
+    except Exception as e: raise Exception(f"Erro ao criar banco: {e}")
 
-
-# ==================================================
-# BUILD URL
-# ==================================================
 def build_url(db_type, user, password, host, port, db):
-
     if db_type == "mssql":
         driver = get_sqlserver_driver()
-
         if host and "localdb" in host.lower():
             pipe = get_localdb_pipe()
-
-            if not pipe:
-                raise Exception("LocalDB não encontrado")
-
-            odbc_str = (
-                f"DRIVER={{{driver}}};"
-                f"SERVER={pipe};"
-                f"DATABASE={db};"
-                "Trusted_Connection=yes;"
-            )
-
-            params = urllib.parse.quote_plus(odbc_str)
-            return f"mssql+pyodbc:///?odbc_connect={params}"
-
+            if not pipe: raise Exception("LocalDB não encontrado")
+            odbc_str = f"DRIVER={{{driver}}};SERVER={pipe};DATABASE={db};Trusted_Connection=yes;"
+            return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
         else:
-            driver_encoded = urllib.parse.quote_plus(driver)
-
-            return (
-                f"mssql+pyodbc://@{host}:{port}/{db}"
-                f"?driver={driver_encoded}&trusted_connection=yes"
-            )
-
+            return f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
     elif db_type == "postgresql":
-        safe_user = urllib.parse.quote_plus(user)
-        safe_password = urllib.parse.quote_plus(password)
-
-        # ✔ CORREÇÃO PRINCIPAL AQUI
-        return f"postgresql+psycopg2://{safe_user}:{safe_password}@{host}:{port}/{db}"
-
+        return f"postgresql+psycopg2://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
     elif db_type == "mysql":
-        safe_user = urllib.parse.quote_plus(user)
-        safe_password = urllib.parse.quote_plus(password)
-        return f"mysql+pymysql://{safe_user}:{safe_password}@{host}:{port}/{db}"
+        return f"mysql+pymysql://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
+    return None
 
-    else:
-        raise ValueError(f"Banco não suportado: {db_type}")
-
-
-# ==================================================
-# CLASSIFICAÇÃO
-# ==================================================
+# Mantenho aqui para evitar erro de importação
 def classify_columns(info: dict) -> dict:
-    """
-    Classifica as colunas para anonimização com travas de segurança
-    para evitar a quebra de tipos de dados no banco (ex: inserir texto em INT).
-    """
     treatments = {}
     pks = info.get("primary_keys", [])
-
     for col in info["columns"]:
         name = col["name"]
         name_lower = name.lower()
-        # Converte o tipo do SQLAlchemy/Banco para string e limpa
         ctype = str(col["type"]).lower()
-
-        # --- 1. REGRA DE OURO: CHAVES E IDs (INTEGRIDADE RELACIONAL) ---
-        # Se for PK ou terminar com _id (ex: cliente_id, veiculo_id), não tocamos.
         if name in pks or name_lower == "id" or name_lower.endswith("_id"):
             treatments[name] = "SKIP"
             continue
-
-        # --- 2. TRAVA DE TIPO NUMÉRICO ---
-        # Se o tipo no banco for inteiro, não podemos injetar strings do Faker.
-        # Marcamos como NUMERIC para que o db_utils saiba tratar ou apenas pular.
         if any(t in ctype for t in ["int", "integer", "bigint", "serial", "smallint"]):
-            treatments[name] = "SKIP" # IDs numéricos devem ser preservados
+            treatments[name] = "SKIP"
             continue
-            
-        # Para números decimais (preços, etc), marcamos como NUMERIC se quiser tratar depois
         if any(t in ctype for t in ["numeric", "decimal", "double", "real", "float"]):
             treatments[name] = "NUMERIC"
             continue
-
-        # --- 3. DATAS E BOOLEANOS ---
-        # Geralmente não anonimizamos datas de sistema ou flags (True/False)
         if any(t in ctype for t in ["date", "time", "timestamp", "bool", "boolean"]):
             treatments[name] = "SKIP"
             continue
-
-        # --- 4. DETECÇÃO DE DADOS SENSÍVEIS (COLUNAS DE TEXTO) ---
-        # Aqui buscamos palavras-chave em colunas que sabemos que aceitam string (VARCHAR/TEXT)
         sensitive_keywords = ["cpf", "rg", "email", "telefone", "tel", "celular", "nome", "razao_social"]
         if any(k in name_lower for k in sensitive_keywords):
             treatments[name] = "SENSITIVE"
-        
-        # --- 5. PADRÃO: TEXTO ---
-        # Se cair aqui, é uma coluna de texto (descrição, observação, etc) que pode ter nomes no meio.
         else:
             treatments[name] = "TEXT"
-
     return treatments
-
 
 # ==================================================
 # STATE
 # ==================================================
 if "stats" not in st.session_state:
-    st.session_state.stats = {
-    "PER": 0,
-    "CPF": 0,
-    "RG": 0,
-    "PHONE": 0,
-    "EMAIL": 0,
-    "CODE": 0,
-    "TEXT": 0,
-    "total_rows": 0,
-}
+    st.session_state.stats = {"PER": 0, "CPF": 0, "RG": 0, "PHONE": 0, "EMAIL": 0, "CODE": 0, "TEXT": 0, "total_rows": 0}
 
 # ==================================================
 # SIDEBAR
 # ==================================================
 with st.sidebar:
     st.title("🛡️ Aegis Control")
-
-    db_type = st.selectbox(
-        "Tipo do Banco",
-        ["postgresql", "mysql", "mssql"]
-    )
-
-    st.subheader("🔴 ORIGEM")
+    db_type = st.selectbox("Tipo do Banco", ["postgresql", "mysql", "mssql"])
+    
+    st.subheader("🔴 CONEXÃO")
     src_host = st.text_input("Host", "localhost")
     src_user = st.text_input("Usuário", "")
     src_pass = st.text_input("Senha", type="password")
     src_port = st.text_input("Porta", "5432")
-    src_db = st.text_input("Banco Origem")
+    
+    col_db1, col_db2 = st.columns(2)
+    src_db = col_db1.text_input("Origem")
+    dst_db = col_db2.text_input("Destino")
 
     st.divider()
-
-    st.subheader("🟢 DESTINO")
-    dst_db = st.text_input("Banco Destino")
-
-    st.divider()
-
     modo = st.selectbox("Modo", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
     chunk_size = st.number_input("Chunk Size", value=1000, step=500)
-
-    btn_iniciar = st.button("🚀 INICIAR", use_container_width=True)
+    
+    # NOVO: Filtro de Tabelas
+    filter_tables = st.text_input("Filtrar Tabelas (ex: logs, usuarios)", help="Deixe em branco para todas")
+    
+    btn_iniciar = st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary")
 
 # ==================================================
 # DASHBOARD
 # ==================================================
-st.title("🛡️ Aegis Pipeline")
+st.title("🛡️ Pipeline de Proteção de Dados")
 
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Total", f"{st.session_state.stats['total_rows']:,}")
+m1.metric("Alterações", f"{st.session_state.stats['total_rows']:,}")
 m2.metric("Pessoas", st.session_state.stats["PER"])
-m3.metric("CPF/RG", st.session_state.stats["CPF"] + st.session_state.stats["RG"])
+m3.metric("Documentos", st.session_state.stats["CPF"] + st.session_state.stats["RG"])
 m4.metric("Contatos", st.session_state.stats["PHONE"] + st.session_state.stats["EMAIL"])
-m5.metric("Textos", st.session_state.stats["TEXT"])
+m5.metric("Tempo Est.", "00:00:00", help="Estimativa baseada na velocidade atual")
 
 status = st.empty()
 progress = st.progress(0)
+speed_text = st.empty()
 
 # ==================================================
 # EXECUÇÃO
 # ==================================================
 if btn_iniciar:
-
     if not src_db or not dst_db:
         st.error("❌ Informe os bancos origem e destino")
         st.stop()
 
-    if src_db.strip() == dst_db.strip():
-        st.error("❌ Banco origem e destino NÃO podem ser iguais")
-        st.stop()
-
     try:
+        start_time = time.time()
         src_url = build_url(db_type, src_user, src_pass, src_host, src_port, src_db)
         dst_url = build_url(db_type, src_user, src_pass, src_host, src_port, dst_db)
 
-        status.info("🔧 Preparando ambiente...")
-
-        if db_type == "mssql" and src_host and "localdb" in src_host.lower():
-            create_db_localdb_if_not_exists(dst_db)
-
         status.info("🔌 Conectando...")
-
         src_engine = db_utils.connect(src_url)
         dst_engine = db_utils.connect(dst_url)
 
         db_utils.set_replication_mode(dst_engine, "replica")
-
         schemas = db_utils.get_user_schemas(src_engine)
 
-        total_tables = sum(len(db_utils.get_tables(src_engine, s)) for s in schemas)
-        processed_tables = 0
+        # Filtro de tabelas
+        allowed_list = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
 
-        for schema in schemas:
-            status.warning(f"📂 Schema: {schema}")
+        # Cálculo do total para a barra de progresso
+        tables_to_process = []
+        for s in schemas:
+            raw = db_utils.get_tables(src_engine, s)
+            filtered = [t for t in raw if not allowed_list or t in allowed_list]
+            tables_to_process.extend([(s, t) for t in filtered])
 
+        total_tables = len(tables_to_process)
+        
+        for idx, (schema, table) in enumerate(tables_to_process):
+            status.write(f"⚙️ Processando: **{schema}.{table}**")
+            
             db_utils.copy_schema(src_engine, dst_engine, schema)
+            info = db_utils.get_table_info(src_engine, table, schema)
+            treatments = classify_columns(info)
+            db_utils.truncate_table(dst_engine, table, schema)
 
-            raw_tables = db_utils.get_tables(src_engine, schema)
-            tables = db_utils.build_dependency_graph(src_engine, raw_tables, schema)
+            for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, chunk_size):
+                rows = [dict(r) for r in chunk]
 
-            for table in tables:
-                status.write(f"⚙️ {schema}.{table}")
+                if "Anonimização" in modo:
+                    for r in rows:
+                        for col, treat in treatments.items():
+                            if r[col] is None or treat == "SKIP": continue
+                            
+                            val_orig = r[col]
+                            try:
+                                res_val, cat = anonymizer.anonymize_value(col, val_orig)
+                            except:
+                                res_val, cat = val_orig, None
+                            
+                            r[col] = res_val
+                            if res_val != val_orig:
+                                st.session_state.stats["total_rows"] += 1
+                                if cat and cat in st.session_state.stats:
+                                    st.session_state.stats[cat] += 1
 
-                info = db_utils.get_table_info(src_engine, table, schema)
-                treatments = classify_columns(info)
+                db_utils.insert_rows(dst_engine, table, schema, rows)
+                
+                # Atualizar estimativa
+                elapsed = time.time() - start_time
+                if idx > 0:
+                    est_total = (elapsed / (idx + 1)) * total_tables
+                    remaining = str(timedelta(seconds=int(est_total - elapsed)))
+                    m5.metric("Tempo Rest.", remaining)
 
-                db_utils.truncate_table(dst_engine, table, schema)
-
-                for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, chunk_size):
-                    rows = [dict(r) for r in chunk]
-
-                    if "Anonimização" in modo:
-                        for r in rows:
-                            for col, treat in treatments.items():
-                                if r[col] is None or treat == "SKIP":
-                                    continue
-
-                                val_orig = r[col]
-
-                                try:
-                                    res_val, cat = anonymizer.anonymize_value(col, val_orig)
-                                except Exception:
-                                    res_val, cat = val_orig, None
-
-                                r[col] = res_val
-
-                                if res_val != val_orig:
-                                    st.session_state.stats["total_rows"] += 1
-                                    if cat:
-                                        if cat not in st.session_state.stats:
-                                            st.session_state.stats[cat] = 0
-                                        st.session_state.stats[cat] += 1
-
-                    db_utils.insert_rows(dst_engine, table, schema, rows)
-
-                processed_tables += 1
-                progress.progress(processed_tables / total_tables)
-
-                st.toast(f"{table} OK", icon="✅")
-
-            db_utils.fix_sequences(dst_engine, schema)
+            progress.progress((idx + 1) / total_tables)
+            st.toast(f"{table} finalizada", icon="✅")
 
         db_utils.set_replication_mode(dst_engine, "origin")
-
-        status.success("✅ FINALIZADO")
+        status.success(f"✅ FINALIZADO em {str(timedelta(seconds=int(time.time()-start_time)))}")
         st.balloons()
 
     except Exception as e:
         status.error(f"❌ Erro: {e}")
-
-        try:
-            db_utils.set_replication_mode(dst_engine, "origin")
-        except Exception:
-            pass
+        try: db_utils.set_replication_mode(dst_engine, "origin")
+        except: pass

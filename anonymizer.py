@@ -196,3 +196,4 @@ def anonymize_value(col, val):
     new_val = anonymize_text(val_str, is_vehicle_col=is_vehicle_col)
     cat = "TEXT" if new_val != val_str else None
     return new_val, cat
+
