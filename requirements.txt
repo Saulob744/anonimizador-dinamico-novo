@@ -1,9 +1,11 @@
 # Web Framework
 streamlit
 
-# Database
+# Database & Conectividade
 sqlalchemy
-psycopg2
+psycopg2-binary
+pyodbc
+pymysql
 pandas
 
 # Utils
@@ -12,6 +14,3 @@ python-dotenv
 # NLP / IA
 faker
 spacy
-
-# spaCy Portuguese model (GitHub - você já confirmou que funciona)
-https://github.com/explosion/spacy-models/releases/download/pt_core_news_lg-3.7.0/pt_core_news_lg-3.7.0-py3-none-any.whl
