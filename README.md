@@ -1,6 +1,56 @@
-🛡️ Aegis Anonymizer ProPrivacidade de dados levada a sério com IA e Engenharia de Dados.O Aegis Anonymizer é uma ferramenta robusta para a criação de bancos de dados de homologação e teste. Ele mascara informações sensíveis (PII - Personally Identifiable Information) através de uma abordagem híbrida que utiliza Processamento de Linguagem Natural (IA) e Motores de Regex Avançados.🚀 Como Usar o SoftwareVocê pode rodar o Aegis de duas formas. O Docker é o método altamente recomendado, pois já configura todos os drivers de banco e modelos de IA automaticamente, evitando conflitos de dependências locais.Opção 1: Via Docker (Recomendado 🌟)Esta opção isola o ambiente e garante que todos os drivers (SQL Server, Postgres, MySQL) funcionem perfeitamente.Build da Imagem:Bashdocker build -t aegis-pro .
-Execução:Bashdocker run -p 8501:8501 aegis-pro
-Acesso: Abra no navegador: http://localhost:8501Opção 2: Instalação Manual (Python Local)Dependências: pip install -r requirements.txtModelo de IA: python -m spacy download pt_core_news_lgExecução: streamlit run app.py🛠️ Guia de Preenchimento (Configuração de Rede)Ao usar o Docker, a comunicação com o banco de dados muda se o banco estiver na mesma máquina onde o container está rodando.📍 Caso 1: Banco em Servidor RemotoSe o banco está em um IP da rede (ex: 10.0.0.50), preencha o campo Host normalmente.📍 Caso 2: Banco na sua Máquina Local (Host)O Docker enxerga "localhost" como o próprio container. Para acessar o banco "fora" dele, use:Windows/Mac: host.docker.internalLinux: 172.17.0.1 (IP padrão da ponte Docker)⚙️ O que o software faz "por baixo dos panos"?Mapeamento Genético: Analisa o esquema do banco, identificando Chaves Primárias (PK) e Estrangeiras (FK).Classificação Inteligente:SKIP: IDs e datas são preservados para manter a integridade relacional.SENSITIVE: CPFs, RGs e Nomes sofrem substituição direta por dados sintéticos.TEXT: Logs e observações são processados via NLP (SpaCy) para remover nomes ocultos em textos livres.Bypass de Integridade: Desabilita temporariamente as restrições de FK no destino, permitindo cargas rápidas e sem erros de ordem de inserção.Estimativa por IA: O tempo restante (ETA) é calculado com base na performance real do modelo de linguagem por linha processada.📋 Requisitos de CampoCampoDescriçãoExemploHostEndereço do banco de dados10.5.1.20 ou host.docker.internalPortaPorta padrão do serviço5432 (PG), 1433 (MSSQL), 3306Banco OrigemBanco com dados reaisdb_producaoBanco DestinoBanco para anonimizaçãodb_homologacaoChunk SizeLinhas por lote de carga1000 (Sugerido)⚠️ Atenção[!CAUTION]Nunca utilize o banco de produção como Destino. O Aegis realiza operações de TRUNCATE no banco de destino antes de iniciar a migração.🌐 Dica para Redes Restritas (Proxy)Se você estiver em uma rede com proxy (Setor Público), buildar a imagem passando os argumentos:Bashdocker build \
- --build-arg http_proxy=http://seu-proxy:porta \
- --build-arg https_proxy=http://seu-proxy:porta \
- -t aegis-pro .
+# 🛡️ Aegis Anonymizer Pro
+
+### _Dados reais. Zero exposição._
+
+<p align="center">
+  <b>Anonimização inteligente de dados com IA + Engenharia de Dados</b><br>
+  Transforme bancos de produção em ambientes seguros para testes e homologação.
+</p>
+
+---
+
+## 🚀 Sobre o projeto
+
+O **Aegis Anonymizer** é uma ferramenta projetada para anonimizar dados sensíveis (**PII**) de forma **realista, consistente e segura**.
+
+Diferente de soluções tradicionais, ele combina:
+
+- 🤖 **NLP (SpaCy)** → entende contexto humano
+- 🔍 **Regex avançadas** → detecta padrões estruturados
+- 🧠 **Memória consistente** → mantém coerência dos dados
+
+---
+
+## ⚡ O que ele resolve
+
+✔ Permite usar dados reais sem expor pessoas  
+✔ Gera bases de homologação confiáveis  
+✔ Remove dados sensíveis mesmo em textos livres
+
+---
+
+## 🧠 Exemplo prático
+
+```text
+Entrada:
+"João da Silva realizou a operação"
+
+Saída:
+"CARLOS PEREIRA realizou a operação"
+
+docker build -t aegis-pro .
+docker run -p 8501:8501 aegis-pro
+
+http://localhost:8501
+
+
+pip install -r requirements.txt
+python -m spacy download pt_core_news_lg
+streamlit run app.py
+
+
+| Sistema       | Host                   |
+| ------------- | ---------------------- |
+| Windows / Mac | `host.docker.internal` |
+| Linux         | `172.17.0.1`           |
+```
