@@ -1,44 +1,5 @@
 # 🛡️ Aegis Anonymizer Pro
 
-### _Dados reais. Zero exposição._
-
-<p align="center">
-  <b>Anonimização inteligente de dados com IA + Engenharia de Dados</b><br>
-  Transforme bancos de produção em ambientes seguros para testes e homologação.
-</p>
-
----
-
-## 🚀 Sobre o projeto
-
-O **Aegis Anonymizer** é uma ferramenta projetada para anonimizar dados sensíveis (**PII**) de forma **realista, consistente e segura**.
-
-Diferente de soluções tradicionais, ele combina:
-
-- 🤖 **NLP (SpaCy)** → entende contexto humano
-- 🔍 **Regex avançadas** → detecta padrões estruturados
-- 🧠 **Memória consistente** → mantém coerência dos dados
-
----
-
-## ⚡ O que ele resolve
-
-✔ Permite usar dados reais sem expor pessoas  
-✔ Gera bases de homologação confiáveis  
-✔ Remove dados sensíveis mesmo em textos livres
-
----
-
-## 🧠 Exemplo prático
-
-Para que o seu repositório no GitHub tenha um aspecto profissional e de "nível sênior", o segredo está no uso de **Badges**, **Callouts** (alertas visuais) e **Divisores de Seção**.
-
-Aqui está o conteúdo formatado em **Markdown Puro**, com a estrutura exata que o GitHub utiliza para estilizar descrições de projetos de software:
-
------
-
-# 🛡️ Aegis Anonymizer Pro
-
 > **AI-Powered Data Privacy & ETL Pipeline**
 
 O **Aegis Anonymizer** é uma solução avançada para o tratamento de dados sensíveis em ambientes de homologação. Utilizando **Processamento de Linguagem Natural (NLP)** e heurísticas de engenharia de dados, o sistema garante que bases de teste sejam seguras e fiéis à realidade, mantendo a conformidade com a LGPD.
