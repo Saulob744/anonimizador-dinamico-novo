@@ -117,25 +117,51 @@ def build_url(db_type, user, password, host, port, db):
 # CLASSIFICAÇÃO
 # ==================================================
 def classify_columns(info: dict) -> dict:
+    """
+    Classifica as colunas para anonimização com travas de segurança
+    para evitar a quebra de tipos de dados no banco (ex: inserir texto em INT).
+    """
     treatments = {}
     pks = info.get("primary_keys", [])
 
     for col in info["columns"]:
         name = col["name"]
+        name_lower = name.lower()
+        # Converte o tipo do SQLAlchemy/Banco para string e limpa
         ctype = str(col["type"]).lower()
 
-        if name in pks:
+        # --- 1. REGRA DE OURO: CHAVES E IDs (INTEGRIDADE RELACIONAL) ---
+        # Se for PK ou terminar com _id (ex: cliente_id, veiculo_id), não tocamos.
+        if name in pks or name_lower == "id" or name_lower.endswith("_id"):
             treatments[name] = "SKIP"
+            continue
 
-        elif any(t in ctype for t in ["int", "bigint", "numeric", "double", "real"]):
+        # --- 2. TRAVA DE TIPO NUMÉRICO ---
+        # Se o tipo no banco for inteiro, não podemos injetar strings do Faker.
+        # Marcamos como NUMERIC para que o db_utils saiba tratar ou apenas pular.
+        if any(t in ctype for t in ["int", "integer", "bigint", "serial", "smallint"]):
+            treatments[name] = "SKIP" # IDs numéricos devem ser preservados
+            continue
+            
+        # Para números decimais (preços, etc), marcamos como NUMERIC se quiser tratar depois
+        if any(t in ctype for t in ["numeric", "decimal", "double", "real", "float"]):
             treatments[name] = "NUMERIC"
+            continue
 
-        elif any(t in ctype for t in ["date", "time", "timestamp", "bool"]):
+        # --- 3. DATAS E BOOLEANOS ---
+        # Geralmente não anonimizamos datas de sistema ou flags (True/False)
+        if any(t in ctype for t in ["date", "time", "timestamp", "bool", "boolean"]):
             treatments[name] = "SKIP"
+            continue
 
-        elif any(k in name.lower() for k in ["cpf", "rg", "email", "telefone", "nome"]):
+        # --- 4. DETECÇÃO DE DADOS SENSÍVEIS (COLUNAS DE TEXTO) ---
+        # Aqui buscamos palavras-chave em colunas que sabemos que aceitam string (VARCHAR/TEXT)
+        sensitive_keywords = ["cpf", "rg", "email", "telefone", "tel", "celular", "nome", "razao_social"]
+        if any(k in name_lower for k in sensitive_keywords):
             treatments[name] = "SENSITIVE"
-
+        
+        # --- 5. PADRÃO: TEXTO ---
+        # Se cair aqui, é uma coluna de texto (descrição, observação, etc) que pode ter nomes no meio.
         else:
             treatments[name] = "TEXT"
 
