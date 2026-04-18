@@ -21,11 +21,13 @@ REGEX = {
     "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    # Captura códigos complexos como AUTH-X9A-001
-    "CODE": re.compile(r"\b[A-Z0-9]{2,10}(?:-[A-Z0-9]{1,10})+\b", re.IGNORECASE),
     
-    # Camada de Segurança Extra: Regex de Nome (fallback caso o NLP falhe)
-    # Suporta nomes compostos com acentos brasileiros
+    # NOVO: CHASSI (VIN) - 17 caracteres alfanuméricos
+    "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE),
+    
+    # MELHORADO: Códigos com hífens ou misturas densas de letras e números
+    "CODE": re.compile(r"\b(?=[A-Z]*\d)(?=[\d]*[A-Z])[A-Z0-9-]{5,}\b", re.IGNORECASE),
+    
     "NAME_FALLBACK": re.compile(
         r"\b[A-ZÀ-Ÿ][a-zà-ÿ]{2,}(?:\s+(?:da|de|do|dos|das))?(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]{2,}){1,3}\b"
     )
@@ -69,17 +71,28 @@ def anonymize_text(text):
     if not isinstance(text, str) or not text: 
         return text
 
-    # 1. NLP (A IA entende o contexto de 'João')
     doc = nlp(text)
     entities = []
+
+    # 1. NLP com Validação Dinâmica
     for ent in doc.ents:
-        if ent.label_ == "PER": 
+        if ent.label_ == "PER":
+            # --- TRAVA DINÂMICA 1: Substantivo Comum ---
+            # Se a palavra principal for um substantivo comum (suspeito, vítima), ignore.
+            if any(t.pos_ == "NOUN" for t in ent):
+                continue
+            
+            # --- TRAVA DINÂMICA 2: Presença de Números ---
+            # Se o "nome" tiver números (ex: Gol 1.0, BMW X6), ignore. 
+            # Nomes de pessoas não têm números.
+            if any(char.isdigit() for char in ent.text):
+                continue
+                
             entities.append({"start": ent.start_char, "end": ent.end_char, "text": ent.text, "type": "PER"})
 
-    # 2. Regex (Apanha documentos e códigos tipo AUTH-X9A)
+    # 2. Regex (Apanha CHASSI, Documentos e Placas)
     for label, pattern in REGEX.items():
         for match in pattern.finditer(text):
-            # Evita duplicar se o NLP já pegou (checagem de sobreposição)
             if not any(e["start"] <= match.start() < e["end"] for e in entities):
                 entities.append({
                     "start": match.start(), 
