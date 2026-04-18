@@ -14,7 +14,6 @@ nlp = spacy.load("pt_core_news_lg")
 # =========================
 # REGEX COM SUPORTE A ACENTOS (LATIN-1)
 # =========================
-# Adicionamos classes de caracteres que cobrem á, é, í, ó, ú, ã, õ, ç, etc.
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
     "RG": re.compile(r"\b\d{1,2}\.?\d{3,5}\.?\d{3}-?[0-9Xx]\b"),
@@ -22,12 +21,10 @@ REGEX = {
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
     
-    # CHASSI: Pega de 8 a 17 caracteres desde que misture letra e número
-    "CHASSI": re.compile(r"\b(?=.*[A-Z])(?=.*\d)[A-Z0-9]{8,17}\b", re.IGNORECASE),    
-    
-    # CÓDIGOS ÚNICOS: Pega qualquer coisa de 5 a 30 caracteres que tenha 
-    # pelo menos UM número e UMA letra (ex: tokens, IDs de sistema, protocolos)
-    "CODE": re.compile(r"\b(?=.*[A-Z])(?=.*\d)[A-Z0-9-]{5,30}\b", re.IGNORECASE),
+    # CORREÇÃO CRÍTICA: Trocamos o .* por [a-zA-Z0-9-]*
+    # Isso obriga a Regex a procurar o número DENTRO da palavra, parando no espaço.
+    "CHASSI": re.compile(r"\b(?=[a-zA-Z0-9]*\d)(?=[a-zA-Z0-9]*[a-zA-Z])[a-zA-Z0-9]{8,17}\b", re.IGNORECASE),    
+    "CODE": re.compile(r"\b(?=[a-zA-Z0-9-]*\d)(?=[a-zA-Z0-9-]*[a-zA-Z])[a-zA-Z0-9-]{5,30}\b", re.IGNORECASE),
     
     "NAME_FALLBACK": re.compile(
         r"\b[A-ZÀ-Ÿ][a-zà-ÿ]{2,}(?:\s+(?:da|de|do|dos|das))?(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]{2,}){1,3}\b"
@@ -68,41 +65,61 @@ def _get(val, cat, fn):
 # PROCESSAMENTO HÍBRIDO (NLP + REGEX)
 # ==========================================
 
-def anonymize_text(text):
+def anonymize_text(text, is_vehicle_col=False):
     if not isinstance(text, str) or not text: 
         return text
 
     doc = nlp(text)
     entities = []
+    
+    # Proteção de marcas identificadas pela IA
+    protected_by_ai = [
+        {"start": ent.start_char, "end": ent.end_char} 
+        for ent in doc.ents if ent.label_ in ["ORG", "MISC", "LOC"]
+    ]
 
-    # 1. NLP com Validação Dinâmica
-    for ent in doc.ents:
-        if ent.label_ == "PER":
-            # --- TRAVA DINÂMICA 1: Substantivo Comum ---
-            # Se a palavra principal for um substantivo comum (suspeito, vítima), ignore.
-            if any(t.pos_ == "NOUN" for t in ent):
-                continue
-            
-            # --- TRAVA DINÂMICA 2: Presença de Números ---
-            # Se o "nome" tiver números (ex: Gol 1.0, BMW X6), ignore. 
-            # Nomes de pessoas não têm números.
-            if any(char.isdigit() for char in ent.text):
-                continue
+    # --- AJUSTE AQUI: Filtro de Pessoas com trava de contexto ---
+    if not is_vehicle_col:
+        text_lower = text.lower()
+        for ent in doc.ents:
+            if ent.label_ == "PER": 
+                # Pega os 15 caracteres antes da entidade para checar contexto
+                prefix = text_lower[max(0, ent.start_char - 15):ent.start_char]
                 
-            entities.append({"start": ent.start_char, "end": ent.end_char, "text": ent.text, "type": "PER"})
+                # Se vier depois de palavras que indicam objetos, ignoramos a anonimização
+                if any(kw in prefix for kw in ["modelo ", "veiculo ", "carro ", "marca "]):
+                    continue
+                    
+                entities.append({"start": ent.start_char, "end": ent.end_char, "text": ent.text, "type": "PER"})
 
-    # 2. Regex (Apanha CHASSI, Documentos e Placas)
+    # O restante da função (Loop de Regex e Substituição) continua igual...
+
+    # 2. Regex
     for label, pattern in REGEX.items():
+        
+        # Se for coluna de veículo, desliga a Regex "caçadora de nomes" para não destruir os modelos
+        if is_vehicle_col and label == "NAME_FALLBACK":
+            continue
+            
         for match in pattern.finditer(text):
-            if not any(e["start"] <= match.start() < e["end"] for e in entities):
+            start, end = match.start(), match.end()
+            
+            # TRAVA INTELIGENTE PARA TEXTO LIVRE: 
+            # Se a Regex achar que é um "Nome", mas a IA disse que é uma "Marca" (ORG), ignoramos!
+            if label == "NAME_FALLBACK":
+                if any(p["start"] <= start < p["end"] or start <= p["start"] < end for p in protected_by_ai):
+                    continue
+
+            # Evita sobreposição
+            if not any(e["start"] <= start < e["end"] for e in entities):
                 entities.append({
-                    "start": match.start(), 
-                    "end": match.end(), 
+                    "start": start, 
+                    "end": end, 
                     "text": match.group(), 
                     "type": label
                 })
 
-    # 3. Ordenação reversa para substituição segura
+    # 3. Ordenação e substituição (MANTENHA EXATAMENTE O QUE VOCÊ JÁ TEM)
     entities.sort(key=lambda x: x["start"], reverse=True)
 
     new_text = text
@@ -114,7 +131,6 @@ def anonymize_text(text):
         elif ent["type"] == "EMAIL":
             subst = _get(ent["text"], "EMAIL", fake.email)
         else:
-            # Para códigos, preserva hífens e números mas troca os valores
             subst = _get(ent["text"], ent["type"], lambda: "".join(
                 random.choice(string.digits) if c.isdigit() 
                 else random.choice(string.ascii_uppercase) if c.isalpha() 
@@ -133,19 +149,15 @@ def anonymize_value(col, val):
     if val is None: 
         return val, None
     
-    # --- CAMADA DE SEGURANÇA 0: IDs e INTEIROS ---
-    # Se o valor original for um número (int) ou a coluna terminar em _id,
-    # nós NÃO rodamos o anonimizador de texto.
+    # Camada 0: IDs
     if isinstance(val, int) or col.lower().endswith('_id') or col.lower() == 'id':
         return val, None
 
     val_str = str(val)
     col_lower = col.lower()
 
-    # --- CAMADA DE SEGURANÇA 1: COLUNAS DIRETAS ---
-    # Só anonimizamos como NOME se não for um ID
+    # Camada 1: Colunas de Pessoas e Docs
     if any(x in col_lower for x in ["nome", "usuario", "proprietario", "cliente"]):
-        # Verificação extra: se o conteúdo parece um número, não é um nome real
         if val_str.isdigit():
             return val, None
         return _get(val_str, "PER", lambda: fake.name().upper()), "PER"
@@ -156,7 +168,13 @@ def anonymize_value(col, val):
     if "email" in col_lower:
         return _get(val_str, "EMAIL", fake.email), "EMAIL"
 
-    # --- CAMADA DE SEGURANÇA 2: TEXTO LIVRE ---
-    new_val = anonymize_text(val_str)
+    # --- A MÁGICA ACONTECE AQUI ---
+    # Detecta se a coluna atual é focada no bem (veículo, modelo, marca)
+    is_vehicle_col = any(x in col_lower for x in ["modelo", "veiculo", "carro", "marca", "descricao"])
+
+    # Camada 2: Texto Livre
+    # Passamos o status da coluna para a função de texto.
+    new_val = anonymize_text(val_str, is_vehicle_col=is_vehicle_col)
+    
     cat = "TEXT" if new_val != val_str else None
     return new_val, cat
