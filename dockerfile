@@ -2,7 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 1. Configurações de Proxy
+# =========================
+# 1. PROXY (opcional)
+# =========================
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
@@ -11,36 +13,48 @@ ENV http_proxy=$http_proxy
 ENV https_proxy=$https_proxy
 ENV no_proxy=$no_proxy
 
-# 2. Instala dependências de sistema e drivers para SQL Server
+# =========================
+# 2. DEPENDÊNCIAS SISTEMA + ODBC SQL SERVER
+# =========================
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
     curl \
-    gnupg2 \
+    gnupg \
     unixodbc-dev \
-    && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
-    && curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    ca-certificates \
+    && mkdir -p /usr/share/keyrings \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \
     && ACCEPT_EULA=Y apt-get install -y msodbcsql17 \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Cache de dependências Python
+# =========================
+# 3. DEPENDÊNCIAS PYTHON
+# =========================
 COPY requirements.txt .
 
-# 4. Instalação do pip com Trusted Hosts para ignorar bloqueios de SSL do proxy
 RUN python -m pip install --no-cache-dir --upgrade pip && \
-    python -m pip install --no-cache-dir -r requirements.txt \
+    pip install --no-cache-dir -r requirements.txt \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
     --trusted-host pypi.python.org
 
-# 5. Baixa o modelo do spacy (usando o proxy configurado no ENV)
+# =========================
+# 4. MODELO SPACY
+# =========================
 RUN python -m spacy download pt_core_news_lg
 
-# 6. Copia o restante do código
+# =========================
+# 5. APP
+# =========================
 COPY . .
 
-# 7. Configurações de execução
+# =========================
+# 6. EXECUÇÃO
+# =========================
 EXPOSE 8501
 ENV PYTHONUNBUFFERED=1
 

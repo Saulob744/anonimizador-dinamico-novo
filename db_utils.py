@@ -4,30 +4,27 @@ import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine.url import make_url
 import subprocess
+import time
 
 logger = logging.getLogger(__name__)
 _TABLE_CACHE = {}
 
 # ==================================================
-# CONEXÃO INTELIGENTE (AUTO CREATE DB)
+# CONEXÃO
 # ==================================================
 def connect(url: str):
     parsed = make_url(url)
 
-    # 🔥 ODBC (LocalDB etc)
     if "odbc_connect" in url:
         logger.warning("⚠️ ODBC detectado → pulando criação de banco")
         return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
     db_name = parsed.database
     if not db_name:
-        raise ValueError("URL não contém nome do banco")
+        raise ValueError("URL sem database")
 
     backend = parsed.get_backend_name()
 
-    # -----------------------------------------
-    # DEFINE BANCO ADMIN
-    # -----------------------------------------
     if backend == "postgresql":
         server_url = parsed.set(database="postgres")
     elif backend == "mssql":
@@ -35,15 +32,8 @@ def connect(url: str):
     else:
         server_url = parsed.set(database=None)
 
-    engine_server = create_engine(
-        server_url,
-        isolation_level="AUTOCOMMIT",
-        future=True
-    )
+    engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
 
-    # -----------------------------------------
-    # CREATE DATABASE
-    # -----------------------------------------
     try:
         with engine_server.connect() as conn:
 
@@ -70,18 +60,10 @@ def connect(url: str):
                 """))
 
     except Exception as e:
-        logger.error(f"❌ Erro ao criar banco: {e}")
+        logger.error(f"Erro ao criar DB: {e}")
         raise
 
-    # -----------------------------------------
-    # CONEXÃO FINAL
-    # -----------------------------------------
-    return create_engine(
-        url,
-        pool_pre_ping=True,
-        pool_recycle=3600,
-        future=True
-    )
+    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
 # ==================================================
 # UTILS
@@ -99,18 +81,24 @@ def format_table_name(engine, schema, table):
     else:
         return f'"{schema}"."{table}"'
 
+# ==================================================
+# FK CONTROLE GLOBAL (🔥 MELHORADO)
+# ==================================================
 def disable_fk(conn, db_type):
-    try:
-        if db_type == "postgresql":
-            conn.execute(text("SET session_replication_role = 'replica'"))
+    if db_type == "postgresql":
+        conn.execute(text("SET session_replication_role = 'replica'"))
+    elif db_type == "mysql":
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
+    elif db_type == "mssql":
+        conn.execute(text("EXEC sp_msforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT all'"))
 
-        elif db_type == "mysql":
-            conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
-
-        elif db_type == "mssql":
-            conn.execute(text("EXEC sp_msforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT all'"))
-    except Exception as e:
-        logger.warning(f"FK disable falhou: {e}")
+def enable_fk(conn, db_type):
+    if db_type == "postgresql":
+        conn.execute(text("SET session_replication_role = 'origin'"))
+    elif db_type == "mysql":
+        conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
+    elif db_type == "mssql":
+        conn.execute(text("EXEC sp_msforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT all'"))
 
 # ==================================================
 # SCHEMAS
@@ -124,10 +112,7 @@ def get_user_schemas(engine):
     if db_type == "postgresql":
         ignored.update({"pg_catalog", "pg_toast"})
 
-    return sorted([
-        s for s in insp.get_schema_names()
-        if s not in ignored and not s.startswith("pg_")
-    ])
+    return sorted([s for s in insp.get_schema_names() if s not in ignored and not s.startswith("pg_")])
 
 # ==================================================
 # TABELAS
@@ -144,7 +129,16 @@ def get_table_info(engine, table, schema):
     }
 
 # ==================================================
-# DEPENDÊNCIA
+# DETECTAR TABELA DE JUNÇÃO (🔥 NOVO)
+# ==================================================
+def is_join_table(info):
+    return (
+        len(info["foreign_keys"]) >= 2 and
+        len(info["columns"]) <= len(info["foreign_keys"]) + 2
+    )
+
+# ==================================================
+# DEPENDÊNCIA (🔥 MELHORADO COM CICLO)
 # ==================================================
 def build_dependency_graph(engine, tables, schema):
     insp = inspect(engine)
@@ -175,9 +169,20 @@ def build_dependency_graph(engine, tables, schema):
     remaining = [t for t in tables if t not in ordered]
 
     if remaining:
-        logger.warning(f"Dependência circular: {remaining}")
+        logger.warning(f"⚠️ Ciclo detectado: {remaining}")
 
-    return ordered + remaining
+    # 🔥 Estratégia: colocar join tables por último
+    join_tables = []
+    normal_tables = []
+
+    for t in ordered + remaining:
+        info = get_table_info(engine, t, schema)
+        if is_join_table(info):
+            join_tables.append(t)
+        else:
+            normal_tables.append(t)
+
+    return normal_tables + join_tables
 
 # ==================================================
 # SCHEMA COPY
@@ -194,7 +199,7 @@ def copy_schema(src_engine, dst_engine, schema):
                     IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}')
                     EXEC('CREATE SCHEMA [{schema}]')
                 """))
-        except Exception:
+        except:
             pass
 
     meta = sa.MetaData()
@@ -228,9 +233,9 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
             yield rows
 
 # ==================================================
-# INSERT
+# INSERT COM RETRY (🔥 MELHORADO)
 # ==================================================
-def insert_rows(engine, table_name, schema, rows):
+def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if not rows:
         return
 
@@ -246,23 +251,27 @@ def insert_rows(engine, table_name, schema, rows):
         )
 
     table = _TABLE_CACHE[key]
-    db_type = get_db_type(engine)
 
-    try:
-        with engine.begin() as conn:
-            disable_fk(conn, db_type)
+    for attempt in range(max_retries):
+        try:
+            with engine.begin() as conn:
 
-            for row in rows:
-                for col in table.columns:
-                    val = row.get(col.name)
+                # ajuste de tamanho
+                for row in rows:
+                    for col in table.columns:
+                        val = row.get(col.name)
+                        if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
+                            row[col.name] = val[:col.type.length]
 
-                    if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
-                        row[col.name] = val[:col.type.length]
+                conn.execute(table.insert(), rows)
 
-            conn.execute(table.insert(), rows)
+            return
 
-    except Exception as e:
-        logger.error(f"❌ Batch error {schema}.{table_name}: {e}")
+        except Exception as e:
+            logger.warning(f"Retry {attempt+1} {schema}.{table_name}: {e}")
+            time.sleep(1)
+
+    logger.error(f"❌ Falha definitiva: {schema}.{table_name}")
 
 # ==================================================
 # TRUNCATE
@@ -277,7 +286,7 @@ def truncate_table(engine, table_name, schema):
                 conn.execute(text(f'TRUNCATE TABLE {table_ref} CASCADE'))
             else:
                 conn.execute(text(f'DELETE FROM {table_ref}'))
-        except Exception:
+        except:
             conn.execute(text(f'DELETE FROM {table_ref}'))
 
 # ==================================================
@@ -314,16 +323,3 @@ def set_replication_mode(engine, mode='replica'):
     if get_db_type(engine) == "postgresql":
         with engine.begin() as conn:
             conn.execute(text(f"SET session_replication_role = '{mode}'"))
-
-# ==================================================
-# LOCALDB
-# ==================================================
-def create_db_localdb(db_name):
-    subprocess.run(
-        [
-            "sqlcmd",
-            "-S", r"(localdb)\MSSQLLocalDB",
-            "-Q", f"IF DB_ID('{db_name}') IS NULL CREATE DATABASE [{db_name}]"
-        ],
-        check=True
-    )
