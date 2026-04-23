@@ -82,7 +82,7 @@ def format_table_name(engine, schema, table):
         return f'"{schema}"."{table}"'
 
 # ==================================================
-# FK CONTROLE GLOBAL (🔥 MELHORADO)
+# FK CONTROLE GLOBAL 
 # ==================================================
 def disable_fk(conn, db_type):
     if db_type == "postgresql":
@@ -129,7 +129,7 @@ def get_table_info(engine, table, schema):
     }
 
 # ==================================================
-# DETECTAR TABELA DE JUNÇÃO (🔥 NOVO)
+# DETECTAR TABELA DE JUNÇÃO
 # ==================================================
 def is_join_table(info):
     return (
@@ -138,7 +138,7 @@ def is_join_table(info):
     )
 
 # ==================================================
-# DEPENDÊNCIA (🔥 MELHORADO COM CICLO)
+# DEPENDÊNCIAS
 # ==================================================
 def build_dependency_graph(engine, tables, schema):
     insp = inspect(engine)
@@ -171,7 +171,7 @@ def build_dependency_graph(engine, tables, schema):
     if remaining:
         logger.warning(f"⚠️ Ciclo detectado: {remaining}")
 
-    # 🔥 Estratégia: colocar join tables por último
+    # Estratégia: colocar join tables por último
     join_tables = []
     normal_tables = []
 
@@ -233,7 +233,7 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
             yield rows
 
 # ==================================================
-# INSERT COM RETRY (🔥 MELHORADO)
+# INSERT COM RETRY 
 # ==================================================
 def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if not rows:

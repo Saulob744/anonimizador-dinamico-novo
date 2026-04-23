@@ -170,7 +170,7 @@ if btn_iniciar:
         src_engine = db_utils.connect(build_url(db_type, src_user, src_pass, src_host, src_port, src_db))
         dst_engine = db_utils.connect(build_url(db_type, src_user, src_pass, src_host, src_port, dst_db))
 
-        # 🔥 DESLIGA FK GLOBAL
+        #  DESLIGA FK GLOBAL
         db_utils.set_replication_mode(dst_engine, "replica")
 
         schemas = db_utils.get_user_schemas(src_engine)
@@ -178,7 +178,7 @@ if btn_iniciar:
 
         tables_pipeline = []
 
-        # 🔥 MONTA PIPELINE ORDENADO POR GRAFO
+        #  MONTA PIPELINE ORDENADO POR GRAFO
         for s in schemas:
             raw = db_utils.get_tables(src_engine, s)
             filtered = [t for t in raw if not allowed_list or t in allowed_list]
@@ -190,7 +190,7 @@ if btn_iniciar:
 
         total_tables = len(tables_pipeline)
 
-        # 🔥 COPIA SCHEMA UMA VEZ
+        #  COPIA SCHEMA UMA VEZ
         for s in schemas:
             db_utils.copy_schema(src_engine, dst_engine, s)
 
@@ -241,7 +241,7 @@ if btn_iniciar:
             remaining = str(timedelta(seconds=int(est_total - elapsed)))
             m5.metric("Tempo Rest.", remaining)
 
-        # 🔥 REATIVA FK (VALIDAÇÃO FINAL)
+        #  REATIVA FK (VALIDAÇÃO FINAL)
         db_utils.set_replication_mode(dst_engine, "origin")
 
         status.success(f"✅ FINALIZADO em {str(timedelta(seconds=int(time.time()-start_time)))}")
