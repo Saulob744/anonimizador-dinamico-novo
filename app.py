@@ -108,9 +108,13 @@ def classify_columns(info: dict) -> dict:
 # ==================================================
 if "stats" not in st.session_state:
     st.session_state.stats = {
-        "PER": 0, "CPF": 0, "RG": 0,
-        "PHONE": 0, "EMAIL": 0,
-        "CODE": 0, "TEXT": 0,
+        "PER": 0,
+        "CPF": 0,
+        "RG": 0,
+        "PHONE": 0,
+        "EMAIL": 0,
+        "CODE": 0,
+        "TEXT": 0,
         "total_rows": 0
     }
 
@@ -142,35 +146,51 @@ with st.sidebar:
     btn_iniciar = st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary")
 
 # ==================================================
-# DASHBOARD
+# DASHBOARD FIXO
 # ==================================================
 st.title("🛡️ Pipeline de Proteção de Dados")
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Alterações", f"{st.session_state.stats['total_rows']:,}")
-m2.metric("Pessoas", st.session_state.stats["PER"])
-m3.metric("Documentos", st.session_state.stats["CPF"] + st.session_state.stats["RG"])
-m4.metric("Contatos", st.session_state.stats["PHONE"] + st.session_state.stats["EMAIL"])
-m5.metric("Tempo Est.", "00:00:00")
+top_metrics = st.container()
+progress_container = st.container()
+log_container = st.container()
 
-status = st.empty()
-progress = st.progress(0)
+with top_metrics:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    metric_total = m1.empty()
+    metric_per = m2.empty()
+    metric_doc = m3.empty()
+    metric_cont = m4.empty()
+    metric_eta = m5.empty()
+
+with progress_container:
+    progress_bar = st.progress(0)
+    progress_info = st.empty()
+    speed_info = st.empty()
+    table_info = st.empty()
+
+with log_container:
+    status = st.empty()
 
 # ==================================================
 # EXECUÇÃO
 # ==================================================
 if btn_iniciar:
+    anonymizer._memory.clear()
+
     if not src_db or not dst_db:
         st.error("❌ Informe os bancos")
         st.stop()
 
     try:
         start_time = time.time()
+        last_update = time.time()
+
+        total_rows_processed = 0
+        total_rows_estimated = 0
 
         src_engine = db_utils.connect(build_url(db_type, src_user, src_pass, src_host, src_port, src_db))
         dst_engine = db_utils.connect(build_url(db_type, src_user, src_pass, src_host, src_port, dst_db))
 
-        #  DESLIGA FK GLOBAL
         db_utils.set_replication_mode(dst_engine, "replica")
 
         schemas = db_utils.get_user_schemas(src_engine)
@@ -178,11 +198,9 @@ if btn_iniciar:
 
         tables_pipeline = []
 
-        #  MONTA PIPELINE ORDENADO POR GRAFO
         for s in schemas:
             raw = db_utils.get_tables(src_engine, s)
             filtered = [t for t in raw if not allowed_list or t in allowed_list]
-
             ordered = db_utils.build_dependency_graph(src_engine, filtered, s)
 
             for t in ordered:
@@ -190,16 +208,20 @@ if btn_iniciar:
 
         total_tables = len(tables_pipeline)
 
-        #  COPIA SCHEMA UMA VEZ
+        status.info("🔎 Estimando volume...")
+
+        for schema, table in tables_pipeline:
+            try:
+                total_rows_estimated += db_utils.get_table_count(src_engine, table, schema)
+            except:
+                total_rows_estimated += 1000
+
         for s in schemas:
             db_utils.copy_schema(src_engine, dst_engine, s)
 
-        # ==================================================
-        # PROCESSAMENTO
-        # ==================================================
         for idx, (schema, table) in enumerate(tables_pipeline):
 
-            status.write(f"⚙️ {schema}.{table}")
+            table_info.info(f"📦 {idx+1}/{total_tables} → {schema}.{table}")
 
             info = db_utils.get_table_info(src_engine, table, schema)
             treatments = classify_columns(info)
@@ -209,6 +231,7 @@ if btn_iniciar:
             for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, chunk_size):
 
                 rows = [dict(r) for r in chunk]
+                total_rows_processed += len(rows)
 
                 if "Anonimização" in modo:
                     for r in rows:
@@ -227,24 +250,53 @@ if btn_iniciar:
 
                             if res_val != val_orig:
                                 st.session_state.stats["total_rows"] += 1
-                                if cat and cat in st.session_state.stats:
+                                if cat in st.session_state.stats:
                                     st.session_state.stats[cat] += 1
 
                 db_utils.insert_rows(dst_engine, table, schema, rows)
 
-            # progresso
-            progress.progress((idx + 1) / total_tables)
+                now = time.time()
 
-            # estimativa
-            elapsed = time.time() - start_time
-            est_total = (elapsed / (idx + 1)) * total_tables
-            remaining = str(timedelta(seconds=int(est_total - elapsed)))
-            m5.metric("Tempo Rest.", remaining)
+                if now - last_update > 0.3:
+                    elapsed = now - start_time
+                    speed = total_rows_processed / elapsed if elapsed > 0 else 0
 
-        #  REATIVA FK (VALIDAÇÃO FINAL)
+                    progress_value = (
+                        total_rows_processed / total_rows_estimated
+                        if total_rows_estimated > 0 else 0
+                    )
+
+                    progress_bar.progress(min(progress_value, 1.0))
+
+                    remaining_sec = (
+                        (total_rows_estimated - total_rows_processed) / speed
+                        if speed > 0 else 0
+                    )
+
+                    eta = str(timedelta(seconds=int(remaining_sec)))
+
+                    metric_total.metric("Alterações", f"{st.session_state.stats['total_rows']:,}")
+                    metric_per.metric("Pessoas", st.session_state.stats["PER"])
+                    metric_doc.metric("Docs", st.session_state.stats["CPF"] + st.session_state.stats["RG"])
+                    metric_cont.metric("Contatos", st.session_state.stats["PHONE"] + st.session_state.stats["EMAIL"])
+                    metric_eta.metric("Tempo Rest.", eta)
+
+                    progress_info.write(
+                        f"📊 {total_rows_processed:,} / {total_rows_estimated:,} linhas"
+                    )
+
+                    speed_info.write(
+                        f"⚡ {int(speed):,} linhas/s"
+                    )
+
+                    last_update = now
+
         db_utils.set_replication_mode(dst_engine, "origin")
 
-        status.success(f"✅ FINALIZADO em {str(timedelta(seconds=int(time.time()-start_time)))}")
+        total_time = str(timedelta(seconds=int(time.time() - start_time)))
+
+        status.success(f"✅ FINALIZADO em {total_time}")
+        progress_bar.progress(1.0)
         st.balloons()
 
     except Exception as e:

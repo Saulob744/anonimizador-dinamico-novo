@@ -3,7 +3,6 @@ from collections import defaultdict, deque
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine.url import make_url
-import subprocess
 import time
 
 logger = logging.getLogger(__name__)
@@ -65,11 +64,13 @@ def connect(url: str):
 
     return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
+
 # ==================================================
 # UTILS
 # ==================================================
 def get_db_type(engine):
     return engine.dialect.name
+
 
 def format_table_name(engine, schema, table):
     db_type = get_db_type(engine)
@@ -81,24 +82,6 @@ def format_table_name(engine, schema, table):
     else:
         return f'"{schema}"."{table}"'
 
-# ==================================================
-# FK CONTROLE GLOBAL 
-# ==================================================
-def disable_fk(conn, db_type):
-    if db_type == "postgresql":
-        conn.execute(text("SET session_replication_role = 'replica'"))
-    elif db_type == "mysql":
-        conn.execute(text("SET FOREIGN_KEY_CHECKS = 0"))
-    elif db_type == "mssql":
-        conn.execute(text("EXEC sp_msforeachtable 'ALTER TABLE ? NOCHECK CONSTRAINT all'"))
-
-def enable_fk(conn, db_type):
-    if db_type == "postgresql":
-        conn.execute(text("SET session_replication_role = 'origin'"))
-    elif db_type == "mysql":
-        conn.execute(text("SET FOREIGN_KEY_CHECKS = 1"))
-    elif db_type == "mssql":
-        conn.execute(text("EXEC sp_msforeachtable 'ALTER TABLE ? WITH CHECK CHECK CONSTRAINT all'"))
 
 # ==================================================
 # SCHEMAS
@@ -112,13 +95,18 @@ def get_user_schemas(engine):
     if db_type == "postgresql":
         ignored.update({"pg_catalog", "pg_toast"})
 
-    return sorted([s for s in insp.get_schema_names() if s not in ignored and not s.startswith("pg_")])
+    return sorted([
+        s for s in insp.get_schema_names()
+        if s not in ignored and not s.startswith("pg_")
+    ])
+
 
 # ==================================================
 # TABELAS
 # ==================================================
 def get_tables(engine, schema):
     return sorted(inspect(engine).get_table_names(schema=schema))
+
 
 def get_table_info(engine, table, schema):
     insp = inspect(engine)
@@ -128,8 +116,9 @@ def get_table_info(engine, table, schema):
         "foreign_keys": insp.get_foreign_keys(table, schema=schema)
     }
 
+
 # ==================================================
-# DETECTAR TABELA DE JUNÇÃO
+# JOIN TABLE DETECTION
 # ==================================================
 def is_join_table(info):
     return (
@@ -137,8 +126,9 @@ def is_join_table(info):
         len(info["columns"]) <= len(info["foreign_keys"]) + 2
     )
 
+
 # ==================================================
-# DEPENDÊNCIAS
+# DEPENDENCY GRAPH
 # ==================================================
 def build_dependency_graph(engine, tables, schema):
     insp = inspect(engine)
@@ -171,7 +161,6 @@ def build_dependency_graph(engine, tables, schema):
     if remaining:
         logger.warning(f"⚠️ Ciclo detectado: {remaining}")
 
-    # Estratégia: colocar join tables por último
     join_tables = []
     normal_tables = []
 
@@ -184,8 +173,9 @@ def build_dependency_graph(engine, tables, schema):
 
     return normal_tables + join_tables
 
+
 # ==================================================
-# SCHEMA COPY
+# COPY SCHEMA
 # ==================================================
 def copy_schema(src_engine, dst_engine, schema):
     db_type = get_db_type(dst_engine)
@@ -215,6 +205,25 @@ def copy_schema(src_engine, dst_engine, schema):
 
             table.create(bind=conn, checkfirst=True)
 
+
+# ==================================================
+# COUNT (CRÍTICO PRA BARRA DE PROGRESSO)
+# ==================================================
+def get_table_count(engine, table, schema):
+    table_ref = format_table_name(engine, schema, table)
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text(f"SELECT COUNT(*) FROM {table_ref}")
+            )
+            return result.scalar() or 0
+
+    except Exception as e:
+        logger.warning(f"⚠️ COUNT fallback em {schema}.{table}: {e}")
+        return 1000  # fallback inteligente
+
+
 # ==================================================
 # STREAMING
 # ==================================================
@@ -232,8 +241,9 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
                 break
             yield rows
 
+
 # ==================================================
-# INSERT COM RETRY 
+# INSERT
 # ==================================================
 def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if not rows:
@@ -256,7 +266,6 @@ def insert_rows(engine, table_name, schema, rows, max_retries=3):
         try:
             with engine.begin() as conn:
 
-                # ajuste de tamanho
                 for row in rows:
                     for col in table.columns:
                         val = row.get(col.name)
@@ -272,6 +281,7 @@ def insert_rows(engine, table_name, schema, rows, max_retries=3):
             time.sleep(1)
 
     logger.error(f"❌ Falha definitiva: {schema}.{table_name}")
+
 
 # ==================================================
 # TRUNCATE
@@ -289,35 +299,9 @@ def truncate_table(engine, table_name, schema):
         except:
             conn.execute(text(f'DELETE FROM {table_ref}'))
 
-# ==================================================
-# SEQUENCES
-# ==================================================
-def fix_sequences(engine, schema):
-    if get_db_type(engine) != "postgresql":
-        return
-
-    with engine.begin() as conn:
-        conn.execute(text(f"""
-            DO $$
-            DECLARE r RECORD;
-            BEGIN
-                FOR r IN
-                    SELECT sequence_name, table_name, column_name
-                    FROM information_schema.sequences s
-                    JOIN information_schema.columns c
-                    ON c.column_default LIKE '%' || s.sequence_name || '%'
-                    WHERE sequence_schema = '{schema}'
-                LOOP
-                    EXECUTE format(
-                        'SELECT setval(''%I.%I'', COALESCE((SELECT MAX(%I) FROM %I.%I),1))',
-                        '{schema}', r.sequence_name, r.column_name, '{schema}', r.table_name
-                    );
-                END LOOP;
-            END$$;
-        """))
 
 # ==================================================
-# REPLICATION
+# REPLICATION MODE
 # ==================================================
 def set_replication_mode(engine, mode='replica'):
     if get_db_type(engine) == "postgresql":
