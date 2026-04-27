@@ -15,7 +15,7 @@ def connect(url: str):
     parsed = make_url(url)
 
     if "odbc_connect" in url:
-        logger.warning("⚠️ ODBC detectado → pulando criação de banco")
+        logger.warning("⚠️ ODBC detectado → usando conexão direta")
         return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
     db_name = parsed.database
@@ -52,9 +52,7 @@ def connect(url: str):
                 conn.execute(text(f"""
                     IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}')
                     BEGIN
-                        DECLARE @sql NVARCHAR(MAX)
-                        SET @sql = 'CREATE DATABASE [{db_name}]'
-                        EXEC(@sql)
+                        EXEC('CREATE DATABASE [{db_name}]')
                     END
                 """))
 
@@ -63,7 +61,6 @@ def connect(url: str):
         raise
 
     return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
-
 
 # ==================================================
 # UTILS
@@ -101,8 +98,33 @@ def get_user_schemas(engine):
     ])
 
 
+def copy_schema(src_engine, dst_engine, schema):
+    db_type = get_db_type(dst_engine)
+
+    with dst_engine.begin() as conn:
+        if db_type == "postgresql":
+            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+
+    meta = sa.MetaData()
+
+    with src_engine.connect() as conn:
+        meta.reflect(bind=conn, schema=schema, resolve_fks=False)
+
+    with dst_engine.begin() as conn:
+        for table in meta.sorted_tables:
+            try:
+                table.schema = schema
+
+                for col in table.columns:
+                    col.server_default = None
+
+                table.create(bind=conn, checkfirst=True)
+
+            except Exception as e:
+                logger.warning(f"CREATE SKIP {schema}.{table.name}: {e}")
+
 # ==================================================
-# TABELAS
+# TABLES
 # ==================================================
 def get_tables(engine, schema):
     return sorted(inspect(engine).get_table_names(schema=schema))
@@ -116,19 +138,125 @@ def get_table_info(engine, table, schema):
         "foreign_keys": insp.get_foreign_keys(table, schema=schema)
     }
 
+def table_exists(engine, schema, table):
+    insp = inspect(engine)
+    return insp.has_table(table, schema=schema)
+# ==================================================
+# COUNT (ESSENCIAL PRO PROGRESS BAR)
+# ==================================================
+def get_table_count(engine, table, schema):
+    table_ref = format_table_name(engine, schema, table)
+
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text(f"SELECT COUNT(*) FROM {table_ref}")
+            ).scalar() or 0
+
+    except Exception as e:
+        logger.warning(f"COUNT fallback {schema}.{table}: {e}")
+        return 1000
+
 
 # ==================================================
-# JOIN TABLE DETECTION
+# STREAMING
 # ==================================================
-def is_join_table(info):
-    return (
-        len(info["foreign_keys"]) >= 2 and
-        len(info["columns"]) <= len(info["foreign_keys"]) + 2
-    )
+def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
+    table_ref = format_table_name(engine, schema, table)
+
+    with engine.connect() as conn:
+        result = conn.execution_options(stream_results=True).execute(
+            text(f"SELECT * FROM {table_ref}")
+        )
+
+        while True:
+            rows = result.mappings().fetchmany(chunk_size)
+            if not rows:
+                break
+            yield rows
 
 
 # ==================================================
-# DEPENDENCY GRAPH
+# INSERT (SAFE)
+# ==================================================
+def insert_rows(engine, table_name, schema, rows, max_retries=3):
+    if not rows:
+        return
+
+    key = f"{schema}.{table_name}"
+
+    if key not in _TABLE_CACHE:
+        meta = sa.MetaData()
+        _TABLE_CACHE[key] = sa.Table(
+            table_name,
+            meta,
+            autoload_with=engine,
+            schema=schema
+        )
+
+    table = _TABLE_CACHE[key]
+
+    for attempt in range(max_retries):
+        try:
+            with engine.begin() as conn:
+
+                safe_rows = []
+
+                for row in rows:
+                    new_row = dict(row)
+
+                    for col in table.columns:
+                        val = new_row.get(col.name)
+
+                        # 🔥 FIX AQUI (SEGURANÇA REAL)
+                        if isinstance(val, str):
+                            col_len = getattr(col.type, "length", None)
+
+                            if col_len:
+                                new_row[col.name] = val[:col_len]
+
+                    safe_rows.append(new_row)
+
+                conn.execute(table.insert(), safe_rows)
+
+            return
+
+        except Exception as e:
+            logger.warning(f"Retry {attempt+1} {schema}.{table_name}: {e}")
+            time.sleep(1)
+
+    logger.error(f"❌ Falha definitiva: {schema}.{table_name}")
+
+
+# ==================================================
+# TRUNCATE (FIX TRANSACTION ISSUE)
+# ==================================================
+def truncate_table(engine, table_name, schema):
+    db_type = get_db_type(engine)
+    table_ref = format_table_name(engine, schema, table_name)
+
+    if not table_exists(engine, schema, table_name):
+        logger.warning(f"⚠️ SKIP TRUNCATE (não existe): {schema}.{table_name}")
+        return
+
+    try:
+        with engine.begin() as conn:
+            if db_type == "postgresql":
+                conn.execute(text(f'TRUNCATE TABLE {table_ref} CASCADE'))
+            else:
+                conn.execute(text(f'DELETE FROM {table_ref}'))
+
+    except Exception as e:
+        logger.warning(f"TRUNCATE fallback {schema}.{table_name}: {e}")
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f'DELETE FROM {table_ref}'))
+        except Exception as e2:
+            logger.error(f"❌ TRUNCATE FAILED TOTAL: {schema}.{table_name} -> {e2}")
+
+
+# ==================================================
+# DEPENDENCY GRAPH (RESTORED)
 # ==================================================
 def build_dependency_graph(engine, tables, schema):
     insp = inspect(engine)
@@ -158,150 +286,11 @@ def build_dependency_graph(engine, tables, schema):
 
     remaining = [t for t in tables if t not in ordered]
 
-    if remaining:
-        logger.warning(f"⚠️ Ciclo detectado: {remaining}")
-
-    join_tables = []
-    normal_tables = []
-
-    for t in ordered + remaining:
-        info = get_table_info(engine, t, schema)
-        if is_join_table(info):
-            join_tables.append(t)
-        else:
-            normal_tables.append(t)
-
-    return normal_tables + join_tables
+    return ordered + remaining
 
 
 # ==================================================
-# COPY SCHEMA
-# ==================================================
-def copy_schema(src_engine, dst_engine, schema):
-    db_type = get_db_type(dst_engine)
-
-    with dst_engine.begin() as conn:
-        try:
-            if db_type == "postgresql":
-                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
-            elif db_type == "mssql":
-                conn.execute(text(f"""
-                    IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{schema}')
-                    EXEC('CREATE SCHEMA [{schema}]')
-                """))
-        except:
-            pass
-
-    meta = sa.MetaData()
-    with src_engine.connect() as conn:
-        meta.reflect(bind=conn, schema=schema)
-
-    with dst_engine.begin() as conn:
-        for table in meta.sorted_tables:
-            table.schema = schema if db_type != "sqlite" else None
-
-            for col in table.columns:
-                col.server_default = None
-
-            table.create(bind=conn, checkfirst=True)
-
-
-# ==================================================
-# COUNT (CRÍTICO PRA BARRA DE PROGRESSO)
-# ==================================================
-def get_table_count(engine, table, schema):
-    table_ref = format_table_name(engine, schema, table)
-
-    try:
-        with engine.connect() as conn:
-            result = conn.execute(
-                text(f"SELECT COUNT(*) FROM {table_ref}")
-            )
-            return result.scalar() or 0
-
-    except Exception as e:
-        logger.warning(f"⚠️ COUNT fallback em {schema}.{table}: {e}")
-        return 1000  # fallback inteligente
-
-
-# ==================================================
-# STREAMING
-# ==================================================
-def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
-    table_ref = format_table_name(engine, schema, table)
-
-    with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(
-            text(f"SELECT * FROM {table_ref}")
-        )
-
-        while True:
-            rows = result.mappings().fetchmany(chunk_size)
-            if not rows:
-                break
-            yield rows
-
-
-# ==================================================
-# INSERT
-# ==================================================
-def insert_rows(engine, table_name, schema, rows, max_retries=3):
-    if not rows:
-        return
-
-    key = f"{schema}.{table_name}"
-
-    if key not in _TABLE_CACHE:
-        meta = sa.MetaData()
-        _TABLE_CACHE[key] = sa.Table(
-            table_name,
-            meta,
-            autoload_with=engine,
-            schema=schema
-        )
-
-    table = _TABLE_CACHE[key]
-
-    for attempt in range(max_retries):
-        try:
-            with engine.begin() as conn:
-
-                for row in rows:
-                    for col in table.columns:
-                        val = row.get(col.name)
-                        if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
-                            row[col.name] = val[:col.type.length]
-
-                conn.execute(table.insert(), rows)
-
-            return
-
-        except Exception as e:
-            logger.warning(f"Retry {attempt+1} {schema}.{table_name}: {e}")
-            time.sleep(1)
-
-    logger.error(f"❌ Falha definitiva: {schema}.{table_name}")
-
-
-# ==================================================
-# TRUNCATE
-# ==================================================
-def truncate_table(engine, table_name, schema):
-    db_type = get_db_type(engine)
-    table_ref = format_table_name(engine, schema, table_name)
-
-    with engine.begin() as conn:
-        try:
-            if db_type == "postgresql":
-                conn.execute(text(f'TRUNCATE TABLE {table_ref} CASCADE'))
-            else:
-                conn.execute(text(f'DELETE FROM {table_ref}'))
-        except:
-            conn.execute(text(f'DELETE FROM {table_ref}'))
-
-
-# ==================================================
-# REPLICATION MODE
+# REPLICATION MODE (POSTGRES ONLY)
 # ==================================================
 def set_replication_mode(engine, mode='replica'):
     if get_db_type(engine) == "postgresql":
