@@ -37,10 +37,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 RUN python -m pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt \
-    --trusted-host pypi.org \
-    --trusted-host files.pythonhosted.org \
-    --trusted-host pypi.python.org
+    pip install --no-cache-dir -r requirements.txt
 
 # =========================
 # 4. MODELO SPACY
@@ -53,9 +50,14 @@ RUN python -m spacy download pt_core_news_lg
 COPY . .
 
 # =========================
-# 6. EXECUÇÃO
+# 6. OTIMIZAÇÕES
+# =========================
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# =========================
+# 7. EXECUÇÃO
 # =========================
 EXPOSE 8501
-ENV PYTHONUNBUFFERED=1
 
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
