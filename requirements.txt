@@ -1,16 +1,26 @@
 # Web Framework
-streamlit
+streamlit>=1.30
 
 # Database & Conectividade
-sqlalchemy
-psycopg2-binary
-pyodbc
-pymysql
-pandas
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+pyodbc>=5.0
+pymysql>=1.1
+pandas>=2.0
 
 # Utils
-python-dotenv
+python-dotenv>=1.0
 
 # NLP / IA
-faker
-spacy
+faker>=24.0
+spacy>=3.7
+
+# Modelo do spaCy (instalar separado via comando)
+# python -m spacy download pt_core_news_lg
+
+# NER avançado (usado no seu código)
+gliner>=0.2.0
+
+# Dependências comuns do gliner
+torch>=2.0
+transformers>=4.40
