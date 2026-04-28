@@ -7,6 +7,11 @@ import pyodbc
 import subprocess
 import time
 import re
+import psutil
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 # ==================================================
 # RELOAD (DEV)
@@ -37,17 +42,15 @@ def hard_scrub(text: str) -> str:
     if not isinstance(text, str):
         return text
 
-    # captura nomes completos comuns (2-4 tokens capitalizados)
     pattern = re.compile(
         r"\b([A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3})\b"
     )
 
     def repl(m):
         name = m.group(1)
-        return anonymizer._get(name, "PER", lambda: anonymizer.fake.name().upper())
+        return anonymizer._get_fake(name, "PER")
 
     return pattern.sub(repl, text)
-
 
 # ==================================================
 # HELPERS DB
@@ -97,18 +100,11 @@ def build_url(db_type, user, password, host, port, db):
 
     return None
 
-
 # ==================================================
 # STATE
 # ==================================================
 if "stats" not in st.session_state:
     st.session_state.stats = {
-        "PER": 0,
-        "CPF": 0,
-        "RG": 0,
-        "PHONE": 0,
-        "EMAIL": 0,
-        "TEXT": 0,
         "total_rows": 0
     }
 
@@ -138,9 +134,14 @@ with st.sidebar:
     )
 
     chunk_size = st.number_input("Chunk Size", value=1000, step=500)
+    filter_tables = st.text_input("Filtrar Tabelas (separadas por vírgula)")
 
-    filter_tables = st.text_input("Filtrar Tabelas")
+    # 🚀 NOVO: BOTÃO DE CONTROLE DE LOCALIZAÇÃO AQUI NA SIDEBAR
+    st.divider()
+    st.subheader("⚙️ Configurações Especiais")
+    anon_geo = st.toggle("Desfocar Localização (GPS)", value=True, help="Se ativo, reduz a precisão de coordenadas para proteger a residência exata.")
 
+    st.divider()
     start_btn = st.button("🚀 INICIAR PIPELINE", use_container_width=True)
 
 # ==================================================
@@ -155,8 +156,9 @@ status = st.empty()
 # PIPELINE
 # ==================================================
 def run_pipeline():
+    process = psutil.Process(os.getpid())
+    t0_global = time.time()
 
-    anonymizer._memory.clear()
     anonymizer.fake.seed_instance(42)
 
     src_engine = db_utils.connect(
@@ -170,7 +172,6 @@ def run_pipeline():
     db_utils.set_replication_mode(dst_engine, "replica")
 
     schemas = db_utils.get_user_schemas(src_engine)
-
     allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
 
     for s in schemas:
@@ -184,6 +185,9 @@ def run_pipeline():
         ordered = db_utils.build_dependency_graph(src_engine, filtered, s)
         tables += [(s, t) for t in ordered]
 
+    # ============================
+    # ESTIMATIVA TOTAL
+    # ============================
     estimated = 0
     for s, t in tables:
         try:
@@ -192,62 +196,82 @@ def run_pipeline():
             estimated += 1000
 
     total_rows = 0
+    metric_placeholder = st.empty()
 
-    for i, (schema, table) in enumerate(tables):
-
-        status.info(f"📦 {schema}.{table}")
-
+    status.info("🧹 Limpando tabelas de destino (Evitando quebra de Foreign Keys)...")
+    for schema, table in reversed(tables):
         try:
             db_utils.truncate_table(dst_engine, table, schema)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Aviso ao limpar {schema}.{table}: {e}")
+
+    # ============================
+    # LOOP PRINCIPAL
+    # ============================
+    for i, (schema, table) in enumerate(tables):
+        t0_table = time.time()
+        status.info(f"📦 Processando: {schema}.{table}")
 
         for chunk in db_utils.fetch_rows_streaming(src_engine, table, schema, chunk_size):
-
             rows = [dict(r) for r in chunk]
 
-            # ==================================================
-            # 🔥 ANONIMIZAÇÃO GLOBAL (SEM DEPENDER DE COLUNA)
-            # ==================================================
             if modo == "🛡️ Anonimização Total":
-
                 for r in rows:
+                    for col in list(r.keys()):
+                        old = r[col]
+                        if old is None:
+                            continue
 
-                    for col in r.keys():
-
-                        if r[col] is None:
+                        if isinstance(old, (int, float, bool)) or type(old).__name__ in ['date', 'datetime', 'Timestamp']:
                             continue
 
                         try:
-                            old = r[col]
-
-                            # PASSO 1: IA + regex
-                            new = anonymizer.anonymize_text(str(old))
-
-                            # PASSO 2: HARD SCRUB (corrige vazamentos)
-                            new = hard_scrub(new)
-
-                            r[col] = new
+                            # 🚀 NOVO: PASSANDO O VALOR DO BOTÃO 'anon_geo' PARA O CÉREBRO
+                            new, flag = anonymizer.anonymize_value(col, old, anon_location=anon_geo)
+                            
+                            if flag == "TEXT" and isinstance(new, str):
+                                new = hard_scrub(new)
 
                             if new != old:
+                                r[col] = new
                                 st.session_state.stats["total_rows"] += 1
-
-                        except:
+                        except Exception as e:
+                            logger.error(f"Erro ao anonimizar coluna {col}: {e}")
                             continue
 
-            # INSERT
             try:
                 db_utils.insert_rows(dst_engine, table, schema, rows)
             except Exception as e:
-                status.warning(f"⚠️ INSERT FAIL {schema}.{table}: {e}")
+                status.warning(f"⚠️ FALHA NO INSERT {schema}.{table}: {e}")
 
             total_rows += len(rows)
 
-            progress_bar.progress(min(total_rows / max(estimated, 1), 1.0))
+            # ============================
+            # 📊 MÉTRICAS EM TEMPO REAL
+            # ============================
+            elapsed = time.time() - t0_global
+            speed = total_rows / elapsed if elapsed > 0 else 0
+            progress = total_rows / max(estimated, 1)
+            eta = (elapsed / progress - elapsed) if progress > 0 else 0
+            ram = process.memory_info().rss / (1024 ** 2)
+
+            metric_placeholder.markdown(f"""
+            ### 📊 Métricas em tempo real
+            - 🧮 Linhas processadas: **{total_rows:,} / {estimated:,}**
+            - ⚡ Velocidade: **{speed:,.0f} linhas/s**
+            - ⏱️ Tempo decorrido: **{elapsed:.1f}s**
+            - ⏳ ETA: **{eta:.1f}s**
+            - 💾 RAM: **{ram:.0f} MB**
+            """)
+
+            progress_bar.progress(min(progress, 1.0))
+
+        t1_table = time.time()
+        st.info(f"⏱️ {schema}.{table} concluída em {t1_table - t0_table:.1f}s")
 
     db_utils.set_replication_mode(dst_engine, "origin")
-
-    status.success("✅ FINALIZADO COM SEGURANÇA REFORÇADA")
+    total_time = time.time() - t0_global
+    status.success(f"✅ FINALIZADO em {total_time:.2f}s 🚀")
 
 
 # ==================================================
@@ -258,4 +282,4 @@ if start_btn:
         run_pipeline()
         st.balloons()
     except Exception as e:
-        status.error(f"❌ ERRO: {e}")
+        status.error(f"❌ ERRO CRÍTICO: {e}")
