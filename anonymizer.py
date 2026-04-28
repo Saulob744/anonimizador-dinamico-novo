@@ -23,7 +23,7 @@ def get_gliner():
     return _gliner_model
 
 # ==================================================
-# MOTORES DE BUSCA (REGEX E LISTAS)
+# MOTORES DE BUSCA
 # ==================================================
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
@@ -35,16 +35,18 @@ REGEX = {
     "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b")
 }
 
+# 🚀 NOVO: Regex para validar se a string é um UUID legítimo (8-4-4-4-12)
+UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
 NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][A-ZÀ-Üa-zà-ü']+(?:\s+(?:D\.|DA|DE|DO|DAS|DOS|[A-ZÀ-Ü][A-Za-zà-ü']+)){1,4})\b")
 
-# 🚀 LISTA AMPLIADA (Top 50+ Nomes Comuns Brasileiros)
 _nomes = "Maria|João|Joao|Ana|José|Jose|Carlos|Paulo|Lucas|Marcos|Luiz|Fernanda|Julia|Pedro|Carol|Jorge|Antonio|Francisco|Aline|Bruna|Camila|Rafael|Gabriel|Rodrigo|Thiago|Bruno|Amanda|Jessica|Letícia|Leticia|Diego|Marcelo|Gustavo|Guilherme|Felipe|Larissa|Vitória|Vitoria|Renato|Eduardo|Leonardo|Victor|Vitor|Matheus|Mateus"
 COMMON_NAMES = re.compile(rf"\b({_nomes})\b", re.IGNORECASE)
 
 PURE_COORD_PATTERN = re.compile(r"^-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+$")
 
 # ==================================================
-# FUNÇÕES CORE (NORMALIZAÇÃO E HASH)
+# FUNÇÕES CORE
 # ==================================================
 def _normalize(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
@@ -65,6 +67,9 @@ def _get_fake(value: str, typ: str) -> str:
     fake.seed_instance(seed)
     random.seed(seed)
 
+    # 🚀 TRATAMENTO PARA UUID: Gera um UUID válido para não quebrar o banco
+    if typ == "UUID": return fake.uuid4()
+    
     if typ == "PER": return fake.name().upper()
     if typ == "CPF": return fake.cpf()
     if typ == "EMAIL": return fake.email()
@@ -110,7 +115,6 @@ def _detect_gliner(text: str):
 
 def _detect_all(text: str):
     found = []
-
     for typ, pattern in REGEX.items():
         for m in pattern.finditer(text): found.append((m.start(), m.end(), m.group(), typ))
 
@@ -125,28 +129,19 @@ def _detect_all(text: str):
 
     found.extend(_detect_gliner(text))
 
-    # OTIMIZAÇÃO: Ordena por Início, depois por Tamanho Decrescente
-    # Garante que Nomes Completos se sobreponham a nomes curtos
     clean_found, last_end = [], -1
     for s, e, v, typ in sorted(found, key=lambda x: (x[0], -(x[1]-x[0]))):
         if s >= last_end:
             clean_found.append((s, e, v, typ))
             last_end = e
-
     return clean_found
 
 def reset_memory():
     fake.seed_instance(42)
 
 # ==================================================
-# PROCESSAMENTO DE TEXTO E GPS
+# API PRINCIPAL
 # ==================================================
-def alter_geo_precision(value: str, precision: int = 3) -> str:
-    try:
-        lat, lon = map(float, value.split(","))
-        return f"{lat:.{precision}f}, {lon:.{precision}f}"
-    except: return value
-
 def anonymize_text(text: str) -> str:
     if not isinstance(text, str) or not text.strip() or (text.isdigit() or len(text) < 3):
         return text
@@ -168,8 +163,19 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 
     val_str = str(val).strip()
 
+    # 🚀 AJUSTE UUID: Intercepta o valor antes do processamento de texto
+    if UUID_PATTERN.match(val_str):
+        return _get_fake(val_str, "UUID"), "UUID"
+
     if PURE_COORD_PATTERN.match(val_str):
         return (alter_geo_precision(val_str, 3), "COORD") if anon_location else (val_str, None)
 
     new_val = anonymize_text(val_str)
     return new_val, ("TEXT" if new_val != val_str else None)
+
+# Helper GPS mantido
+def alter_geo_precision(value: str, precision: int = 3) -> str:
+    try:
+        lat, lon = map(float, value.split(","))
+        return f"{lat:.{precision}f}, {lon:.{precision}f}"
+    except: return value
