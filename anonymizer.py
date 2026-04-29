@@ -5,15 +5,13 @@ from gliner import GLiNER
 logger = logging.getLogger(__name__)
 
 # ==================================================
-# CONFIGURAÇÕES GERAIS
+# CONFIGURAÇÕES GERAIS E IA
 # ==================================================
 fake = Faker("pt_BR")
 _gliner_model = None
 
-GLINER_LABELS = [
-    "person", "first name", "suspect", "victim", "employee",
-    "email", "phone number", "address", "organization", "location"
-]
+# GLiNER agora só será usado para colunas de Texto Livre (Observações)
+GLINER_LABELS = ["person", "first name", "email", "phone number", "address", "organization"]
 
 def get_gliner():
     global _gliner_model
@@ -23,7 +21,7 @@ def get_gliner():
     return _gliner_model
 
 # ==================================================
-# MOTORES DE BUSCA
+# MOTORES DE BUSCA (REGEX PARA TEXTO LIVRE)
 # ==================================================
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
@@ -35,18 +33,12 @@ REGEX = {
     "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b")
 }
 
-# 🚀 NOVO: Regex para validar se a string é um UUID legítimo (8-4-4-4-12)
 UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-
 NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][A-ZÀ-Üa-zà-ü']+(?:\s+(?:D\.|DA|DE|DO|DAS|DOS|[A-ZÀ-Ü][A-Za-zà-ü']+)){1,4})\b")
-
-_nomes = "Maria|João|Joao|Ana|José|Jose|Carlos|Paulo|Lucas|Marcos|Luiz|Fernanda|Julia|Pedro|Carol|Jorge|Antonio|Francisco|Aline|Bruna|Camila|Rafael|Gabriel|Rodrigo|Thiago|Bruno|Amanda|Jessica|Letícia|Leticia|Diego|Marcelo|Gustavo|Guilherme|Felipe|Larissa|Vitória|Vitoria|Renato|Eduardo|Leonardo|Victor|Vitor|Matheus|Mateus"
-COMMON_NAMES = re.compile(rf"\b({_nomes})\b", re.IGNORECASE)
-
 PURE_COORD_PATTERN = re.compile(r"^-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+$")
 
 # ==================================================
-# FUNÇÕES CORE
+# FUNÇÕES CORE (NORMALIZAÇÃO E HASH)
 # ==================================================
 def _normalize(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
@@ -67,9 +59,7 @@ def _get_fake(value: str, typ: str) -> str:
     fake.seed_instance(seed)
     random.seed(seed)
 
-    # 🚀 TRATAMENTO PARA UUID: Gera um UUID válido para não quebrar o banco
     if typ == "UUID": return fake.uuid4()
-    
     if typ == "PER": return fake.name().upper()
     if typ == "CPF": return fake.cpf()
     if typ == "EMAIL": return fake.email()
@@ -78,23 +68,18 @@ def _get_fake(value: str, typ: str) -> str:
     if typ == "CEP": return fake.postcode()
     if typ == "ORG": return fake.company()
     
+    if typ == "LOC":
+        # Extrai a primeira palavra para manter contexto (ex: "Rua_REGIAO_42")
+        base = _normalize(value).split()[0] if value.split() else "LOC"
+        return f"{base}_REGIAO_{random.randint(10, 99)}"
+
     if typ == "CODE":
         return "".join(random.choices(string.ascii_uppercase + string.digits, k=max(5, len(value))))
 
-    if typ == "LOC":
-        base = _normalize(value).split()[0] if value.split() else "LOC"
-        return f"{base}_REGIAO_{random.randint(1, 100)}"
-        
-    if typ == "COORDS":
-        try:
-            lat, lon = map(float, value.split(","))
-            return f"{round(lat + random.uniform(-0.05, 0.05), 4)}, {round(lon + random.uniform(-0.05, 0.05), 4)}"
-        except: return "-0.0000, -0.0000"
-            
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
 # ==================================================
-# DETECÇÃO E CLASSIFICAÇÃO
+# DETECÇÃO PARA TEXTO LIVRE (OBSERVAÇÕES)
 # ==================================================
 def _resolve_type(raw_type: str) -> str:
     t = raw_type.lower()
@@ -108,7 +93,7 @@ def _resolve_type(raw_type: str) -> str:
 def _detect_gliner(text: str):
     if len(text) < 10 or " " not in text: return []
     try:
-        preds = get_gliner().predict_entities(text, GLINER_LABELS, threshold=0.30)
+        preds = get_gliner().predict_entities(text, GLINER_LABELS, threshold=0.35)
         return [ (e["start"], e["end"], e["text"], _resolve_type(e["label"])) for e in preds ]
     except Exception:
         return []
@@ -120,12 +105,8 @@ def _detect_all(text: str):
 
     for m in NAME_REGEX.finditer(text):
         raw = m.group()
-        words = _canonical(raw).split()
-        if len(words) >= 2 and not any(w.isdigit() for w in words):
+        if len(_canonical(raw).split()) >= 2:
             found.append((m.start(), m.end(), raw, "PER"))
-
-    for m in COMMON_NAMES.finditer(text):
-        found.append((m.start(), m.end(), m.group(), "PER"))
 
     found.extend(_detect_gliner(text))
 
@@ -139,9 +120,12 @@ def _detect_all(text: str):
 def reset_memory():
     fake.seed_instance(42)
 
-# ==================================================
-# API PRINCIPAL
-# ==================================================
+def alter_geo_precision(value: str, precision: int = 3) -> str:
+    try:
+        lat, lon = map(float, value.split(","))
+        return f"{lat:.{precision}f}, {lon:.{precision}f}"
+    except: return value
+
 def anonymize_text(text: str) -> str:
     if not isinstance(text, str) or not text.strip() or (text.isdigit() or len(text) < 3):
         return text
@@ -157,25 +141,51 @@ def anonymize_text(text: str) -> str:
     result.append(text[last:])
     return "".join(result)
 
+# ==================================================
+# ROTEADOR SEMÂNTICO DE COLUNAS (O CÉREBRO DINÂMICO)
+# ==================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True):
+    # 1. Ignora tipos rápidos que não são texto sensível
     if val is None or isinstance(val, (int, float, bool)) or type(val).__name__ in ['date', 'datetime', 'Timestamp']:
         return val, None
 
     val_str = str(val).strip()
 
-    # 🚀 AJUSTE UUID: Intercepta o valor antes do processamento de texto
+    # 2. Intercepta UUIDs (Blindagem do BD)
     if UUID_PATTERN.match(val_str):
         return _get_fake(val_str, "UUID"), "UUID"
 
+    # 3. Intercepta Coordenadas Puras
     if PURE_COORD_PATTERN.match(val_str):
         return (alter_geo_precision(val_str, 3), "COORD") if anon_location else (val_str, None)
 
+    # 4. 🚀 ROTEAMENTO DINÂMICO POR NOME DA COLUNA
+    c = col_name.lower()
+
+    # A) COLUNAS SEGURAS (Pula processamento, economiza CPU e evita falsos positivos)
+    if any(k in c for k in ["crime", "tipo", "status", "situacao", "estado", "cidade", "natureza", "sexo", "genero", "profissao", "cor", "marca", "modelo"]):
+        return val_str, None
+
+    # B) COLUNAS ESTRUTURADAS (Troca tudo diretamente sem ler o texto interno)
+    if any(k in c for k in ["nome", "vitima", "suspeito", "autor", "pessoa", "testemunha"]):
+        return _get_fake(val_str, "PER"), "PER"
+        
+    if any(k in c for k in ["endereco", "rua", "logradouro", "bairro", "local"]):
+        return _get_fake(val_str, "LOC"), "LOC"
+        
+    if any(k in c for k in ["email", "mail"]):
+        return _get_fake(val_str, "EMAIL"), "EMAIL"
+        
+    if any(k in c for k in ["fone", "celular", "telefone"]):
+        return _get_fake(val_str, "PHONE"), "PHONE"
+        
+    if any(k in c for k in ["cpf", "cnpj", "rg", "documento"]):
+        return _get_fake(val_str, "CPF"), "CPF"
+
+    if any(k in c for k in ["placa", "veiculo"]):
+        return _get_fake(val_str, "PLATE"), "PLATE"
+
+    # C) TEXTO LIVRE (Se não for nenhuma coluna acima, como "observacoes" ou "historico")
+    # Passa pelo motor pesado (Regex + IA)
     new_val = anonymize_text(val_str)
     return new_val, ("TEXT" if new_val != val_str else None)
-
-# Helper GPS mantido
-def alter_geo_precision(value: str, precision: int = 3) -> str:
-    try:
-        lat, lon = map(float, value.split(","))
-        return f"{lat:.{precision}f}, {lon:.{precision}f}"
-    except: return value
