@@ -191,7 +191,7 @@ def run_pipeline():
                     eta_str = f"{h:02d}h {m:02d}m {s_rem:02d}s" if h > 0 else f"{m:02d}m {s_rem:02d}s"
 
                 metric_placeholder.markdown(f"""
-                ### 📊 Métricas ({'🚀 Super-rápido' if n_cores > 1 else '🐢 Padrão'})
+                ### 📊 Métricas ({'🚀 Super-rápido' if n_cores > 1 else 'Padrão'})
                 - 🧮 Linhas Processadas: **{total_rows:,} / {total_estimated:,}**
                 - ⚡ Velocidade Média: **{speed:,.0f} linhas/s** | ⏳ Faltam: **{eta_str}**
                 - ⏱️ Tempo Decorrido: **{elapsed:.1f}s** | 💾 Uso de RAM: **{proc.memory_info().rss / 1024**2:.0f} MB**
