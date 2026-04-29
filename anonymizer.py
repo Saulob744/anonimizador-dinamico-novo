@@ -1,199 +1,207 @@
-import re
-import spacy
-import random
-import string
-import unicodedata
+import re, random, string, unicodedata, hashlib, logging
 from faker import Faker
+from gliner import GLiNER
 
-# =========================
-# INICIALIZAÇÃO
-# =========================
+logger = logging.getLogger(__name__)
+
+# ==================================================
+# CONFIGURAÇÕES GERAIS
+# ==================================================
 fake = Faker("pt_BR")
-nlp = spacy.load("pt_core_news_lg")
+_gliner_model = None
 
-# =========================
-# REGEX REFINADAS
-# =========================
+GLINER_LABELS = [
+    "person", "first name", "suspect", "victim", "employee",
+    "email", "phone number", "address", "organization", "location"
+]
+
+def get_gliner():
+    global _gliner_model
+    if _gliner_model is None:
+        logger.info("Carregando modelo GLiNER na memória...")
+        _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
+    return _gliner_model
+
+# ==================================================
+# MOTORES DE BUSCA
+# ==================================================
 REGEX = {
     "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
-    "RG": re.compile(r"\b\d{1,2}\.?\d{3,5}\.?\d{3}-?[0-9Xx]\b"),
-    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
+    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    
-    # CHASSI/CODE: Melhorados para aceitar mais variações de separadores
-    "CHASSI": re.compile(r"\b(?=[a-zA-Z0-9]*\d)(?=[a-zA-Z0-9]*[a-zA-Z])[a-zA-Z0-9]{8,17}\b", re.IGNORECASE),    
-    "CODE": re.compile(r"\b(?=[a-zA-Z0-9-]*\d)(?=[a-zA-Z0-9-]*[a-zA-Z])[a-zA-Z0-9-]{4,30}\b", re.IGNORECASE),
-    
-    # NAME_FALLBACK: Exige 2+ palavras capitalizadas
-    "NAME_FALLBACK": re.compile(
-        r"\b[A-ZÀ-Ÿ][a-zà-ÿ]{2,}(?:\s+(?:da|de|do|dos|das))?\s+[A-ZÀ-Ÿ][a-zà-ÿ]{2,}(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]{2,})*\b"
-    )
+    "CEP": re.compile(r"\b\d{5}-?\d{3}\b"),
+    "COORDS": re.compile(r"-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+"),
+    "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b")
 }
 
-_memory = {}
+# 🚀 NOVO: Regex para validar se a string é um UUID legítimo (8-4-4-4-12)
+UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-# =========================
-# HELPERS (MANTIDOS)
-# =========================
+NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][A-ZÀ-Üa-zà-ü']+(?:\s+(?:D\.|DA|DE|DO|DAS|DOS|[A-ZÀ-Ü][A-Za-zà-ü']+)){1,4})\b")
 
-def _remove_accents(input_str):
-    nfkd_form = unicodedata.normalize('NFKD', input_str)
-    return "".join([c for c in nfkd_form if not unicodedata.combining(c)])
+_nomes = "Maria|João|Joao|Ana|José|Jose|Carlos|Paulo|Lucas|Marcos|Luiz|Fernanda|Julia|Pedro|Carol|Jorge|Antonio|Francisco|Aline|Bruna|Camila|Rafael|Gabriel|Rodrigo|Thiago|Bruno|Amanda|Jessica|Letícia|Leticia|Diego|Marcelo|Gustavo|Guilherme|Felipe|Larissa|Vitória|Vitoria|Renato|Eduardo|Leonardo|Victor|Vitor|Matheus|Mateus"
+COMMON_NAMES = re.compile(rf"\b({_nomes})\b", re.IGNORECASE)
 
-def _normalize_key(v):
-    text = str(v).strip()
-    text = _remove_accents(text)
-    return " ".join(text.upper().split())
+PURE_COORD_PATTERN = re.compile(r"^-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+$")
 
-def _get(val, cat, fn):
-    key = _normalize_key(val)
-    if cat not in _memory: 
-        _memory[cat] = {}
-    if key not in _memory[cat]:
-        _memory[cat][key] = fn()
-    return _memory[cat][key]
+# ==================================================
+# FUNÇÕES CORE
+# ==================================================
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", "".join(c for c in text if not unicodedata.combining(c)))).upper().strip()
 
-# ==========================================
-# VALIDAR SE É NOME REAL (DINÂMICO)
-# ==========================================
+def _canonical(value: str) -> str:
+    v = re.sub(r"\b([A-Z])\.", r"\1", _normalize(value))
+    return " ".join([p for p in v.split() if len(p) > 1])
 
-def _is_likely_real_name(ent):
-    """
-    Recebe a entidade do SpaCy e decide se é um nome humano sensível.
-    """
-    text = ent.text
-    words = text.split()
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(" ".join(sorted([p for p in _canonical(value).split() if len(p) > 2])).encode()).hexdigest()
 
-    # 1. ÂNCORAS E PAPEIS (Filtro Dinâmico)
-    # Se a palavra for um substantivo comum (NOUN), não é um nome próprio.
-    # Isso protege: Agente, Suspeito, Vítima, Condutor, Policial, etc.
-    if any(token.pos_ == "NOUN" for token in ent):
-        return False
+# ==================================================
+# GERADOR DETERMINÍSTICO
+# ==================================================
+def _get_fake(value: str, typ: str) -> str:
+    seed = int(hashlib.sha256((_fingerprint(value) + typ).encode()).hexdigest()[:8], 16)
+    fake.seed_instance(seed)
+    random.seed(seed)
 
-    # 2. ESTRUTURA
-    # Nomes sensíveis em logs geralmente têm sobrenome (2+ palavras)
-    if len(words) < 2:
-        return False
+    # 🚀 TRATAMENTO PARA UUID: Gera um UUID válido para não quebrar o banco
+    if typ == "UUID": return fake.uuid4()
+    
+    if typ == "PER": return fake.name().upper()
+    if typ == "CPF": return fake.cpf()
+    if typ == "EMAIL": return fake.email()
+    if typ == "PHONE": return fake.phone_number()
+    if typ == "PLATE": return fake.license_plate().upper()
+    if typ == "CEP": return fake.postcode()
+    if typ == "ORG": return fake.company()
+    
+    if typ == "CODE":
+        return "".join(random.choices(string.ascii_uppercase + string.digits, k=max(5, len(value))))
+
+    if typ == "LOC":
+        base = _normalize(value).split()[0] if value.split() else "LOC"
+        return f"{base}_REGIAO_{random.randint(1, 100)}"
         
-    # 3. LIMPEZA
-    # Nomes não contêm números
-    if any(char.isdigit() for char in text):
-        return False
-        
-    # Evita siglas curtas (ex: "BO", "ID", "DETRAN")
-    if text.isupper() and len(text) < 10:
-        return False
-        
-    return True
+    if typ == "COORDS":
+        try:
+            lat, lon = map(float, value.split(","))
+            return f"{round(lat + random.uniform(-0.05, 0.05), 4)}, {round(lon + random.uniform(-0.05, 0.05), 4)}"
+        except: return "-0.0000, -0.0000"
+            
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
-# ==========================================
-# PROCESSAMENTO HÍBRIDO AJUSTADO
-# ==========================================
+# ==================================================
+# DETECÇÃO E CLASSIFICAÇÃO
+# ==================================================
+def _resolve_type(raw_type: str) -> str:
+    t = raw_type.lower()
+    if any(k in t for k in ["person", "name", "suspect", "victim", "employee"]): return "PER"
+    if "email" in t: return "EMAIL"
+    if "phone" in t: return "PHONE"
+    if "organization" in t: return "ORG"
+    if any(k in t for k in ["location", "address"]): return "LOC"
+    return "UNK"
 
-def anonymize_text(text, is_vehicle_col=False):
-    if not isinstance(text, str) or not text: 
+def _detect_gliner(text: str):
+    if len(text) < 10 or " " not in text: return []
+    try:
+        preds = get_gliner().predict_entities(text, GLINER_LABELS, threshold=0.30)
+        return [ (e["start"], e["end"], e["text"], _resolve_type(e["label"])) for e in preds ]
+    except Exception:
+        return []
+
+def _detect_all(text: str):
+    found = []
+    for typ, pattern in REGEX.items():
+        for m in pattern.finditer(text): found.append((m.start(), m.end(), m.group(), typ))
+
+    for m in NAME_REGEX.finditer(text):
+        raw = m.group()
+        words = _canonical(raw).split()
+        if len(words) >= 2 and not any(w.isdigit() for w in words):
+            found.append((m.start(), m.end(), raw, "PER"))
+
+    for m in COMMON_NAMES.finditer(text):
+        found.append((m.start(), m.end(), m.group(), "PER"))
+
+    found.extend(_detect_gliner(text))
+
+    clean_found, last_end = [], -1
+    for s, e, v, typ in sorted(found, key=lambda x: (x[0], -(x[1]-x[0]))):
+        if s >= last_end:
+            clean_found.append((s, e, v, typ))
+            last_end = e
+    return clean_found
+
+def reset_memory():
+    fake.seed_instance(42)
+
+# ==================================================
+# API PRINCIPAL
+# ==================================================
+def anonymize_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip() or (text.isdigit() or len(text) < 3):
         return text
 
-    doc = nlp(text)
-    entities = []
-    
-    # Zonas Protegidas (Marcas/Locais que não têm números)
-    protected_by_ai = [
-        {"start": ent.start_char, "end": ent.end_char} 
-        for ent in doc.ents 
-        if ent.label_ in ["ORG", "MISC", "LOC"] and not any(c.isdigit() for c in ent.text)
-    ]
+    entities = _detect_all(text)
+    if not entities: return text
 
-    # 1. Identificação de Pessoas (IA)
-    if not is_vehicle_col:
-        text_lower = text.lower()
-        for ent in doc.ents:
-            if ent.label_ == "PER": 
-                # Checa se é um papel (Agente/Suspeito) ou nome real
-                if _is_likely_real_name(ent): 
-                    prefix = text_lower[max(0, ent.start_char - 15):ent.start_char]
-                    if any(kw in prefix for kw in ["modelo ", "veiculo ", "carro ", "marca "]):
-                        continue
-                        
-                    if not any(p["start"] <= ent.start_char < p["end"] for p in protected_by_ai):
-                        entities.append({"start": ent.start_char, "end": ent.end_char, "text": ent.text, "type": "PER"})
+    result, last = [], 0
+    for s, e, v, typ in entities:
+        result.extend([text[last:s], _get_fake(v, typ)])
+        last = e
 
-    # 2. Identificação por Regex (O resto continua igual...)
-    for label, pattern in REGEX.items():
-        if is_vehicle_col and label == "NAME_FALLBACK": continue
-        for match in pattern.finditer(text):
-            start, end = match.start(), match.end()
-            if any(e["start"] <= start < e["end"] for e in entities): continue
-            if any(p["start"] <= start < p["end"] for p in protected_by_ai): continue
-            
-            # Aplica a mesma lógica de validação na Regex
-            # Como a regex não tem tokens do SpaCy, simulamos um doc rápido
-            if label == "NAME_FALLBACK":
-                temp_doc = nlp(match.group())
-                if not _is_likely_real_name(temp_doc):
-                    continue
+    result.append(text[last:])
+    return "".join(result)
 
-            entities.append({"start": start, "end": end, "text": match.group(), "type": label})
-
-  
-
-    # 4. Ordenação e substituição (AJUSTADO PARA EVITAR O 'VALOR')
-    entities.sort(key=lambda x: x["start"], reverse=True)
-
-    new_text = text
-    for ent in entities:
-        cat = "PER" if ent["type"] in ["PER", "NAME_FALLBACK"] else ent["type"]
-        
-        # Lógica de substituição dinâmica e consistente
-        if cat == "PER":
-            subst = _get(ent["text"], "PER", lambda: fake.name().upper())
-        elif cat == "CPF":
-            subst = _get(ent["text"], "CPF", fake.cpf)
-        elif cat == "RG":
-            # Gera um RG fake padrão: 12.345.678-9
-            subst = _get(ent["text"], "RG", lambda: fake.bothify(text='##.###.###-#'))
-        elif cat == "EMAIL":
-            subst = _get(ent["text"], "EMAIL", fake.email)
-        elif cat == "PLATE":
-            # Gera uma placa fake padrão Mercosul ou Antiga: ABC-1234 ou ABC1D23
-            subst = _get(ent["text"], "PLATE", lambda: fake.bothify(text='???-####').upper())
-        elif cat == "PHONE":
-            subst = _get(ent["text"], "PHONE", fake.cellphone_number)
-        else:
-            # Para CODE, CHASSI e outros padrões
-            subst = _get(ent["text"], cat, lambda: "".join(
-                random.choice(string.digits) if c.isdigit() 
-                else random.choice(string.ascii_uppercase) if c.isalpha() 
-                else c for c in ent["text"]
-            ))
-        
-        new_text = new_text[:ent["start"]] + subst + new_text[ent["end"]:]
-
-    return new_text
-
-# ==========================================
-# INTERFACE COM O BANCO (MANTIDA)
-# ==========================================
-
-def anonymize_value(col, val):
-    if val is None: return val, None
-    if isinstance(val, (int, float)) or col.lower() in ['id', 'uuid'] or col.lower().endswith('_id'):
+def anonymize_value(col_name: str, val, anon_location: bool = True):
+    if val is None or type(val).__name__ in ['date', 'datetime', 'Timestamp']:
         return val, None
 
-    val_str = str(val)
-    col_lower = col.lower()
+    col = (col_name or "").lower()
 
-    # Colunas diretas de identidade
-    if any(x in col_lower for x in ["nome", "usuario", "proprietario", "cliente"]):
-        if val_str.isdigit(): return val, None
-        return _get(val_str, "PER", lambda: fake.name().upper()), "PER"
+    # 🚀 NOVO: tratar latitude/longitude numéricas
+    if anon_location and isinstance(val, (int, float)):
+        if col in ["latitude", "lat"]:
+            seed = int(hashlib.sha256(f"{val}_lat".encode()).hexdigest()[:8], 16)
+            random.seed(seed)
+            return val + random.uniform(-0.01, 0.01), "LAT_LON"
 
-    # Verificação de coluna de descrição/veículo
-    # Reduzi a agressividade do is_vehicle_col para permitir nomes em descrições
-    is_vehicle_col = any(x in col_lower for x in ["modelo", "marca", "tipo_veiculo"])
+        if col in ["longitude", "lon", "lng"]:
+            seed = int(hashlib.sha256(f"{val}_lon".encode()).hexdigest()[:8], 16)
+            random.seed(seed)
+            return val + random.uniform(-0.01, 0.01), "LAT_LON"
 
-    new_val = anonymize_text(val_str, is_vehicle_col=is_vehicle_col)
-    cat = "TEXT" if new_val != val_str else None
-    return new_val, cat
+        return val, None  # mantém comportamento original para outros números
 
+    val_str = str(val).strip()
+
+    # UUID (mantido)
+    if UUID_PATTERN.match(val_str):
+        return _get_fake(val_str, "UUID"), "UUID"
+
+    # 🚀 AJUSTE: coordenadas em string agora usam ruído (não só precisão)
+    if PURE_COORD_PATTERN.match(val_str):
+        return (alter_geo_precision(val_str, precision=6, noise=0.01), "COORD") if anon_location else (val_str, None)
+
+    new_val = anonymize_text(val_str)
+    return new_val, ("TEXT" if new_val != val_str else None)
+
+# Helper GPS mantido
+def alter_geo_precision(value: str, precision: int = 6, noise: float = 0.01) -> str:
+    try:
+        lat, lon = map(float, value.split(","))
+
+        # determinístico (mesmo input → mesmo output)
+        seed = int(hashlib.sha256(value.encode()).hexdigest()[:8], 16)
+        random.seed(seed)
+
+        lat += random.uniform(-noise, noise)
+        lon += random.uniform(-noise, noise)
+
+        return f"{lat:.{precision}f}, {lon:.{precision}f}"
+    except:
+        return value
