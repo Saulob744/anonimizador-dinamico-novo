@@ -1,20 +1,48 @@
-import re, random, string, unicodedata, hashlib, logging
+# =========================================================
+# ANONYMIZER PRO+ (REFATORADO COM SCORE INTELIGENTE)
+# Mantém compatibilidade com sistema atual
+# Adiciona:
+# - Score dinâmico por coluna
+# - Debug detalhado
+# - Filtro de colunas não sensíveis
+# - Redução de falsos positivos
+# =========================================================
+
+import re
+import random
+import string
+import unicodedata
+import hashlib
+import logging
 from functools import lru_cache
 from faker import Faker
 from gliner import GLiNER
 
 logger = logging.getLogger(__name__)
 
-_MAPPING_CACHE, _USED_FAKES = {}, set()
+# =========================================================
+# CONFIGURAÇÕES GLOBAIS
+# =========================================================
+_MAPPING_CACHE = {}
+_USED_FAKES = set()
 fake = Faker("pt_BR")
 _gliner_model = None
 
 CACHE_LIMIT = 500000
 GLINER_MIN_TEXT = 80
+DEBUG_MODE = True
 
-GLINER_LABELS = ["person", "email", "phone number", "address", "organization"]
+GLINER_LABELS = [
+    "person",
+    "email",
+    "phone number",
+    "address",
+    "organization"
+]
 
-# Regex principais
+# =========================================================
+# REGEX PRINCIPAIS
+# =========================================================
 REGEX = {
     "CPF": re.compile(r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
@@ -22,22 +50,20 @@ REGEX = {
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
     "LOC": re.compile(
         r"\b(Rua|Av|Avenida|Alameda|Travessa|Pca|Praca)\s+([A-ZÀ-Ü0-9][^\s,]+(\s+[A-ZÀ-Ü0-9][^\s,]+){0,4})\b",
-        re.IGNORECASE
+        re.IGNORECASE,
     ),
     "COORD": re.compile(
         r"^\s*-?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?)\s*,\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"
     ),
-    "LAT": re.compile(
-        r"^\s*-?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?)\s*$"
-    ),
+    "LAT": re.compile(r"^\s*-?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?)\s*$"),
     "LONG": re.compile(
         r"^\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"
     ),
     "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b"),
     "PER_COMMON": re.compile(
-        r"\b(maria|jos[eé]|jo[aã]o|ant[oô]nio|francisco|ana|carlos|paulo|pedro|lucas|luiz|marcos|lu[ií]s|gabriel|rafael|daniel|marcelo|bruno|eduardo|felipe|raimundo|rodrigo|manoel|mateus|andr[eé]|fernando|f[aá]bio|leonardo|gustavo|guilherme|leandro|tiago|thiago|[aâ]nderson|ricardo|m[aá]rcio|jorge|alexandre|roberto|edson|diego|v[ií]tor|francisca|ant[oô]nia|adriana|juliana|m[aá]rcia|fernanda|patr[ií]cia|aline|sandra|camila|amanda|bruna|j[eé]ssica|let[ií]cia|j[uú]lia|luciana|vanessa|mariana|gabriela|vera|vit[oó]ria|larissa|cl[aá]udia|beatriz|rita|luana|s[oô]nia|renata|eliane|josefa|simone|nat[aá]lia|michele|tatiane|s[ií]lvia|f[aá]tima|terezinha|margarida)\b",
-        re.IGNORECASE
-    )
+        r"\b(maria|jos[eé]|jo[aã]o|ana|carlos|paulo|pedro|lucas|luiz|gabriel|rafael|fernando|roberto|mariana|patricia|camila|amanda|bruna|julia|marcos|diego|ricardo|gustavo)\b",
+        re.IGNORECASE,
+    ),
 }
 
 NAME_REGEX = re.compile(
@@ -51,37 +77,67 @@ UUID_PATTERN = re.compile(
 DOC_PATTERN = re.compile(r"\b(cpf|rg|documentos?|cnpj|cnh|passaporte)\b")
 NAME_COL_PATTERN = re.compile(r"\b(nome|nomes|razao social)\b")
 
+# =========================================================
+# HEURÍSTICAS DE SENSIBILIDADE
+# =========================================================
+SENSITIVE_HINTS = re.compile(
+    r"\b(nome|mae|pai|filiacao|suspeito|autor|vitima|indiciado|cpf|rg|telefone|email|endereco|usuario|funcionario|servidor|pessoa)\b",
+    re.IGNORECASE,
+)
 
-# Normalização
+NON_SENSITIVE_HINTS = re.compile(
+    r"\b(natureza|crime|tipo|status|descricao|historico|categoria|municipio|cidade|bairro|marca|modelo|cor|orgao|setor|departamento|processo|protocolo|codigo|id)\b",
+    re.IGNORECASE,
+)
+
+CITY_LIKE_PATTERN = re.compile(
+    r"^[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+)?$"
+)
+
+# =========================================================
+# DEBUG
+# =========================================================
+def debug_log(msg):
+    if DEBUG_MODE:
+        logger.warning(msg)
+
+# =========================================================
+# NORMALIZAÇÃO
+# =========================================================
 @lru_cache(maxsize=100000)
-def _normalize(t: str) -> str:
-    if not t:
+def _normalize(text: str) -> str:
+    if not text:
         return ""
-    t = "".join(
-        c for c in unicodedata.normalize("NFKD", t)
+
+    text = "".join(
+        c for c in unicodedata.normalize("NFKD", text)
         if not unicodedata.combining(c)
     )
-    return re.sub(r"[^\w\s]", "", t.upper().strip())
+
+    return re.sub(r"[^\w\s]", "", text.upper().strip())
 
 
-def _fingerprint(v: str) -> str:
+def _fingerprint(value: str) -> str:
     parts = sorted(
-        p for p in _normalize(v).split()
+        p for p in _normalize(value).split()
         if p not in {"DA", "DE", "DO", "DAS", "DOS"}
     )
+
     return hashlib.sha256(" ".join(parts).encode()).hexdigest()
 
-
-# Geração fake
+# =========================================================
+# GERAÇÃO DE FAKES
+# =========================================================
 def _get_fake(value: str, typ: str) -> str:
     global _MAPPING_CACHE
 
     if len(_MAPPING_CACHE) > CACHE_LIMIT:
         _MAPPING_CACHE.clear()
 
-    ckey = f"{typ}:{_normalize(value)}"
-    if ckey in _MAPPING_CACHE:
-        return _MAPPING_CACHE[ckey]
+    cache_key = f"{typ}:{_normalize(value)}"
+
+    if cache_key in _MAPPING_CACHE:
+        return _MAPPING_CACHE[cache_key]
 
     seed = int(_fingerprint(value)[:8], 16)
     attempts = 0
@@ -93,36 +149,24 @@ def _get_fake(value: str, typ: str) -> str:
         try:
             if typ == "UUID":
                 val = str(fake.uuid4())
-
             elif typ in {"PER", "NAME"}:
                 val = fake.name().upper()
-
             elif typ == "PER_COMMON":
                 val = fake.first_name().upper()
-
             elif typ == "CPF":
                 val = fake.cpf()
-
             elif typ == "EMAIL":
                 val = fake.email()
-
             elif typ == "PLATE":
                 val = fake.license_plate().upper()
-
             elif typ == "LOC":
                 prefix = value.split()[0].upper() if " " in value else "RUA"
                 val = f"{prefix} {fake.name().upper()}"
-
             elif typ == "COORD":
                 lat, lon = map(float, value.split(","))
-                val = (
-                    f"{lat + random.uniform(-0.003, 0.003):.4f}, "
-                    f"{lon + random.uniform(-0.003, 0.003):.4f}"
-                )
-
+                val = f"{lat + random.uniform(-0.003, 0.003):.4f}, {lon + random.uniform(-0.003, 0.003):.4f}"
             elif typ in {"LAT", "LONG"}:
                 val = f"{float(value) + random.uniform(-0.003, 0.003):.4f}"
-
             else:
                 val = "".join(
                     random.choices(
@@ -130,8 +174,7 @@ def _get_fake(value: str, typ: str) -> str:
                         k=max(5, len(value))
                     )
                 )
-
-        except:
+        except Exception:
             val = value
 
         if typ in {"CPF", "UUID", "PER", "NAME"} and val in _USED_FAKES:
@@ -143,19 +186,261 @@ def _get_fake(value: str, typ: str) -> str:
         if typ in {"CPF", "UUID", "PER", "NAME"}:
             _USED_FAKES.add(val)
 
-        _MAPPING_CACHE[ckey] = val
+        _MAPPING_CACHE[cache_key] = val
         return val
 
-
-# Modelo IA
+# =========================================================
+# GLINER
+# =========================================================
 def get_gliner():
     global _gliner_model
+
     if _gliner_model is None:
         _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
+
     return _gliner_model
 
+# =========================================================
+# SCORE DE SENSIBILIDADE
+# =========================================================
+def score_column_sensitivity(col_name: str, sample_values) -> dict:
+    """
+    Score robusto para decidir se uma coluna merece anonimização estrutural.
 
-# Detecção
+    Objetivo:
+    - Reduzir falsos positivos
+    - Ignorar colunas categóricas/operacionais
+    - Detectar colunas realmente pessoais
+    - Preservar compatibilidade
+    """
+
+    score = 0
+    reasons = []
+
+    col_clean = str(col_name).lower().replace("_", " ").replace("-", " ")
+
+    # =====================================================
+    # CAMADA 1 — NOME DA COLUNA
+    # =====================================================
+    if SENSITIVE_HINTS.search(col_clean):
+        score += 40
+        reasons.append("sensitive_column_name")
+
+    if NON_SENSITIVE_HINTS.search(col_clean):
+        score -= 50
+        reasons.append("non_sensitive_column_name")
+
+    # =====================================================
+    # AMOSTRAS
+    # =====================================================
+    valid_samples = [
+        str(v).strip()
+        for v in sample_values
+        if v is not None and str(v).strip()
+    ][:50]
+
+    if not valid_samples:
+        return {
+            "score": score,
+            "decision": False,
+            "reasons": reasons,
+        }
+
+    total = len(valid_samples)
+
+    # =====================================================
+    # MÉTRICAS
+    # =====================================================
+    person_hits = 0
+    structured_hits = 0
+    city_hits = 0
+    categorical_hits = 0
+    short_text_hits = 0
+    long_text_hits = 0
+    unique_values = set()
+
+    for val in valid_samples:
+        unique_values.add(val.lower())
+
+        word_count = len(val.split())
+
+        # -------------------------
+        # Texto curto / categórico
+        # -------------------------
+        if len(val) < 15:
+            short_text_hits += 1
+
+        if len(val) > 80:
+            long_text_hits += 1
+
+        # -------------------------
+        # Estrutura categórica
+        # -------------------------
+        if word_count <= 2 and val.istitle():
+            categorical_hits += 1
+
+        # -------------------------
+        # Regex estruturado
+        # -------------------------
+        for typ, pat in REGEX.items():
+            if pat.search(val):
+                if typ in {"CPF", "EMAIL", "PHONE", "LOC"}:
+                    structured_hits += 1
+                break
+
+        # -------------------------
+        # Nome detectado
+        # -------------------------
+        if NAME_REGEX.search(val):
+            person_hits += 1
+
+        if REGEX["PER_COMMON"].search(val):
+            person_hits += 1
+
+        # -------------------------
+        # Cidade/localidade
+        # -------------------------
+        if CITY_LIKE_PATTERN.match(val) and word_count <= 2:
+            city_hits += 1
+
+        # -------------------------
+        # IA apenas em textos maiores
+        # -------------------------
+        if len(val) >= GLINER_MIN_TEXT:
+            try:
+                preds = get_gliner().predict_entities(
+                    val,
+                    ["person"],
+                    threshold=0.40,
+                )
+                if preds:
+                    person_hits += 2
+            except Exception:
+                pass
+
+    # =====================================================
+    # RATIOS
+    # =====================================================
+    person_ratio = person_hits / total
+    structured_ratio = structured_hits / total
+    city_ratio = city_hits / total
+    categorical_ratio = categorical_hits / total
+    short_ratio = short_text_hits / total
+    long_ratio = long_text_hits / total
+    unique_ratio = len(unique_values) / total
+
+    avg_words = sum(len(v.split()) for v in valid_samples) / total
+
+    # =====================================================
+    # CAMADA 2 — PONTUAÇÃO POSITIVA
+    # =====================================================
+    score += int(person_ratio * 55)
+    score += int(structured_ratio * 40)
+
+    if long_ratio > 0.30:
+        score += 15
+        reasons.append("long_text_pattern")
+
+    # =====================================================
+    # CAMADA 3 — PENALIDADES
+    # =====================================================
+
+    # Coluna majoritariamente cidade/local
+    if city_ratio >= 0.50:
+        score -= 60
+        reasons.append("city_like_pattern")
+
+    # Coluna categórica
+    if categorical_ratio >= 0.60:
+        score -= 35
+        reasons.append("categorical_pattern")
+
+    # Texto curto demais
+    if short_ratio >= 0.70:
+        score -= 25
+        reasons.append("short_text_pattern")
+
+    # Pouca diversidade
+    if unique_ratio < 0.30:
+        score -= 20
+        reasons.append("low_uniqueness")
+
+    # Média de palavras muito baixa
+    if avg_words < 2:
+        score -= 20
+        reasons.append("low_nominal_pattern")
+
+    # Se parece operacional e não pessoal
+    if (
+        city_ratio > 0.40
+        and person_ratio < 0.30
+        and structured_ratio < 0.20
+    ):
+        score -= 50
+        reasons.append("operational_column_pattern")
+
+    # =====================================================
+    # CAMADA 4 — REGRAS DE BLOQUEIO
+    # =====================================================
+
+    force_block = False
+
+    if NON_SENSITIVE_HINTS.search(col_clean):
+        force_block = True
+        reasons.append("forced_non_sensitive_block")
+
+    if city_ratio >= 0.70:
+        force_block = True
+        reasons.append("forced_city_block")
+
+    if categorical_ratio >= 0.75 and person_ratio < 0.25:
+        force_block = True
+        reasons.append("forced_categorical_block")
+
+    # =====================================================
+    # DECISÃO FINAL
+    # =====================================================
+    decision = False if force_block else score >= 35
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
+    debug_log(
+        f"[COLUMN SCORE] {col_name} | "
+        f"Score={score} | "
+        f"Decision={decision} | "
+        f"Person={person_ratio:.2f} | "
+        f"Structured={structured_ratio:.2f} | "
+        f"City={city_ratio:.2f} | "
+        f"Categorical={categorical_ratio:.2f} | "
+        f"Unique={unique_ratio:.2f} | "
+        f"AvgWords={avg_words:.2f} | "
+        f"Reasons={reasons} | "
+        f"Samples={valid_samples[:10]}"
+    )
+
+    return {
+        "score": score,
+        "decision": decision,
+        "reasons": reasons,
+        "person_ratio": round(person_ratio, 2),
+        "structured_ratio": round(structured_ratio, 2),
+        "city_ratio": round(city_ratio, 2),
+        "categorical_ratio": round(categorical_ratio, 2),
+        "unique_ratio": round(unique_ratio, 2),
+        "avg_words": round(avg_words, 2),
+    }
+
+def should_anonymize_column(col_name: str, sample_values) -> bool:
+    try:
+        return score_column_sensitivity(col_name, sample_values)["decision"]
+    except Exception as e:
+        debug_log(f"[ERROR SCORE] {col_name}: {e}")
+        return True
+
+# =========================================================
+# DETECÇÃO
+# =========================================================
 def _detect_all(text: str, anon_loc: bool):
     found = []
 
@@ -163,23 +448,22 @@ def _detect_all(text: str, anon_loc: bool):
         if typ in {"COORD", "LOC"} and not anon_loc:
             continue
 
-        for m in pat.finditer(text):
-            found.append((m.start(), m.end(), m.group(), typ))
+        for match in pat.finditer(text):
+            found.append((match.start(), match.end(), match.group(), typ))
 
-    for m in NAME_REGEX.finditer(text):
-        found.append((m.start(), m.end(), m.group(), "PER"))
+    for match in NAME_REGEX.finditer(text):
+        found.append((match.start(), match.end(), match.group(), "PER"))
 
-    # IA apenas em textos relevantes
     if len(text) >= GLINER_MIN_TEXT:
         try:
             preds = get_gliner().predict_entities(
                 text,
                 GLINER_LABELS,
-                threshold=0.30
+                threshold=0.30,
             )
 
-            for e in preds:
-                lbl = e["label"].lower()
+            for entity in preds:
+                lbl = entity["label"].lower()
 
                 typ = (
                     "PER" if "person" in lbl else
@@ -191,10 +475,10 @@ def _detect_all(text: str, anon_loc: bool):
                     continue
 
                 found.append(
-                    (e["start"], e["end"], e["text"], typ)
+                    (entity["start"], entity["end"], entity["text"], typ)
                 )
 
-        except:
+        except Exception:
             pass
 
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
@@ -209,8 +493,9 @@ def _detect_all(text: str, anon_loc: bool):
 
     return clean
 
-
-# Texto livre
+# =========================================================
+# TEXTO
+# =========================================================
 def anonymize_text(text: str, anon_loc: bool = True) -> str:
     if not isinstance(text, str):
         return text
@@ -225,19 +510,20 @@ def anonymize_text(text: str, anon_loc: bool = True) -> str:
     if not entities:
         return text
 
-    res = []
+    result = []
     last = 0
 
     for s, e, v, t in entities:
-        res.extend([text[last:s], _get_fake(v, t)])
+        result.extend([text[last:s], _get_fake(v, t)])
         last = e
 
-    res.append(text[last:])
+    result.append(text[last:])
 
-    return "".join(res)
+    return "".join(result)
 
-
-# Valor individual
+# =========================================================
+# VALOR UNITÁRIO
+# =========================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True):
     if (
         val is None
@@ -262,93 +548,213 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 
     return new_v, ("TEXT" if new_v != v_str else None)
 
-
-# Reset
+# =========================================================
+# RESET
+# =========================================================
 def reset_memory():
     global _MAPPING_CACHE, _USED_FAKES
     _MAPPING_CACHE.clear()
     _USED_FAKES.clear()
     _normalize.cache_clear()
 
+# =========================================================
+# DATAFRAME
+# =========================================================
+# =========================================================
+# SCORE DE SENSIBILIDADE DE COLUNA (VERSÃO REFORÇADA)
+# =========================================================
+def score_column_sensitivity(col_name: str, sample_values) -> dict:
+    """
+    Decide se uma coluna realmente merece anonimização,
+    reduzindo falsos positivos como:
+    - cidades
+    - bairros
+    - naturezas criminais
+    - categorias repetitivas
+    - descrições curtas não pessoais
+    """
 
-# Inferência de coluna
-def infer_column_type(sample_values) -> str:
-    clean_sample = [
-        str(v).strip()
-        for v in sample_values
-        if v is not None and str(v).strip()
-    ]
-
-    if not clean_sample:
-        return "TEXT"
-
-    total = len(clean_sample)
-    counts = {key: 0 for key in REGEX.keys()}
-
-    for val in clean_sample:
-        for typ, pat in REGEX.items():
-            if pat.search(val):
-                counts[typ] += 1
-                break
-
-    for typ, count in counts.items():
-        if (count / total) > 0.70:
-            return typ
-
-    return "TEXT"
-
-
-# Coluna DataFrame
-def anonymize_dataframe_column(df, col_name: str, anon_location: bool = True):
-    import pandas as pd
-
-    col = df[col_name]
-
-    if (
-        pd.api.types.is_datetime64_any_dtype(col)
-        or pd.api.types.is_bool_dtype(col)
-    ):
-        return col
-
-    serie_valida = col.dropna()
-
-    if serie_valida.empty:
-        return col
-
-    serie_str = serie_valida.astype(str).str.strip()
-
-    if serie_str.str.len().mean() < 3:
-        return col
+    score = 0
+    reasons = []
 
     col_clean = str(col_name).lower().replace("_", " ").replace("-", " ")
 
-    if DOC_PATTERN.search(col_clean):
-        tipo_inferred = "CPF"
+    # -----------------------------------------------------
+    # PESO PELO NOME DA COLUNA
+    # -----------------------------------------------------
+    if SENSITIVE_HINTS.search(col_clean):
+        score += 40
+        reasons.append("sensitive_column_name")
 
-    elif NAME_COL_PATTERN.search(col_clean):
-        tipo_inferred = "PER"
+    if NON_SENSITIVE_HINTS.search(col_clean):
+        score -= 50
+        reasons.append("non_sensitive_column_name")
 
-    else:
-        tipo_inferred = infer_column_type(
-            serie_str.head(100).tolist()
-        )
+    # -----------------------------------------------------
+    # AMOSTRAS VÁLIDAS
+    # -----------------------------------------------------
+    valid_samples = [
+        str(v).strip()
+        for v in sample_values
+        if v is not None and str(v).strip()
+    ][:100]
 
-    if tipo_inferred in {
-        "CPF", "CNPJ", "PER",
-        "EMAIL", "PHONE",
-        "PLATE", "LAT",
-        "LONG", "COORD"
-    }:
-        return col.apply(
-            lambda x: (
-                _get_fake(str(x).strip(), tipo_inferred)
-                if pd.notnull(x) else x
-            )
-        )
+    if not valid_samples:
+        debug_log(f"[COLUMN SCORE] {col_name} | EMPTY SAMPLE")
+        return {
+            "score": score,
+            "decision": False,
+            "reasons": reasons,
+        }
 
-    return col.apply(
-        lambda x: (
-            anonymize_text(str(x), anon_location)
-            if pd.notnull(x) else x
-        )
+    total = len(valid_samples)
+
+    # -----------------------------------------------------
+    # MÉTRICAS
+    # -----------------------------------------------------
+    person_hits = 0
+    structured_hits = 0
+    city_hits = 0
+    repetitive_hits = 0
+    short_text_hits = 0
+    categorical_hits = 0
+
+    normalized_values = [_normalize(v) for v in valid_samples]
+    unique_ratio = len(set(normalized_values)) / total
+
+    for val in valid_samples:
+        val_clean = val.strip()
+
+        # -----------------------------
+        # REGEX estruturado
+        # -----------------------------
+        for typ, pat in REGEX.items():
+            if pat.search(val_clean):
+                if typ in {"CPF", "EMAIL", "PHONE", "LOC"}:
+                    structured_hits += 1
+                break
+
+        # -----------------------------
+        # Nome provável
+        # -----------------------------
+        if NAME_REGEX.search(val_clean):
+            person_hits += 1
+
+        if REGEX["PER_COMMON"].search(val_clean):
+            person_hits += 1
+
+        # -----------------------------
+        # IA GLINER (somente textos médios)
+        # -----------------------------
+        if 15 <= len(val_clean) <= 120:
+            try:
+                preds = get_gliner().predict_entities(
+                    val_clean,
+                    ["person"],
+                    threshold=0.45,
+                )
+
+                if preds:
+                    person_hits += 3
+
+            except Exception:
+                pass
+
+        # -----------------------------
+        # Cidade / localidade provável
+        # -----------------------------
+        if (
+            CITY_LIKE_PATTERN.match(val_clean)
+            and len(val_clean.split()) <= 3
+            and not REGEX["PER_COMMON"].search(val_clean)
+        ):
+            city_hits += 1
+
+        # -----------------------------
+        # Texto curto demais
+        # -----------------------------
+        if len(val_clean.split()) <= 2:
+            short_text_hits += 1
+
+        # -----------------------------
+        # Categoria típica
+        # -----------------------------
+        if len(val_clean) < 30 and not any(ch.isdigit() for ch in val_clean):
+            categorical_hits += 1
+
+    # -----------------------------------------------------
+    # RATIOS
+    # -----------------------------------------------------
+    person_ratio = person_hits / total
+    structured_ratio = structured_hits / total
+    city_ratio = city_hits / total
+    short_ratio = short_text_hits / total
+    categorical_ratio = categorical_hits / total
+
+    # -----------------------------------------------------
+    # SCORE POSITIVO
+    # -----------------------------------------------------
+    score += int(person_ratio * 60)
+    score += int(structured_ratio * 35)
+
+    # -----------------------------------------------------
+    # SCORE NEGATIVO
+    # -----------------------------------------------------
+    if city_ratio > 0.40:
+        score -= 45
+        reasons.append("city_like_pattern")
+
+    if short_ratio > 0.75:
+        score -= 25
+        reasons.append("mostly_short_values")
+
+    if categorical_ratio > 0.70:
+        score -= 20
+        reasons.append("categorical_values")
+
+    if unique_ratio < 0.35:
+        score -= 20
+        reasons.append("high_repetition")
+
+    # -----------------------------------------------------
+    # PROTEÇÃO EXTRA:
+    # se nome da coluna já sugere natureza/tipo,
+    # exigir score muito maior
+    # -----------------------------------------------------
+    threshold = 35
+
+    if NON_SENSITIVE_HINTS.search(col_clean):
+        threshold = 55
+
+    # -----------------------------------------------------
+    # DECISÃO FINAL
+    # -----------------------------------------------------
+    decision = score >= threshold
+
+    # -----------------------------------------------------
+    # DEBUG COMPLETO
+    # -----------------------------------------------------
+    debug_log(
+        f"[COLUMN SCORE] "
+        f"Column='{col_name}' | "
+        f"Score={score} | Threshold={threshold} | Decision={decision} | "
+        f"PersonRatio={person_ratio:.2f} | "
+        f"StructuredRatio={structured_ratio:.2f} | "
+        f"CityRatio={city_ratio:.2f} | "
+        f"ShortRatio={short_ratio:.2f} | "
+        f"UniqueRatio={unique_ratio:.2f} | "
+        f"Reasons={reasons} | "
+        f"Samples={valid_samples[:10]}"
     )
+
+    return {
+        "score": score,
+        "decision": decision,
+        "reasons": reasons,
+        "person_ratio": round(person_ratio, 2),
+        "structured_ratio": round(structured_ratio, 2),
+        "city_ratio": round(city_ratio, 2),
+        "short_ratio": round(short_ratio, 2),
+        "unique_ratio": round(unique_ratio, 2),
+        "threshold": threshold,
+    }

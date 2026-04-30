@@ -38,6 +38,9 @@ st.markdown("""
 # ==================================================
 # CORE
 # ==================================================
+# ==================================================
+# CORE
+# ==================================================
 def process_chunk_parallel(rows, modo, anon_geo):
     import anonymizer
     import re
@@ -51,27 +54,90 @@ def process_chunk_parallel(rows, modo, anon_geo):
 
     processed = []
 
+    # ==================================================
+    # NOVO: cache por chunk para score de sensibilidade
+    # Evita recalcular por linha
+    # ==================================================
+    column_samples = {}
+
+    if rows:
+        sample_size = min(50, len(rows))
+
+        for col in rows[0].keys():
+            vals = []
+
+            for r in rows[:sample_size]:
+                v = r.get(col)
+
+                if (
+                    v is not None
+                    and not isinstance(v, (int, float, bool))
+                    and type(v).__name__ not in ['date', 'datetime', 'Timestamp']
+                ):
+                    vals.append(str(v).strip())
+
+            column_samples[col] = vals
+
+    column_decisions = {}
+
+    for col, samples in column_samples.items():
+        try:
+            column_decisions[col] = anonymizer.should_anonymize_column(
+                col,
+                samples
+            )
+        except Exception:
+            column_decisions[col] = True
+
+    # ==================================================
+    # PROCESSAMENTO NORMAL
+    # ==================================================
     for r in rows:
         row_dict = dict(r)
 
         for col, old in row_dict.items():
+
+            # Ignora tipos seguros
             if old is None or isinstance(old, (int, float, bool)):
                 continue
+
             if type(old).__name__ in ['date', 'datetime', 'Timestamp']:
                 continue
 
-            try:
-                new, flag = anonymizer.anonymize_value(col, old, anon_location=anon_geo)
+            # ==================================================
+            # NOVO: pula colunas classificadas como não sensíveis
+            # ==================================================
+            if not column_decisions.get(col, True):
+                continue
 
+            try:
+                new, flag = anonymizer.anonymize_value(
+                    col,
+                    old,
+                    anon_location=anon_geo
+                )
+
+                # ==================================================
+                # Scrub secundário apenas se texto foi alterado
+                # ==================================================
                 if flag == "TEXT" and isinstance(new, str):
                     new = sub_scrub.sub(
-                        lambda m: anonymizer._get_fake(m.group(1), "PER"),
+                        lambda m: anonymizer._get_fake(
+                            m.group(1),
+                            "PER"
+                        ),
                         new
                     )
 
                 row_dict[col] = new
-            except:
-                pass
+
+            except Exception as e:
+                try:
+                    anonymizer.debug_log(
+                        f"[APP ERROR] Col={col} Value={str(old)[:80]} Error={e}"
+                    )
+                except Exception:
+                    pass
 
         processed.append(row_dict)
 
