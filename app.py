@@ -45,19 +45,26 @@ def process_chunk_parallel(rows, modo, anon_geo):
     import anonymizer
     import re
 
+    # ==================================================
+    # SCRUB SECUNDÁRIO
+    # Captura nomes compostos que possam escapar
+    # ==================================================
     sub_scrub = re.compile(
         r"\b([A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3})\b"
     )
 
+    # ==================================================
+    # EXECUTA APENAS NO MODO TOTAL
+    # ==================================================
     if modo != "🛡️ Anonimização Total":
         return rows
 
     processed = []
 
     # ==================================================
-    # NOVO: cache por chunk para score de sensibilidade
-    # Evita recalcular por linha
+    # FASE 1 — AMOSTRAGEM POR COLUNA
     # ==================================================
+    # Coleta até 50 valores por coluna para score estrutural
     column_samples = {}
 
     if rows:
@@ -69,15 +76,30 @@ def process_chunk_parallel(rows, modo, anon_geo):
             for r in rows[:sample_size]:
                 v = r.get(col)
 
+                # Ignora tipos seguros
                 if (
-                    v is not None
-                    and not isinstance(v, (int, float, bool))
-                    and type(v).__name__ not in ['date', 'datetime', 'Timestamp']
+                    v is None
+                    or isinstance(v, bool)
+                    or type(v).__name__ in ['date', 'datetime', 'Timestamp']
                 ):
+                    continue
+
+                # ==================================================
+                # IMPORTANTE:
+                # Agora float/int também entram se forem possíveis
+                # coordenadas
+                # ==================================================
+                if isinstance(v, (int, float)):
                     vals.append(str(v).strip())
+                    continue
+
+                vals.append(str(v).strip())
 
             column_samples[col] = vals
 
+    # ==================================================
+    # FASE 2 — DECISÃO DE SENSIBILIDADE POR COLUNA
+    # ==================================================
     column_decisions = {}
 
     for col, samples in column_samples.items():
@@ -86,31 +108,70 @@ def process_chunk_parallel(rows, modo, anon_geo):
                 col,
                 samples
             )
-        except Exception:
+
+            anonymizer.debug_log(
+                f"[APP COLUMN DECISION] {col} -> {column_decisions[col]}"
+            )
+
+        except Exception as e:
             column_decisions[col] = True
 
+            try:
+                anonymizer.debug_log(
+                    f"[APP COLUMN SCORE ERROR] Col={col} Error={e}"
+                )
+            except Exception:
+                pass
+
     # ==================================================
-    # PROCESSAMENTO NORMAL
+    # FASE 3 — PROCESSAMENTO DAS LINHAS
     # ==================================================
     for r in rows:
         row_dict = dict(r)
 
         for col, old in row_dict.items():
 
-            # Ignora tipos seguros
-            if old is None or isinstance(old, (int, float, bool)):
+            # ==================================================
+            # Ignora nulos
+            # ==================================================
+            if old is None:
                 continue
 
+            # ==================================================
+            # Ignora datas
+            # ==================================================
             if type(old).__name__ in ['date', 'datetime', 'Timestamp']:
                 continue
 
             # ==================================================
-            # NOVO: pula colunas classificadas como não sensíveis
+            # NOVO:
+            # Mantém números comuns,
+            # mas permite coordenadas por nome estrutural
+            # ==================================================
+            col_clean = str(col).lower()
+
+            is_geo_column = any(
+                x in col_clean
+                for x in [
+                    "lat", "latitude",
+                    "lon", "long", "longitude",
+                    "coord", "gps"
+                ]
+            )
+
+            if isinstance(old, (int, float)) and not is_geo_column:
+                continue
+
+            # ==================================================
+            # Pula colunas não sensíveis
             # ==================================================
             if not column_decisions.get(col, True):
                 continue
 
             try:
+                # ==================================================
+                # ANONIMIZAÇÃO PRINCIPAL
+                # ==================================================
                 new, flag = anonymizer.anonymize_value(
                     col,
                     old,
@@ -118,7 +179,8 @@ def process_chunk_parallel(rows, modo, anon_geo):
                 )
 
                 # ==================================================
-                # Scrub secundário apenas se texto foi alterado
+                # SCRUB SECUNDÁRIO
+                # Apenas se houve alteração textual
                 # ==================================================
                 if flag == "TEXT" and isinstance(new, str):
                     new = sub_scrub.sub(
@@ -142,7 +204,6 @@ def process_chunk_parallel(rows, modo, anon_geo):
         processed.append(row_dict)
 
     return processed
-
 
 def build_url(db_type, user, password, host, port, db):
     if db_type == "mssql":
@@ -184,7 +245,7 @@ with st.sidebar:
     modo = st.selectbox("Modo", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
     chunk_size = st.number_input("Chunk", value=10000, step=1000)
     filter_tables = st.text_input("Filtrar tabelas")
-    anon_geo = st.toggle("GPS blur", value=True)
+    anon_geo = st.toggle("Mascara De GPS", value=True)
 
     super_proc = st.toggle("🚀 Multi CPU", value=False)
     n_cores = st.slider("CPU", 1, db_utils.get_cpu_info(), db_utils.get_cpu_info()) if super_proc else 1
@@ -195,7 +256,7 @@ with st.sidebar:
 # ==================================================
 # PIPELINE
 # ==================================================
-st.title("🛡️ Pipeline")
+st.title("🛡️ Pipeline De Proteção De Dados")
 progress_bar = st.progress(0)
 status = st.empty()
 metric_placeholder = st.empty()
