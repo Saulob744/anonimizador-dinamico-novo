@@ -1,263 +1,148 @@
 import re, random, string, unicodedata, hashlib, logging
 from faker import Faker
+from gliner import GLiNER
 
 logger = logging.getLogger(__name__)
 
-# ==================================================
-# CONFIGURAÇÕES DE IA (ENSEMBLE: GLiNER + SPACY)
-# ==================================================
+_MAPPING_CACHE, _USED_FAKES = {}, set()
 fake = Faker("pt_BR")
+_gliner_model = None
 
-# 1. GLiNER (Zero-Shot Contextual NER)
-try:
-    from gliner import GLiNER
-    _gliner_model = None
-    GLINER_LABELS = ["person", "first name", "email", "phone number", "address", "organization"]
-    GLINER_AVAILABLE = True
-except ImportError:
-    GLINER_AVAILABLE = False
-
-def get_gliner():
-    global _gliner_model
-    if GLINER_AVAILABLE and _gliner_model is None:
-        logger.info("Carregando modelo GLiNER na memória...")
-        _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
-    return _gliner_model
-
-# 2. spaCy (Análise Sintática e Morfológica em Português)
-try:
-    import spacy
-    _spacy_model = None
-    _spacy_failed = False  # 🚀 NOVA FLAG: Evita o spam de avisos
-    
-    def get_spacy():
-        global _spacy_model, _spacy_failed
-        
-        if _spacy_failed:
-            return None # Se já falhou na primeira vez, não tenta de novo
-            
-        if _spacy_model is None:
-            try:
-                logger.info("Carregando modelo spaCy (pt_core_news_sm)...")
-                _spacy_model = spacy.load("pt_core_news_sm")
-            except OSError:
-                logger.warning("⚠️ Modelo spaCy não encontrado. Desativando módulo silenciosamente. Para usar, rode: python -m spacy download pt_core_news_sm")
-                _spacy_failed = True # Marca que falhou para ficar quieto nas próximas linhas
-                return None
-        return _spacy_model
-except ImportError:
-    def get_spacy(): return None
-
-# ==================================================
-# MOTORES DE BUSCA (REGEX PARA TEXTO LIVRE)
-# ==================================================
+# Configurações de Detecção - Regex Otimizados e Precisos
+GLINER_LABELS = ["person", "email", "phone number", "address", "organization"]
 REGEX = {
-    "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
+    # Exige CPF formatado com todos os pontos/hífen ou apenas 11 números seguidos
+    "CPF": re.compile(r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
-    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"),
+    # Exige DDD com parênteses completos ou sem, evitando pegar um parêntese isolado
+    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(\d{2}\)|\d{2})\s?(?:9\d{4}|\d{4})-?\d{4}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    "CEP": re.compile(r"\b\d{5}-?\d{3}\b"),
-    "COORDS": re.compile(r"-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+"),
+    "COORD": re.compile(r"-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+"),
+    "LOC": re.compile(r"\b(Rua|Av|Avenida|Alameda|Travessa|Pca|Praca)\s+([A-ZÀ-Ü0-9][^\s,]+(\s+[A-ZÀ-Ü0-9][^\s,]+){0,4})\b", re.IGNORECASE),
     "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b")
 }
 
-UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][A-ZÀ-Üa-zà-ü']+(?:\s+(?:D\.|DA|DE|DO|DAS|DOS|[A-ZÀ-Ü][A-Za-zà-ü']+)){1,4})\b")
-PURE_COORD_PATTERN = re.compile(r"^-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+$")
+# Regex de Nome: Permite maiúsculas e minúsculas, limite de 2 a 4 palavras.
+NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][a-zA-ZÀ-Üà-ü]{1,}(?:\s+(?:d[eao]s?|D[EAO]S?|[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü]{1,}\.?)){1,3})\b")
+UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 
-# 🚀 CAÇADOR DE NOMES SOLTOS E DIMINUTIVOS (Ignora maiúsculas/minúsculas)
-_nomes = "maria|joao|joão|ana|jose|josé|carlos|paulo|lucas|marcos|luiz|luis|fernanda|julia|pedro|carol|jorge|antonio|francisco|aline|bruna|camila|rafael|gabriel|rodrigo|thiago|bruno|amanda|jessica|leticia|letícia|diego|marcelo|gustavo|guilherme|felipe|larissa|vitoria|vitória|renato|eduardo|leonardo|victor|vitor|matheus|mateus|enzo|valentina|miguel|arthur|heitor|alice|laura|sophia|davi|lorenzo|theo|bernardo|isaque|isabella|manuela|giovanna|helena|henrique|luiza|mariana|beatriz|roberto|ricardo|fernando|patricia|juliana|marcia|renata|claudia"
-COMMON_NAMES = re.compile(rf"\b({_nomes})(z?inh[oa]|it[oa]|ão)?\b", re.IGNORECASE)
 
-# 🚀 ÂNCORAS DE PESSOA (Contexto)
-PERSON_ANCHORS = re.compile(r"\b(v[íi]tima|suspeito|autor|indiv[íi]duo|senhor|senhora|sr\.?|sra\.?|testemunha)\s+([A-ZÀ-Üa-zà-ü]+)\b", re.IGNORECASE)
+def _normalize(t: str) -> str:
+    if not t: return ""
+    t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
+    return re.sub(r"[^\w\s]", "", t.upper().strip())
 
-# ==================================================
-# FUNÇÕES CORE (NORMALIZAÇÃO E HASH)
-# ==================================================
-def _normalize(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text)
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", "".join(c for c in text if not unicodedata.combining(c)))).upper().strip()
 
-def _canonical(value: str) -> str:
-    v = re.sub(r"\b([A-Z])\.", r"\1", _normalize(value))
-    return " ".join([p for p in v.split() if len(p) > 1])
+def _fingerprint(v: str) -> str:
+    parts = sorted([p for p in _normalize(v).split() if p not in ["DA", "DE", "DO", "DAS", "DOS"]])
+    return hashlib.sha256(" ".join(parts).encode()).hexdigest()
 
-def _fingerprint(value: str) -> str:
-    return hashlib.sha256(" ".join(sorted([p for p in _canonical(value).split() if len(p) > 2])).encode()).hexdigest()
 
-# ==================================================
-# GERADOR DETERMINÍSTICO
-# ==================================================
 def _get_fake(value: str, typ: str) -> str:
-    seed = int(hashlib.sha256((_fingerprint(value) + typ).encode()).hexdigest()[:8], 16)
-    fake.seed_instance(seed)
-    random.seed(seed)
+    ckey = f"{typ}:{_normalize(value)}"
+    if ckey in _MAPPING_CACHE: return _MAPPING_CACHE[ckey]
 
-    if typ == "UUID": return fake.uuid4()
-    if typ == "PER": return fake.name().upper()
-    if typ == "CPF": return fake.cpf()
-    if typ == "EMAIL": return fake.email()
-    if typ == "PHONE": return fake.phone_number()
-    if typ == "PLATE": return fake.license_plate().upper()
-    if typ == "CEP": return fake.postcode()
-    if typ == "ORG": return fake.company()
-    
-    if typ == "LOC":
-        base = _normalize(value).split()[0] if value.split() else "LOC"
-        return f"{base}_REGIAO_{random.randint(10, 99)}"
+    seed = int(_fingerprint(value)[:8], 16)
+    attempts = 0
+    while True:
+        fake.seed_instance(seed + attempts)
+        random.seed(seed + attempts)
 
-    if typ == "CODE":
-        return "".join(random.choices(string.ascii_uppercase + string.digits, k=max(5, len(value))))
+        if typ == "UUID": val = str(fake.uuid4())
+        elif typ in ["PER", "NAME"]: val = fake.name().upper()
+        elif typ == "CPF": val = fake.cpf()
+        elif typ == "EMAIL": val = fake.email()
+        elif typ == "PLATE": val = fake.license_plate().upper()
+        elif typ == "LOC":
+            prefix = value.split()[0].upper() if " " in value else "RUA"
+            val = f"{prefix} {fake.name().upper()}"
+        elif typ == "COORD":
+            try:
+                lat, lon = map(float, value.split(","))
+                val = f"{lat + random.uniform(-0.009, 0.009):.4f}, {lon + random.uniform(-0.009, 0.009):.4f}"
+            except: val = value
+        else: val = "".join(random.choices(string.ascii_uppercase + string.digits, k=max(5, len(value))))
 
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        if typ in ["CPF", "UUID", "PER", "NAME"] and val in _USED_FAKES:
+            attempts += 1
+            if attempts > 50: break
+            continue
+        
+        if typ in ["CPF", "UUID", "PER", "NAME"]: _USED_FAKES.add(val)
+        _MAPPING_CACHE[ckey] = val
+        return val
 
-# ==================================================
-# MOTOR PESADO (TEXTO LIVRE)
-# ==================================================
-def _resolve_type(raw_type: str) -> str:
-    t = raw_type.lower()
-    if any(k in t for k in ["person", "name", "suspect", "victim", "employee", "per"]): return "PER"
-    if "email" in t: return "EMAIL"
-    if "phone" in t: return "PHONE"
-    if any(k in t for k in ["organization", "org"]): return "ORG"
-    if any(k in t for k in ["location", "address", "loc"]): return "LOC"
-    return "UNK"
 
-def _detect_all(text: str):
+def get_gliner():
+    global _gliner_model
+    if _gliner_model is None: _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
+    return _gliner_model
+
+
+def _detect_all(text: str, anon_loc: bool):
     found = []
     
-    # 1. Âncoras de Pessoas (Pega nomes soltos baseado na palavra anterior)
-    for m in PERSON_ANCHORS.finditer(text):
-        nome_alvo = m.group(2)
-        if len(nome_alvo) > 2:
-            found.append((m.start(2), m.end(2), nome_alvo, "PER"))
+    # 1. Regex
+    for typ, pat in REGEX.items():
+        if typ in ["COORD", "LOC"] and not anon_loc: continue
+        for m in pat.finditer(text): found.append((m.start(), m.end(), m.group(), typ))
 
-    # 2. Caçador de Diminutivos e Nomes Comuns
-    for m in COMMON_NAMES.finditer(text):
-        found.append((m.start(), m.end(), m.group(), "PER"))
-
-    # 3. Regex Padrão (Documentos, Códigos)
-    for typ, pattern in REGEX.items():
-        for m in pattern.finditer(text): found.append((m.start(), m.end(), m.group(), typ))
-
-    # 4. Nomes Compostos (Regex Clássico)
-    for m in NAME_REGEX.finditer(text):
-        raw = m.group()
-        if len(_canonical(raw).split()) >= 2:
-            found.append((m.start(), m.end(), raw, "PER"))
-
-    # 5. Inteligência Artificial: spaCy (Gramática)
-    spacy_model = get_spacy()
-    if spacy_model:
-        doc = spacy_model(text)
-        for ent in doc.ents:
-            if ent.label_ == "PER" or ent.label_ == "LOC":
-                found.append((ent.start_char, ent.end_char, ent.text, _resolve_type(ent.label_)))
-
-    # 6. Inteligência Artificial: GLiNER (Contexto Zero-Shot)
-    gliner_model = get_gliner()
-    if gliner_model and len(text) > 10:
-        try:
-            preds = gliner_model.predict_entities(text, GLINER_LABELS, threshold=0.35)
-            for e in preds:
-                found.append((e["start"], e["end"], e["text"], _resolve_type(e["label"])))
-        except: pass
-
-    # 🚀 RESOLUÇÃO DE CONFLITOS (A Magia do Ensemble)
-    # Ordena por início. Se houver sobreposição, o maior texto "engole" o menor.
-    clean_found, last_end = [], -1
-    for s, e, v, typ in sorted(found, key=lambda x: (x[0], -(x[1]-x[0]))):
-        if s >= last_end:
-            clean_found.append((s, e, v, typ))
-            last_end = e
-            
-    return clean_found
-
-def alter_geo_precision(value: str, precision: int = 3) -> str:
+    # 2. Nomes Próprios
+    for m in NAME_REGEX.finditer(text): found.append((m.start(), m.end(), m.group(), "PER"))
+    
+    # 3. IA (GLiNER)
     try:
-        lat, lon = map(float, value.split(","))
-        return f"{lat:.{precision}f}, {lon:.{precision}f}"
-    except: return value
+        preds = get_gliner().predict_entities(text, GLINER_LABELS, threshold=0.30)
+        for e in preds:
+            lbl = e["label"].lower()
+            typ = "PER" if "person" in lbl else "LOC" if "address" in lbl else "ORG"
+            if typ == "LOC" and not anon_loc: continue
+            found.append((e["start"], e["end"], e["text"], typ))
+    except: pass
 
-def anonymize_text(text: str) -> str:
-    if not isinstance(text, str) or not text.strip() or (text.isdigit() or len(text) < 3):
-        return text
+    found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+    clean, last = [], -1
+    for s, e, v, t in found:
+        if s >= last:
+            clean.append((s, e, v, t))
+            last = e
+    return clean
 
-    entities = _detect_all(text)
+
+def anonymize_text(text: str, anon_loc: bool = True) -> str:
+    if not isinstance(text, str) or len(text.strip()) < 3: return text
+    
+    entities = _detect_all(text, anon_loc)
     if not entities: return text
 
-    result, last = [], 0
-    for s, e, v, typ in entities:
-        result.extend([text[last:s], _get_fake(v, typ)])
+    res, last = [], 0
+    for s, e, v, t in entities:
+        res.extend([text[last:s], _get_fake(v, t)])
         last = e
+    res.append(text[last:])
+    return "".join(res)
 
-    result.append(text[last:])
-    return "".join(result)
 
-def reset_memory():
-    fake.seed_instance(42)
-
-# ==================================================
-# ROTEADOR DINÂMICO POR PERFIL DO DADO (DATA PROFILING)
-# ==================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True):
-    # --------------------------------------------------
-    # CAMADA 1: TIPOS NATIVOS DO BANCO
-    # --------------------------------------------------
     if val is None or isinstance(val, (int, float, bool)) or type(val).__name__ in ['date', 'datetime', 'Timestamp']:
         return val, None
 
-    val_str = str(val).strip()
-    length = len(val_str)
-    if length == 0: return val_str, None
+    v_str = str(val).strip()
+    col_lower = col_name.lower()
 
-    # --------------------------------------------------
-    # CAMADA 2: PADRÕES EXATOS E BLINDAGEM DE BD
-    # --------------------------------------------------
-    if UUID_PATTERN.match(val_str):
-        return _get_fake(val_str, "UUID"), "UUID"
+    if any(k in col_lower for k in ["cpf", "rg", "documento"]):
+        return _get_fake(v_str, "CPF"), "TEXT"
+    
+    if any(k in col_lower for k in ["nome", "razao_social"]):
+        return _get_fake(v_str, "PER"), "TEXT"
 
-    if PURE_COORD_PATTERN.match(val_str):
-        return (alter_geo_precision(val_str, 3), "COORD") if anon_location else (val_str, None)
+    if UUID_PATTERN.match(v_str):
+        return _get_fake(v_str, "UUID"), "UUID"
+    
+    new_v = anonymize_text(v_str, anon_location)
+    return new_v, ("TEXT" if new_v != v_str else None)
 
-    # --------------------------------------------------
-    # CAMADA 3: GEOMETRIA DO DADO (Inteligência Central)
-    # --------------------------------------------------
-    words = val_str.split()
-    word_count = len(words)
 
-    # A) TEXTOS LONGOS (Observações e Históricos)
-    # Tem mais de 50 letras ou 7 palavras? Manda para as IAs lerem a frase!
-    if length > 50 or word_count > 7:
-        new_val = anonymize_text(val_str)
-        return new_val, ("TEXT" if new_val != val_str else None)
-
-    # B) CÓDIGOS E IDENTIFICADORES (Chassis, B.O.s, RGs com letras)
-    # Poucas palavras, mas possui números no meio das letras.
-    if word_count <= 2 and any(char.isdigit() for char in val_str):
-        new_val = anonymize_text(val_str)
-        return new_val, ("TEXT" if new_val != val_str else None)
-
-    # C) STRINGS CURTAS E CATEGÓRICAS (Usa a coluna para desempatar)
-    c = col_name.lower()
-
-    # C.1 - Desempate Categorial Seguros (Não anonimiza)
-    if any(k in c for k in ["crime", "tipo", "status", "situacao", "estado", "cidade", "natureza", "sexo", "genero", "profissao", "cor", "marca", "modelo"]):
-        return val_str, None
-
-    # C.2 - Desempate Estrutural (Troca tudo)
-    if any(k in c for k in ["nome", "vitima", "suspeito", "autor", "pessoa", "testemunha"]):
-        return _get_fake(val_str, "PER"), "PER"
-        
-    if any(k in c for k in ["endereco", "rua", "logradouro", "bairro", "local"]):
-        return _get_fake(val_str, "LOC"), "LOC"
-        
-    if any(k in c for k in ["email", "mail"]):
-        return _get_fake(val_str, "EMAIL"), "EMAIL"
-
-    # C.3 - Rede de Segurança Final
-    # Caiu aqui? É uma string curta (ex: "Faca de cozinha", "Maconha", "Cleber"). 
-    # Por segurança, mandamos para o motor ler a palavra.
-    new_val = anonymize_text(val_str)
-    return new_val, ("TEXT" if new_val != val_str else None)
+def reset_memory():
+    global _MAPPING_CACHE, _USED_FAKES
+    _MAPPING_CACHE, _USED_FAKES = {}, set()
