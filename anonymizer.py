@@ -124,16 +124,20 @@ def anonymize_text(text: str, anon_loc: bool = True) -> str:
 
 
 def anonymize_value(col_name: str, val, anon_location: bool = True):
+    """Função original para processamento linha a linha (com Regex blindado)."""
     if val is None or isinstance(val, (int, float, bool)) or type(val).__name__ in ['date', 'datetime', 'Timestamp']:
         return val, None
 
     v_str = str(val).strip()
-    col_lower = col_name.lower()
+    
+    # Troca underlines e hífens por espaços
+    col_clean = col_name.lower().replace("_", " ").replace("-", " ")
 
-    if any(k in col_lower for k in ["cpf", "rg", "documento"]):
+    # Regex \b garante que pegue "cpf pm", mas não pegue "margem_lucro"
+    if re.search(r"\b(cpf|rg|documentos?|cnpj|cnh|passaporte)\b", col_clean):
         return _get_fake(v_str, "CPF"), "TEXT"
     
-    if any(k in col_lower for k in ["nome", "razao_social"]):
+    if re.search(r"\b(nome|nomes|razao social)\b", col_clean):
         return _get_fake(v_str, "PER"), "TEXT"
 
     if UUID_PATTERN.match(v_str):
@@ -146,3 +150,63 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 def reset_memory():
     global _MAPPING_CACHE, _USED_FAKES
     _MAPPING_CACHE, _USED_FAKES = {}, set()
+
+
+# =========================================================================
+# NOVAS FUNÇÕES: INTELIGÊNCIA DE AMOSTRAGEM PARA DATAFRAMES
+# =========================================================================
+
+def infer_column_type(sample_values) -> str:
+    """
+    Analisa uma amostra de dados para deduzir o tipo predominante da coluna.
+    """
+    clean_sample = [str(v).strip() for v in sample_values if v is not None and str(v).strip() != ""]
+    if not clean_sample:
+        return "TEXT"
+
+    total = len(clean_sample)
+    counts = {key: 0 for key in REGEX.keys()}
+
+    for val in clean_sample:
+        for typ, pat in REGEX.items():
+            if pat.search(val):
+                counts[typ] += 1
+                break  # Conta apenas 1 tipagem por célula
+
+    # Se mais de 70% da amostra bater com o Regex, confirmamos o tipo
+    for typ, count in counts.items():
+        if (count / total) > 0.70:
+            return typ
+
+    return "TEXT"
+
+
+def anonymize_dataframe_column(df, col_name: str, anon_location: bool = True):
+    """
+    Processa uma coluna inteira de um DataFrame Pandas de forma otimizada.
+    Usa o nome da coluna ou a amostragem de dados para decidir o método mais rápido.
+    """
+    import pandas as pd # Importado aqui para não quebrar caso não use Pandas no resto
+    
+    # 1. Pega uma amostra de até 100 linhas válidas
+    sample = df[col_name].dropna().head(100).tolist()
+    
+    # 2. Verifica regras seguras baseadas no nome da coluna
+    col_clean = str(col_name).lower().replace("_", " ").replace("-", " ")
+    tipo_inferred = "TEXT"
+
+    if re.search(r"\b(cpf|rg|documentos?|cnpj|cnh|passaporte)\b", col_clean):
+        tipo_inferred = "CPF"
+    elif re.search(r"\b(nome|nomes|razao social)\b", col_clean):
+        tipo_inferred = "PER"
+    else:
+        # 3. Se o nome não for óbvio, a amostragem de dados decide
+        tipo_inferred = infer_column_type(sample)
+
+    # 4. Aplica a transformação na coluna inteira
+    if tipo_inferred in ["CPF", "CNPJ", "PER", "EMAIL", "PHONE", "PLATE"]:
+        # Método Rápido: Troca direta sem chamar IA
+        return df[col_name].apply(lambda x: _get_fake(str(x).strip(), tipo_inferred) if pd.notnull(x) else x)
+    else:
+        # Método Contextual: Usa IA/Regex para textos livres e longos
+        return df[col_name].apply(lambda x: anonymize_text(str(x), anon_location) if pd.notnull(x) else x)
