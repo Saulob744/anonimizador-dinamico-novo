@@ -19,7 +19,8 @@ REGEX = {
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
     "COORD": re.compile(r"-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+"),
     "LOC": re.compile(r"\b(Rua|Av|Avenida|Alameda|Travessa|Pca|Praca)\s+([A-ZÀ-Ü0-9][^\s,]+(\s+[A-ZÀ-Ü0-9][^\s,]+){0,4})\b", re.IGNORECASE),
-    "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b")
+    "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b"),
+    "PER_COMMON": re.compile(r"\b(maria|jos[eé]|jo[aã]o|ant[oô]nio|francisco|ana|carlos|paulo|pedro|lucas|luiz|marcos|lu[ií]s|gabriel|rafael|daniel|marcelo|bruno|eduardo|felipe|raimundo|rodrigo|manoel|mateus|andr[eé]|fernando|f[aá]bio|leonardo|gustavo|guilherme|leandro|tiago|thiago|[aâ]nderson|ricardo|m[aá]rcio|jorge|alexandre|roberto|edson|diego|v[ií]tor|francisca|ant[oô]nia|adriana|juliana|m[aá]rcia|fernanda|patr[ií]cia|aline|sandra|camila|amanda|bruna|j[eé]ssica|let[ií]cia|j[uú]lia|luciana|vanessa|mariana|gabriela|vera|vit[oó]ria|larissa|cl[aá]udia|beatriz|rita|luana|s[oô]nia|renata|eliane|josefa|simone|nat[aá]lia|michele|tatiane|s[ií]lvia|f[aá]tima|terezinha|margarida)\b", re.IGNORECASE)
 }
 
 # Regex de Nome: Permite maiúsculas e minúsculas, limite de 2 a 4 palavras.
@@ -50,6 +51,7 @@ def _get_fake(value: str, typ: str) -> str:
 
         if typ == "UUID": val = str(fake.uuid4())
         elif typ in ["PER", "NAME"]: val = fake.name().upper()
+        elif typ == "PER_COMMON": val = fake.first_name().upper()
         elif typ == "CPF": val = fake.cpf()
         elif typ == "EMAIL": val = fake.email()
         elif typ == "PLATE": val = fake.license_plate().upper()
@@ -183,30 +185,70 @@ def infer_column_type(sample_values) -> str:
 
 def anonymize_dataframe_column(df, col_name: str, anon_location: bool = True):
     """
-    Processa uma coluna inteira de um DataFrame Pandas de forma otimizada.
-    Usa o nome da coluna ou a amostragem de dados para decidir o método mais rápido.
+    Processa uma coluna inteira de um DataFrame usando tipagem, tamanho e amostragem
+    para decidir o uso da IA e garantir a máxima performance.
     """
-    import pandas as pd # Importado aqui para não quebrar caso não use Pandas no resto
+    import pandas as pd
     
-    # 1. Pega uma amostra de até 100 linhas válidas
-    sample = df[col_name].dropna().head(100).tolist()
-    
-    # 2. Verifica regras seguras baseadas no nome da coluna
+    # ---------------------------------------------------------
+    # BARREIRA 1: Tipagem do Dado (Ignorar o que não é texto/número sensível)
+    # ---------------------------------------------------------
+    if pd.api.types.is_datetime64_any_dtype(df[col_name]) or pd.api.types.is_bool_dtype(df[col_name]):
+        return df[col_name] # Pula a coluna inteira instantaneamente
+
+    # Removemos os nulos temporariamente para análise matemática
+    serie_valida = df[col_name].dropna()
+    if serie_valida.empty:
+        return df[col_name]
+
+    # ---------------------------------------------------------
+    # BARREIRA 2: Análise de Tamanho (Length Profiling)
+    # ---------------------------------------------------------
+    # Convertendo para string só para medir
+    serie_str = serie_valida.astype(str).str.strip()
+    tamanho_medio = serie_str.str.len().mean()
+
+    # Se a média de caracteres for menor que 3, não há o que anonimizar
+    if tamanho_medio < 3:
+        return df[col_name]
+
+    # ---------------------------------------------------------
+    # BARREIRA 3: Inferência pelo Nome ou Amostragem
+    # ---------------------------------------------------------
     col_clean = str(col_name).lower().replace("_", " ").replace("-", " ")
     tipo_inferred = "TEXT"
 
+    # Checa regras seguras baseadas no nome da coluna
     if re.search(r"\b(cpf|rg|documentos?|cnpj|cnh|passaporte)\b", col_clean):
         tipo_inferred = "CPF"
     elif re.search(r"\b(nome|nomes|razao social)\b", col_clean):
         tipo_inferred = "PER"
     else:
-        # 3. Se o nome não for óbvio, a amostragem de dados decide
+        # Se não sabe o que é, analisa uma amostra de 100 linhas
+        sample = serie_str.head(100).tolist()
         tipo_inferred = infer_column_type(sample)
 
-    # 4. Aplica a transformação na coluna inteira
+    # ---------------------------------------------------------
+    # APLICAÇÃO: Roteamento Inteligente
+    # ---------------------------------------------------------
     if tipo_inferred in ["CPF", "CNPJ", "PER", "EMAIL", "PHONE", "PLATE"]:
-        # Método Rápido: Troca direta sem chamar IA
+        # MÉTODOS RÁPIDOS (Sem IA): Troca direta baseada no tipo encontrado
         return df[col_name].apply(lambda x: _get_fake(str(x).strip(), tipo_inferred) if pd.notnull(x) else x)
+        
     else:
-        # Método Contextual: Usa IA/Regex para textos livres e longos
-        return df[col_name].apply(lambda x: anonymize_text(str(x), anon_location) if pd.notnull(x) else x)
+        # É um "TEXTO_LIVRE". Mas precisamos mesmo da IA?
+        if tamanho_medio <= 40:
+            # TEXTO CURTO (Ex: Cargos, Profissões, Cidades pequenas)
+            # A IA não ajuda aqui porque não há contexto. Aplicamos só os Regex rápidos.
+            def _rapido_sem_ia(texto):
+                texto_str = str(texto)
+                # Pega as entidades usando a função _detect_all, 
+                # mas ela vai falhar graciosamente na IA por não achar contexto, agindo via Regex.
+                return anonymize_text(texto_str, anon_location)
+            
+            return df[col_name].apply(lambda x: _rapido_sem_ia(x) if pd.notnull(x) else x)
+            
+        else:
+            # TEXTO LONGO (Ex: Relatos, Observações, Históricos)
+            # AQUI SIM A IA BRILHA E É OBRIGATÓRIA.
+            return df[col_name].apply(lambda x: anonymize_text(str(x), anon_location) if pd.notnull(x) else x)
