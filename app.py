@@ -1,4 +1,6 @@
 import streamlit as st
+import anonymizer
+import re
 import logging
 import warnings
 import importlib
@@ -34,94 +36,106 @@ st.markdown("""
     .stProgress .st-at { background-color: #00ffcc; }
     </style>
 """, unsafe_allow_html=True)
-
 # ==================================================
 # CORE
 # ==================================================
-# ==================================================
-# CORE
-# ==================================================
-def process_chunk_parallel(rows, modo, anon_geo):
+def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
     import anonymizer
     import re
+    import random  # Adicionado para gerar o ruído do GPS
 
     # ==================================================
-    # SCRUB SECUNDÁRIO
-    # Captura nomes compostos que possam escapar
+    # SCRUB SECUNDÁRIO (Regex Textual)
     # ==================================================
     sub_scrub = re.compile(
-        r"\b([A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3})\b"
+        r"\b("
+        r"[A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3}"  # Regra 1: Title Case
+        r"|"
+        r"[A-ZÀ-Ü]{2,}(?:\s+[A-ZÀ-Ü]{2,}){1,3}"             # Regra 2: ALL CAPS (mínimo 2 letras)
+        r")\b"
     )
 
     # ==================================================
-    # EXECUTA APENAS NO MODO TOTAL
+    # REGEX DINÂMICOS PARA DETECÇÃO DE GPS
     # ==================================================
-    if modo != "🛡️ Anonimização Total":
+    # Formato Par (ex: "-23.550520, -46.633308")
+    gps_pair_regex = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
+    
+    # Formato Único (ex: "-23.550520")
+    gps_single_regex = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*$")
+
+    # Função interna para aplicar o ruído (~500 metros)
+    def apply_gps_jitter(coord_str):
+        try:
+            c = float(coord_str)
+            jitter = random.uniform(-0.005, 0.005)
+            return f"{c + jitter:.6f}"
+        except:
+            return coord_str
+
+    if modo != "🛡️ Anonimização Total" or not rows:
         return rows
 
     processed = []
+    column_decisions = pre_decisions if pre_decisions is not None else {}
 
     # ==================================================
-    # FASE 1 — AMOSTRAGEM POR COLUNA
+    # FASE 1 e 2 — PERFILAMENTO E DECISÃO
     # ==================================================
-    # Coleta até 50 valores por coluna para score estrutural
-    column_samples = {}
-
-    if rows:
+    if not column_decisions:
         sample_size = min(50, len(rows))
+        
+        FREE_TEXT_THRESHOLD = 40 # Se qualquer string passar disso, é texto livre
 
         for col in rows[0].keys():
             vals = []
+            max_length = 0
+            has_string = False
 
+            # Avalia o comportamento dos dados na amostra
             for r in rows[:sample_size]:
                 v = r.get(col)
 
-                # Ignora tipos seguros
-                if (
-                    v is None
-                    or isinstance(v, bool)
-                    or type(v).__name__ in ['date', 'datetime', 'Timestamp']
-                ):
+                if v is None or isinstance(v, bool) or type(v).__name__ in ['date', 'datetime', 'Timestamp']:
                     continue
 
-                # ==================================================
-                # IMPORTANTE:
-                # Agora float/int também entram se forem possíveis
-                # coordenadas
-                # ==================================================
                 if isinstance(v, (int, float)):
                     vals.append(str(v).strip())
                     continue
 
-                vals.append(str(v).strip())
+                if isinstance(v, str):
+                    val_str = v.strip()
+                    current_len = len(val_str)
+                    
+                    if current_len > max_length:
+                        max_length = current_len
+                        
+                    vals.append(val_str)
+                    has_string = True
+                else:
+                    vals.append(str(v).strip())
 
-            column_samples[col] = vals
+            # DECISÃO 1: PERFILAMENTO DINÂMICO
+            is_free_text = has_string and (max_length >= FREE_TEXT_THRESHOLD)
 
-    # ==================================================
-    # FASE 2 — DECISÃO DE SENSIBILIDADE POR COLUNA
-    # ==================================================
-    column_decisions = {}
+            if is_free_text:
+                column_decisions[col] = True
+                try:
+                    anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> True (Dinâmico: Texto Livre | MaxLen={max_length})")
+                except Exception:
+                    pass
+                continue
 
-    for col, samples in column_samples.items():
-        try:
-            column_decisions[col] = anonymizer.should_anonymize_column(
-                col,
-                samples
-            )
-
-            anonymizer.debug_log(
-                f"[APP COLUMN DECISION] {col} -> {column_decisions[col]}"
-            )
-
-        except Exception as e:
-            column_decisions[col] = True
-
+            # DECISÃO 2: AVALIAÇÃO DE IA / SCORE TRADICIONAL
             try:
-                anonymizer.debug_log(
-                    f"[APP COLUMN SCORE ERROR] Col={col} Error={e}"
-                )
-            except Exception:
-                pass
+                column_decisions[col] = anonymizer.should_anonymize_column(col, vals)
+                anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> {column_decisions[col]}")
+            except Exception as e:
+                column_decisions[col] = True
+                try:
+                    anonymizer.debug_log(f"[APP COLUMN SCORE ERROR] Col={col} -> Fallback True")
+                except Exception:
+                    pass
 
     # ==================================================
     # FASE 3 — PROCESSAMENTO DAS LINHAS
@@ -130,76 +144,57 @@ def process_chunk_parallel(rows, modo, anon_geo):
         row_dict = dict(r)
 
         for col, old in row_dict.items():
-
-            # ==================================================
-            # Ignora nulos
-            # ==================================================
-            if old is None:
+            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp']:
                 continue
 
-            # ==================================================
-            # Ignora datas
-            # ==================================================
-            if type(old).__name__ in ['date', 'datetime', 'Timestamp']:
+            old_str = str(old).strip()
+
+            # --------------------------------------------------
+            # NOVO: TRATAMENTO DINÂMICO DE GPS (Sem depender de nome de coluna)
+            # --------------------------------------------------
+            if anon_geo:
+                # Tenta identificar par de coordenadas
+                match_pair = gps_pair_regex.match(old_str)
+                if match_pair:
+                    lat, lon = match_pair.groups()
+                    row_dict[col] = f"{apply_gps_jitter(lat)}, {apply_gps_jitter(lon)}"
+                    continue  # Pula o restante do processamento para esta coluna
+
+                # Tenta identificar coordenada única
+                match_single = gps_single_regex.match(old_str)
+                if match_single:
+                    try:
+                        val_float = float(old_str)
+                        if -180 <= val_float <= 180:  # Valida se está na escala global
+                            row_dict[col] = apply_gps_jitter(old_str)
+                            continue  # Pula o restante do processamento para esta coluna
+                    except ValueError:
+                        pass
+
+            # --------------------------------------------------
+            # Ignora números comuns (IDs, preços, etc) que não foram pegos pelo Regex do GPS
+            # --------------------------------------------------
+            if isinstance(old, (int, float)):
                 continue
 
-            # ==================================================
-            # NOVO:
-            # Mantém números comuns,
-            # mas permite coordenadas por nome estrutural
-            # ==================================================
-            col_clean = str(col).lower()
-
-            is_geo_column = any(
-                x in col_clean
-                for x in [
-                    "lat", "latitude",
-                    "lon", "long", "longitude",
-                    "coord", "gps"
-                ]
-            )
-
-            if isinstance(old, (int, float)) and not is_geo_column:
-                continue
-
-            # ==================================================
-            # Pula colunas não sensíveis
-            # ==================================================
+            # --------------------------------------------------
+            # Ignora colunas que a IA/Perfilamento marcaram como seguras
+            # --------------------------------------------------
             if not column_decisions.get(col, True):
                 continue
 
+            # --------------------------------------------------
+            # ANONIMIZAÇÃO PRINCIPAL (IA + Scrub Secundário)
+            # --------------------------------------------------
             try:
-                # ==================================================
-                # ANONIMIZAÇÃO PRINCIPAL
-                # ==================================================
-                new, flag = anonymizer.anonymize_value(
-                    col,
-                    old,
-                    anon_location=anon_geo
-                )
+                new, flag = anonymizer.anonymize_value(col, old, anon_location=anon_geo)
 
-                # ==================================================
-                # SCRUB SECUNDÁRIO
-                # Apenas se houve alteração textual
-                # ==================================================
                 if flag == "TEXT" and isinstance(new, str):
-                    new = sub_scrub.sub(
-                        lambda m: anonymizer._get_fake(
-                            m.group(1),
-                            "PER"
-                        ),
-                        new
-                    )
+                    new = sub_scrub.sub(lambda m: anonymizer._get_fake(m.group(1), "PER"), new)
 
                 row_dict[col] = new
-
-            except Exception as e:
-                try:
-                    anonymizer.debug_log(
-                        f"[APP ERROR] Col={col} Value={str(old)[:80]} Error={e}"
-                    )
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         processed.append(row_dict)
 
