@@ -1,5 +1,8 @@
 import streamlit as st
 import anonymizer
+import anonymizer
+import re
+import random  # Adicionado para gerar o ruído do GPS
 import re
 import logging
 import warnings
@@ -40,10 +43,6 @@ st.markdown("""
 # CORE
 # ==================================================
 def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
-    import anonymizer
-    import re
-    import random  # Adicionado para gerar o ruído do GPS
-
     # ==================================================
     # SCRUB SECUNDÁRIO (Regex Textual)
     # ==================================================
@@ -68,7 +67,7 @@ def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
     def apply_gps_jitter(coord_str):
         try:
             c = float(coord_str)
-            jitter = random.uniform(-0.005, 0.005)
+            jitter = random.uniform(-0.003, 0.003)
             return f"{c + jitter:.6f}"
         except:
             return coord_str

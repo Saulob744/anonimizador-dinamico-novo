@@ -1,13 +1,3 @@
-# =========================================================
-# ANONYMIZER PRO+ (REFATORADO COM SCORE INTELIGENTE)
-# Mantém compatibilidade com sistema atual
-# Adiciona:
-# - Score dinâmico por coluna
-# - Debug detalhado
-# - Filtro de colunas não sensíveis
-# - Redução de falsos positivos
-# =========================================================
-
 import re
 import random
 import string
@@ -204,16 +194,7 @@ def get_gliner():
 # SCORE DE SENSIBILIDADE
 # =========================================================
 def score_column_sensitivity(col_name: str, sample_values) -> dict:
-    """
-    Score robusto para decidir se uma coluna merece anonimização estrutural.
-
-    Objetivo:
-    - Reduzir falsos positivos
-    - Ignorar colunas categóricas/operacionais
-    - Detectar colunas realmente pessoais
-    - Preservar compatibilidade
-    """
-
+    """Score robusto para decidir se uma coluna merece anonimização estrutural."""
     score = 0
     reasons = []
 
