@@ -43,27 +43,21 @@ st.markdown("""
 # CORE
 # ==================================================
 def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
+    import anonymizer
+    import re
+    import random
+    import string
+
     # ==================================================
     # SCRUB SECUNDÁRIO (Regex Textual)
     # ==================================================
     sub_scrub = re.compile(
-        r"\b("
-        r"[A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3}"  # Regra 1: Title Case
-        r"|"
-        r"[A-ZÀ-Ü]{2,}(?:\s+[A-ZÀ-Ü]{2,}){1,3}"             # Regra 2: ALL CAPS (mínimo 2 letras)
-        r")\b"
+        r"\b([A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3}|[A-ZÀ-Ü]{2,}(?:\s+[A-ZÀ-Ü]{2,}){1,3})\b"
     )
 
-    # ==================================================
-    # REGEX DINÂMICOS PARA DETECÇÃO DE GPS
-    # ==================================================
-    # Formato Par (ex: "-23.550520, -46.633308")
     gps_pair_regex = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
-    
-    # Formato Único (ex: "-23.550520")
     gps_single_regex = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*$")
 
-    # Função interna para aplicar o ruído (~500 metros)
     def apply_gps_jitter(coord_str):
         try:
             c = float(coord_str)
@@ -72,69 +66,123 @@ def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
         except:
             return coord_str
 
+    # ==================================================
+    # GERADOR DETERMINÍSTICO DE CÓDIGOS
+    # Mantém a integridade: a mesma placa sempre vira a mesma placa falsa.
+    # ==================================================
+    def generate_dynamic_code(original_str):
+        rng = random.Random(original_str) # A semente é o dado original
+        new_chars = []
+        for char in original_str:
+            if char.isalpha():
+                if char.isupper():
+                    new_chars.append(rng.choice(string.ascii_uppercase))
+                else:
+                    new_chars.append(rng.choice(string.ascii_lowercase))
+            elif char.isdigit():
+                new_chars.append(rng.choice(string.digits))
+            else:
+                new_chars.append(char)
+        return "".join(new_chars)
+
     if modo != "🛡️ Anonimização Total" or not rows:
         return rows
 
     processed = []
     column_decisions = pre_decisions if pre_decisions is not None else {}
+    dynamic_code_columns = set() 
 
     # ==================================================
     # FASE 1 e 2 — PERFILAMENTO E DECISÃO
     # ==================================================
     if not column_decisions:
         sample_size = min(50, len(rows))
-        
-        FREE_TEXT_THRESHOLD = 40 # Se qualquer string passar disso, é texto livre
+        FREE_TEXT_THRESHOLD = 40 
 
         for col in rows[0].keys():
             vals = []
             max_length = 0
             has_string = False
+            
+            valid_strings_count = 0
+            alphanumeric_patterns = 0
 
-            # Avalia o comportamento dos dados na amostra
             for r in rows[:sample_size]:
                 v = r.get(col)
 
                 if v is None or isinstance(v, bool) or type(v).__name__ in ['date', 'datetime', 'Timestamp']:
                     continue
 
-                if isinstance(v, (int, float)):
-                    vals.append(str(v).strip())
+                # ==================================================
+                # CORREÇÃO CRÍTICA: Força conversão para string e dribla os tipos do Banco
+                # ==================================================
+                val_str = str(v).strip()
+
+                # Se conseguir virar float, é um ID numérico puro ou valor, ignoramos.
+                is_pure_num = False
+                try:
+                    float(val_str)
+                    is_pure_num = True
+                except ValueError:
+                    pass
+
+                if is_pure_num:
+                    vals.append(val_str)
                     continue
 
-                if isinstance(v, str):
-                    val_str = v.strip()
-                    current_len = len(val_str)
+                # ==================================================
+                # Chegou aqui? Então com certeza é Texto ou Código Alfanumérico!
+                # ==================================================
+                current_len = len(val_str)
+                if current_len > max_length:
+                    max_length = current_len
                     
-                    if current_len > max_length:
-                        max_length = current_len
-                        
-                    vals.append(val_str)
-                    has_string = True
-                else:
-                    vals.append(str(v).strip())
+                is_short = current_len < FREE_TEXT_THRESHOLD
+                has_num = any(c.isdigit() for c in val_str)
+                has_let = any(c.isalpha() for c in val_str)
+                few_spaces = val_str.count(' ') <= 1
+                
+                # DNA do Identificador: Curto, tem letras, tem números, quase sem espaço
+                if is_short and has_num and has_let and few_spaces:
+                    alphanumeric_patterns += 1
 
-            # DECISÃO 1: PERFILAMENTO DINÂMICO
+                valid_strings_count += 1
+                vals.append(val_str)
+                has_string = True
+
+            # ==================================================
+            # DECISÃO 1: PERFILAMENTO DE IDENTIFICADOR ALFANUMÉRICO
+            # ==================================================
+            # Se mais de 60% das strings tiverem o padrão Letra+Número, a coluna toda é mascarada!
+            is_dynamic_code = valid_strings_count > 0 and (alphanumeric_patterns / valid_strings_count) >= 0.6
+
+            if is_dynamic_code:
+                dynamic_code_columns.add(col)
+                column_decisions[col] = True
+                try:
+                    anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> True (Dinâmico: Código Alfanumérico detectado)")
+                except Exception:
+                    pass
+                continue
+
+            # ==================================================
+            # DECISÃO 2 e 3 (Texto Livre e IA Tradicional)
+            # ==================================================
             is_free_text = has_string and (max_length >= FREE_TEXT_THRESHOLD)
 
             if is_free_text:
                 column_decisions[col] = True
                 try:
-                    anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> True (Dinâmico: Texto Livre | MaxLen={max_length})")
+                    anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> True (Dinâmico: Texto Livre)")
                 except Exception:
                     pass
                 continue
 
-            # DECISÃO 2: AVALIAÇÃO DE IA / SCORE TRADICIONAL
             try:
                 column_decisions[col] = anonymizer.should_anonymize_column(col, vals)
                 anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> {column_decisions[col]}")
             except Exception as e:
                 column_decisions[col] = True
-                try:
-                    anonymizer.debug_log(f"[APP COLUMN SCORE ERROR] Col={col} -> Fallback True")
-                except Exception:
-                    pass
 
     # ==================================================
     # FASE 3 — PROCESSAMENTO DAS LINHAS
@@ -148,43 +196,37 @@ def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
 
             old_str = str(old).strip()
 
-            # --------------------------------------------------
-            # NOVO: TRATAMENTO DINÂMICO DE GPS (Sem depender de nome de coluna)
-            # --------------------------------------------------
             if anon_geo:
-                # Tenta identificar par de coordenadas
                 match_pair = gps_pair_regex.match(old_str)
                 if match_pair:
                     lat, lon = match_pair.groups()
                     row_dict[col] = f"{apply_gps_jitter(lat)}, {apply_gps_jitter(lon)}"
-                    continue  # Pula o restante do processamento para esta coluna
+                    continue 
 
-                # Tenta identificar coordenada única
                 match_single = gps_single_regex.match(old_str)
                 if match_single:
                     try:
                         val_float = float(old_str)
-                        if -180 <= val_float <= 180:  # Valida se está na escala global
+                        if -180 <= val_float <= 180:
                             row_dict[col] = apply_gps_jitter(old_str)
-                            continue  # Pula o restante do processamento para esta coluna
+                            continue
                     except ValueError:
                         pass
 
             # --------------------------------------------------
-            # Ignora números comuns (IDs, preços, etc) que não foram pegos pelo Regex do GPS
+            # MASCARAMENTO DINÂMICO DE CÓDIGOS ALFANUMÉRICOS
             # --------------------------------------------------
+            if col in dynamic_code_columns:
+                row_dict[col] = generate_dynamic_code(old_str)
+                continue
+
+            # Proteção relacional para chaves numéricas
             if isinstance(old, (int, float)):
                 continue
 
-            # --------------------------------------------------
-            # Ignora colunas que a IA/Perfilamento marcaram como seguras
-            # --------------------------------------------------
             if not column_decisions.get(col, True):
                 continue
 
-            # --------------------------------------------------
-            # ANONIMIZAÇÃO PRINCIPAL (IA + Scrub Secundário)
-            # --------------------------------------------------
             try:
                 new, flag = anonymizer.anonymize_value(col, old, anon_location=anon_geo)
 
