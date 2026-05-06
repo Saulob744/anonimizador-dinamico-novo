@@ -1,245 +1,64 @@
 import streamlit as st
-import anonymizer
-import anonymizer
 import re
-import random  # Adicionado para gerar o ruído do GPS
-import re
+import random
+import string
 import logging
 import warnings
 import importlib
 import urllib.parse
-import pyodbc
-import subprocess
 import time
-import re
 import psutil
 import os
+import pyodbc
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
-
-# ==================================================
-# CONFIGURAÇÕES INICIAIS E SUPRESSÃO DE AVISOS
-# ==================================================
-logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=UserWarning, message=".*resume_download.*")
+import difflib
 
 import db_utils
 import anonymizer
 
+# ==================================================
+# CONFIGURAÇÕES INICIAIS
+# ==================================================
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=UserWarning, message=".*resume_download.*")
+
 importlib.reload(db_utils)
 importlib.reload(anonymizer)
 
-# ==================================================
-# UI
-# ==================================================
 st.set_page_config(page_title="🛡️ Aegis Anonymizer Pro", page_icon="🛡️", layout="wide")
-
 st.markdown("""
     <style>
     [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; font-weight: bold; }
     .stProgress .st-at { background-color: #00ffcc; }
+    .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
     </style>
 """, unsafe_allow_html=True)
-# ==================================================
-# CORE
-# ==================================================
-def process_chunk_parallel(rows, modo, anon_geo, pre_decisions=None):
-    import anonymizer
-    import re
-    import random
-    import string
 
-    # ==================================================
-    # SCRUB SECUNDÁRIO (Regex Textual)
-    # ==================================================
-    sub_scrub = re.compile(
-        r"\b([A-ZÀ-Ü][a-zà-ü']+(?:\s+[A-ZÀ-Ü][a-zà-ü']+){1,3}|[A-ZÀ-Ü]{2,}(?:\s+[A-ZÀ-Ü]{2,}){1,3})\b"
+# ==================================================
+# FUNÇÕES AUXILIARES
+# ==================================================
+def apply_gps_jitter(coord_str):
+    try:
+        c = float(coord_str)
+        return f"{c + random.uniform(-0.003, 0.003):.6f}"
+    except ValueError:
+        return coord_str
+
+def generate_dynamic_code(original_str):
+    rng = random.Random(original_str)
+    return "".join(
+        rng.choice(string.ascii_uppercase) if c.isupper() else
+        rng.choice(string.ascii_lowercase) if c.islower() else
+        rng.choice(string.digits) if c.isdigit() else c
+        for c in original_str
     )
 
-    gps_pair_regex = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
-    gps_single_regex = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*$")
-
-    def apply_gps_jitter(coord_str):
-        try:
-            c = float(coord_str)
-            jitter = random.uniform(-0.003, 0.003)
-            return f"{c + jitter:.6f}"
-        except:
-            return coord_str
-
-    # ==================================================
-    # GERADOR DETERMINÍSTICO DE CÓDIGOS
-    # Mantém a integridade: a mesma placa sempre vira a mesma placa falsa.
-    # ==================================================
-    def generate_dynamic_code(original_str):
-        rng = random.Random(original_str) # A semente é o dado original
-        new_chars = []
-        for char in original_str:
-            if char.isalpha():
-                if char.isupper():
-                    new_chars.append(rng.choice(string.ascii_uppercase))
-                else:
-                    new_chars.append(rng.choice(string.ascii_lowercase))
-            elif char.isdigit():
-                new_chars.append(rng.choice(string.digits))
-            else:
-                new_chars.append(char)
-        return "".join(new_chars)
-
-    if modo != "🛡️ Anonimização Total" or not rows:
-        return rows
-
-    processed = []
-    column_decisions = pre_decisions if pre_decisions is not None else {}
-    dynamic_code_columns = set() 
-
-    # ==================================================
-    # FASE 1 e 2 — PERFILAMENTO E DECISÃO
-    # ==================================================
-    if not column_decisions:
-        sample_size = min(50, len(rows))
-        FREE_TEXT_THRESHOLD = 40 
-
-        for col in rows[0].keys():
-            vals = []
-            max_length = 0
-            has_string = False
-            
-            valid_strings_count = 0
-            alphanumeric_patterns = 0
-
-            for r in rows[:sample_size]:
-                v = r.get(col)
-
-                if v is None or isinstance(v, bool) or type(v).__name__ in ['date', 'datetime', 'Timestamp']:
-                    continue
-
-                # ==================================================
-                # CORREÇÃO CRÍTICA: Força conversão para string e dribla os tipos do Banco
-                # ==================================================
-                val_str = str(v).strip()
-
-                # Se conseguir virar float, é um ID numérico puro ou valor, ignoramos.
-                is_pure_num = False
-                try:
-                    float(val_str)
-                    is_pure_num = True
-                except ValueError:
-                    pass
-
-                if is_pure_num:
-                    vals.append(val_str)
-                    continue
-
-                # ==================================================
-                # Chegou aqui? Então com certeza é Texto ou Código Alfanumérico!
-                # ==================================================
-                current_len = len(val_str)
-                if current_len > max_length:
-                    max_length = current_len
-                    
-                is_short = current_len < FREE_TEXT_THRESHOLD
-                has_num = any(c.isdigit() for c in val_str)
-                has_let = any(c.isalpha() for c in val_str)
-                few_spaces = val_str.count(' ') <= 1
-                
-                # DNA do Identificador: Curto, tem letras, tem números, quase sem espaço
-                if is_short and has_num and has_let and few_spaces:
-                    alphanumeric_patterns += 1
-
-                valid_strings_count += 1
-                vals.append(val_str)
-                has_string = True
-
-            # ==================================================
-            # DECISÃO 1: PERFILAMENTO DE IDENTIFICADOR ALFANUMÉRICO
-            # ==================================================
-            # Se mais de 60% das strings tiverem o padrão Letra+Número, a coluna toda é mascarada!
-            is_dynamic_code = valid_strings_count > 0 and (alphanumeric_patterns / valid_strings_count) >= 0.6
-
-            if is_dynamic_code:
-                dynamic_code_columns.add(col)
-                column_decisions[col] = True
-                try:
-                    anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> True (Dinâmico: Código Alfanumérico detectado)")
-                except Exception:
-                    pass
-                continue
-
-            # ==================================================
-            # DECISÃO 2 e 3 (Texto Livre e IA Tradicional)
-            # ==================================================
-            is_free_text = has_string and (max_length >= FREE_TEXT_THRESHOLD)
-
-            if is_free_text:
-                column_decisions[col] = True
-                try:
-                    anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> True (Dinâmico: Texto Livre)")
-                except Exception:
-                    pass
-                continue
-
-            try:
-                column_decisions[col] = anonymizer.should_anonymize_column(col, vals)
-                anonymizer.debug_log(f"[APP COLUMN DECISION] {col} -> {column_decisions[col]}")
-            except Exception as e:
-                column_decisions[col] = True
-
-    # ==================================================
-    # FASE 3 — PROCESSAMENTO DAS LINHAS
-    # ==================================================
-    for r in rows:
-        row_dict = dict(r)
-
-        for col, old in row_dict.items():
-            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp']:
-                continue
-
-            old_str = str(old).strip()
-
-            if anon_geo:
-                match_pair = gps_pair_regex.match(old_str)
-                if match_pair:
-                    lat, lon = match_pair.groups()
-                    row_dict[col] = f"{apply_gps_jitter(lat)}, {apply_gps_jitter(lon)}"
-                    continue 
-
-                match_single = gps_single_regex.match(old_str)
-                if match_single:
-                    try:
-                        val_float = float(old_str)
-                        if -180 <= val_float <= 180:
-                            row_dict[col] = apply_gps_jitter(old_str)
-                            continue
-                    except ValueError:
-                        pass
-
-            # --------------------------------------------------
-            # MASCARAMENTO DINÂMICO DE CÓDIGOS ALFANUMÉRICOS
-            # --------------------------------------------------
-            if col in dynamic_code_columns:
-                row_dict[col] = generate_dynamic_code(old_str)
-                continue
-
-            # Proteção relacional para chaves numéricas
-            if isinstance(old, (int, float)):
-                continue
-
-            if not column_decisions.get(col, True):
-                continue
-
-            try:
-                new, flag = anonymizer.anonymize_value(col, old, anon_location=anon_geo)
-
-                if flag == "TEXT" and isinstance(new, str):
-                    new = sub_scrub.sub(lambda m: anonymizer._get_fake(m.group(1), "PER"), new)
-
-                row_dict[col] = new
-            except Exception:
-                pass
-
-        processed.append(row_dict)
-
-    return processed
+def split_text_into_chunks(text, max_tokens=300):
+    words = text.split()
+    if len(words) <= max_tokens:
+        return [text]
+    return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
 
 def build_url(db_type, user, password, host, port, db):
     if db_type == "mssql":
@@ -247,16 +66,119 @@ def build_url(db_type, user, password, host, port, db):
         if host and "localdb" in host.lower():
             odbc_str = rf"DRIVER={{{driver}}};SERVER=(localdb)\MSSQLLocalDB;DATABASE={db};Trusted_Connection=yes;"
             return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
-
         return f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
-
+    
     prefix = "postgresql+psycopg2" if db_type == "postgresql" else "mysql+pymysql"
     return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
 
+# ==================================================
+# PROCESSAMENTO CENTRAL (AGORA MAIS RÁPIDO E LIMPO)
+# ==================================================
+def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=None):
+    if modo != "🛡️ Anonimização Total" or not rows:
+        return rows
+
+    # Regex Utilitárias Fixas
+    gps_pair = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
+    gps_single = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*$")
+    uuid_regex = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+    # Regex para o Escudo Dinâmico
+    html_regex = re.compile(r"<[^>]+>|&[a-zA-Z0-9#]+;")
+    all_caps_regex = re.compile(r"\b[A-ZÀ-Ü]{3,}(?:\s+[A-ZÀ-Ü]{3,})+\b")
+    bullet_regex = re.compile(r"(?:^|\n|\r)\s*(?:[A-Za-z]\)|\d+[\.\-\)])\s*[A-ZÀ-Ü][a-zà-ü]+")
+
+    processed = []
+    for r in rows:
+        row_dict = dict(r)
+
+        for col, old in row_dict.items():
+            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool', 'int', 'float']:
+                continue
+
+            old_str = str(old).strip()
+
+            if uuid_regex.match(old_str):
+                continue 
+
+            # VERIFICAÇÃO PRINCIPAL: Se não está nas colunas alvo, pula!
+            if not target_columns or col not in target_columns:
+                continue
+
+            if anon_geo:
+                if m := gps_pair.match(old_str):
+                    row_dict[col] = f"{apply_gps_jitter(m.group(1))}, {apply_gps_jitter(m.group(2))}"
+                    continue 
+                if gps_single.match(old_str):
+                    try:
+                        if -180 <= float(old_str) <= 180:
+                            row_dict[col] = apply_gps_jitter(old_str)
+                            continue
+                    except ValueError:
+                        pass
+
+            try:
+                # --- 🛡️ INÍCIO DO ESCUDO (APENAS HTML) ---
+                vault = {}
+                def hide(match):
+                    token = f"__SHLD{len(vault)}__"
+                    vault[token] = match.group(0)
+                    return token
+
+                # Protege apenas as tags HTML (<br>, <strong>, etc) para não quebrar a tela
+                safe_text = html_regex.sub(hide, old_str)
+                
+                # --- 🤖 IA PROCESSA O TEXTO LIVRE ---
+                chunks = split_text_into_chunks(safe_text)
+                anon_chunks = []
+                
+                for chunk in chunks:
+                    new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo)
+                    str_new_val = str(new_val)
+                    
+                    # --- 🕵️ RASTREADOR DE TROCAS ---
+                    if str_new_val != chunk:
+                        seq = difflib.SequenceMatcher(None, chunk.split(), str_new_val.split())
+                        for tag, i1, i2, j1, j2 in seq.get_opcodes():
+                            if tag == 'replace':
+                                termo_original = " ".join(chunk.split()[i1:i2])
+                                termo_falso = " ".join(str_new_val.split()[j1:j2])
+                                if "__SHLD" not in termo_original:
+                                    print(f"🕵️ [TROCA IA | {col}] {termo_original} ➡️ {termo_falso}")
+                    
+                    anon_chunks.append(str_new_val)
+                
+                final_text = " ".join(anon_chunks)
+
+                # --- 🔓 DESATIVA O ESCUDO ---
+                for token, original in vault.items():
+                    final_text = final_text.replace(token, original)
+
+                row_dict[col] = final_text
+
+            except Exception as e:
+                print(f"[DEBUG GLINER] Falha ao processar texto na coluna '{col}': {e}")
+                # Se falhar uma coluna específica, não quebra a linha toda. Mantém o original.
+                row_dict[col] = old_str 
+
+        processed.append(row_dict)
+
+    return processed
 
 # ==================================================
-# UI STATE
+# ESTADO DA UI & MENU LATERAL
 # ==================================================
+if "colunas_para_anonimizar" not in st.session_state:
+    st.session_state.colunas_para_anonimizar = []
+if "analise_concluida" not in st.session_state:
+    st.session_state.analise_concluida = False
+if "colunas_selecionadas_finais" not in st.session_state:
+    st.session_state.colunas_selecionadas_finais = []
+if "todas_colunas_disponiveis" not in st.session_state:
+    st.session_state.todas_colunas_disponiveis = []
+
+start_btn = False
+
 with st.sidebar:
     st.title("🛡️ Aegis Control")
     db_type = st.selectbox("Tipo de Banco de Dados", ["postgresql", "mysql", "mssql"])
@@ -272,297 +194,213 @@ with st.sidebar:
             "password": st.text_input("Senha", type="password", key=f"{prefix}_pass")
         }
 
-    with aba_origem:
-        src_cfg = render_db_form("origem")
-
-    with aba_destino:
-        dst_cfg = render_db_form("destino")
+    with aba_origem: src_cfg = render_db_form("origem")
+    with aba_destino: dst_cfg = render_db_form("destino")
 
     modo = st.selectbox("Modo", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
-    chunk_size = st.number_input("Chunk", value=10000, step=1000)
-    filter_tables = st.text_input("Filtrar tabelas")
+    chunk_size = st.number_input("Chunk", value=1000, step=1000) 
+    filter_tables = st.text_input("Filtrar tabelas (separadas por vírgula)")
     anon_geo = st.toggle("Mascara De GPS", value=True)
 
-    super_proc = st.toggle("🚀 Multi CPU", value=False)
+    super_proc = st.toggle("🚀 Multi CPU (Atenção)", value=False)
     n_cores = st.slider("CPU", 1, db_utils.get_cpu_info(), db_utils.get_cpu_info()) if super_proc else 1
 
-    start_btn = st.button("INICIAR", use_container_width=True)
+    st.divider()
+    btn_analisar = st.button("1. Analisar Estrutura", use_container_width=True)
+    
+    if btn_analisar:
+        try:
+            src_engine = db_utils.connect(build_url(db_type, **src_cfg))
+            schemas = db_utils.get_user_schemas(src_engine)
+            allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
+            
+            sugeridas, todas = [], []
+            if schemas:
+                tables = [t for t in db_utils.get_tables(src_engine, schemas[0]) if not allowed or t in allowed]
+                if tables:
+                    chunk_gen = db_utils.fetch_rows_streaming(src_engine, tables[0], schemas[0], 200)
+                    primeiro_lote = next(chunk_gen, [])
+                    
+                    if primeiro_lote:
+                        rows_dict = [dict(r) for r in primeiro_lote]
+                        todas = list(rows_dict[0].keys())
+                        
+                        for col in todas:
+                            valores = [str(r.get(col, "")) for r in rows_dict if r.get(col) is not None]
+                            if anonymizer.should_anonymize_column(col, valores):
+                                sugeridas.append(col)
+            
+            # Se achou as colunas do banco, usa elas. Se não, deixa vazio para não quebrar a tela.
+            st.session_state.todas_colunas_disponiveis = todas if todas else []
+            st.session_state.colunas_para_anonimizar = sugeridas if sugeridas else []
+            st.session_state.analise_concluida = True
+            st.success("✅ Análise concluída com sucesso!")
+        except Exception as e:
+            st.error(f"Erro ao analisar banco: {e}")
 
+    if st.session_state.analise_concluida:
+        st.markdown("### Selecione as Colunas Alvo")
+        
+        # FILTRO DE SEGURANÇA: Só deixa como padrão as colunas que realmente existem na tabela
+        opcoes_validas = st.session_state.todas_colunas_disponiveis
+        padroes_seguros = [col for col in st.session_state.colunas_para_anonimizar if col in opcoes_validas]
+        
+        colunas_finais = st.multiselect(
+            "Colunas que SERÃO analisadas pela IA:",
+            options=opcoes_validas, 
+            default=padroes_seguros
+        )
+        
+        start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
+        if start_btn:
+            st.session_state.colunas_selecionadas_finais = colunas_finais
 
 # ==================================================
 # PIPELINE
 # ==================================================
 st.title("🛡️ Pipeline De Proteção De Dados")
+debug_box = st.empty() 
 progress_bar = st.progress(0)
 status = st.empty()
 metric_placeholder = st.empty()
 
-
 def run_pipeline():
     proc = psutil.Process(os.getpid())
     t0_global = time.time()
-
-    phase_total = 4
     current_phase = 0
+    phase_total = 4
+    
+    target_cols = st.session_state.colunas_selecionadas_finais
 
     def set_phase(title, subtitle=""):
         nonlocal current_phase
         current_phase += 1
-
         status.info(f"🔷 Fase {current_phase}/{phase_total} • {title}")
+        progress_bar.progress(min((current_phase - 1) / phase_total * 0.25, 0.25))
 
-        metric_placeholder.markdown(f"""
-        ### 📊 Pipeline em execução
-        - 🔷 Fase: **{current_phase}/{phase_total}**
-        - 🧭 Etapa: **{title}**
-        - 🧾 Detalhe: {subtitle if subtitle else "processando..."}
-        - ⏱️ Tempo: **{time.time() - t0_global:.1f}s**
-        - 💾 RAM: **0 MB (inicializando)**
-        """)
-
-        # Reservar 25% para fases estruturais
-        phase_progress = min((current_phase - 1) / phase_total * 0.25, 0.25)
-        progress_bar.progress(phase_progress)
-
-    # =========================
-    # FASE 1
-    # =========================
     set_phase("Conectando bancos de dados", "estabelecendo conexões")
-
     src_engine = db_utils.connect(build_url(db_type, **src_cfg))
     dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
     db_utils.set_replication_mode(dst_engine, "replica")
 
-    # =========================
-    # FASE 2
-    # =========================
     set_phase("Mapeando estruturas", "schemas e tabelas")
-
     if modo == "🛡️ Anonimização Total":
         try:
             anonymizer.get_gliner()
             status.success("🧠 IA carregada com sucesso")
-        except:
-            status.warning("🧠 Modo fallback (regex ativo)")
+        except Exception as e:
+            debug_box.error(f"🚨 Falha ao carregar IA: {e}")
 
     schemas = db_utils.get_user_schemas(src_engine)
     allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
-
     work_list = []
-    total_estimated = 0
-    total_tables = 0
+    total_estimated, total_tables = 0, 0
 
     for s in schemas:
         db_utils.copy_schema(src_engine, dst_engine, s)
-
-        tables = [
-            t for t in db_utils.get_tables(src_engine, s)
-            if not allowed or t in allowed
-        ]
-
+        tables = [t for t in db_utils.get_tables(src_engine, s) if not allowed or t in allowed]
+        
+        print(f"[DEBUG] Schema: {s} | Tabelas encontradas: {tables}")
+        
         ordered = db_utils.build_dependency_graph(src_engine, tables, s)
-
         for t in ordered:
             count = db_utils.get_table_count(src_engine, t, s)
             work_list.append((s, t, count))
             total_estimated += count
             total_tables += 1
 
-    # =========================
-    # FASE 3
-    # =========================
-    set_phase("Preparando destino", "limpeza de tabelas")
+    if total_estimated == 0:
+        debug_box.warning("⚠️ Nenhuma linha encontrada nas tabelas de origem! Verifique o banco fonte.")
+        return
 
+    set_phase("Preparando destino", "limpeza de tabelas")
     for s, t, _ in reversed(work_list):
         db_utils.truncate_table(dst_engine, t, s)
 
-    # =========================
-    # FASE 4
-    # =========================
     set_phase("Executando pipeline", "processamento e carga")
-
-    total_rows = 0
-    last_ui_update = 0
-
-    processed_tables = 0
-
-    # Velocidade estável baseada em múltiplos chunks
+    total_rows, processed_tables, last_ui_update = 0, 0, 0
     weighted_speed_samples = []
-    max_speed_samples = 30
 
     with ProcessPoolExecutor(max_workers=n_cores) as executor:
         for s, t, t_count in work_list:
-
             processed_tables += 1
             table_rows_processed = 0
 
-            status.info(
-                f"📦 Processando: {s}.{t} ({t_count:,} registros) • "
-                f"Tabela {processed_tables}/{total_tables}"
-            )
-
-            for chunk in db_utils.fetch_rows_streaming(
-                src_engine,
-                t,
-                s,
-                chunk_size
-            ):
-
+            for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
                 chunk_start = time.time()
-
                 rows = [dict(r) for r in chunk]
+                
+                print(f"[DEBUG] Tabela {t} | Buscou: {len(rows)} linhas no chunk atual")
 
-                # =========================
-                # ANONIMIZAÇÃO
-                # =========================
                 if modo == "🛡️ Anonimização Total":
                     if n_cores > 1:
                         sub_sz = max(1, len(rows) // n_cores)
-
+                        sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
+                        
                         futures = [
-                            executor.submit(
-                                process_chunk_parallel,
-                                rows[i:i + sub_sz],
-                                modo,
-                                anon_geo
-                            )
-                            for i in range(0, len(rows), sub_sz)
+                            executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
+                            for sub_chunk in sub_chunks
                         ]
-
+                        
                         rows = []
-
-                        for f in futures:
-                            try:
-                                rows.extend(f.result())
-                            except:
-                                pass
+                        for original_chunk, f in zip(sub_chunks, futures):
+                            try: 
+                                result = f.result()
+                                if result:
+                                    rows.extend(result)
+                                else:
+                                    rows.extend(original_chunk)
+                            except Exception as e: 
+                                # A SALVAGUARDA ESTÁ AQUI! Se a CPU/SSL morrer, grava o original.
+                                debug_box.error(f"🚨 Erro crítico na CPU worker. Copiando original. Erro: {e}")
+                                rows.extend(original_chunk)
                     else:
-                        rows = process_chunk_parallel(
-                            rows,
-                            modo,
-                            anon_geo
-                        )
+                        try:
+                            res = process_chunk_parallel(rows, modo, anon_geo, target_cols)
+                            if res: rows = res
+                        except Exception as e:
+                            debug_box.error(f"🚨 Erro na IA. Copiando original. Erro: {e}")
 
-                # =========================
-                # INSERT REAL
-                # =========================
-                db_utils.insert_rows(dst_engine, t, s, rows)
+                print(f"[DEBUG] Tabela {t} | Vai inserir: {len(rows)} linhas formatadas")
+                
+                if rows:
+                    db_utils.insert_rows(dst_engine, t, s, rows)
+                else:
+                    debug_box.warning(f"⚠️ Chunk da tabela {t} retornou VAZIO após processamento!")
 
                 inserted_count = len(rows)
                 total_rows += inserted_count
                 table_rows_processed += inserted_count
 
-                # =========================
-                # VELOCIDADE REAL DE PROCESSAMENTO
-                # Inclui fetch + anonimização + insert
-                # =========================
-                chunk_elapsed = max(time.time() - chunk_start, 0.001)
-                chunk_speed = inserted_count / chunk_elapsed
-
+                chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
                 weighted_speed_samples.append(chunk_speed)
-
-                if len(weighted_speed_samples) > max_speed_samples:
+                if len(weighted_speed_samples) > 30:
                     weighted_speed_samples.pop(0)
 
                 now = time.time()
-
                 if now - last_ui_update > 1:
                     elapsed = now - t0_global
-
-                    global_speed = (
-                        total_rows / elapsed
-                        if elapsed > 0 else 0
-                    )
-
-                    stable_speed = (
-                        sum(weighted_speed_samples) /
-                        len(weighted_speed_samples)
-                        if weighted_speed_samples
-                        else global_speed
-                    )
-
-                    progress_data = total_rows / max(total_estimated, 1)
-
-                    # 25% preparação + 75% execução
-                    total_progress = min(
-                        0.25 + (progress_data * 0.75),
-                        1.0
-                    )
-
-                    cpu = psutil.cpu_percent(interval=0.1)
-
-                    # =========================
-                    # ETA MAIS FIEL
-                    # =========================
-                    remaining_rows = max(
-                        total_estimated - total_rows,
-                        0
-                    )
-
-                    eta_str = "Calculando..."
-
-                    if stable_speed > 0:
-                        eta_seconds = remaining_rows / stable_speed
-
-                        eta_h, rem = divmod(
-                            int(eta_seconds),
-                            3600
-                        )
-                        eta_m, eta_s = divmod(rem, 60)
-
-                        if eta_h > 0:
-                            eta_str = (
-                                f"{eta_h:02d}h "
-                                f"{eta_m:02d}m "
-                                f"{eta_s:02d}s"
-                            )
-                        else:
-                            eta_str = (
-                                f"{eta_m:02d}m "
-                                f"{eta_s:02d}s"
-                            )
-
-                    table_progress = (
-                        table_rows_processed / max(t_count, 1)
-                        if t_count > 0 else 1.0
-                    )
-
+                    stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
+                    total_progress = min(0.25 + ((total_rows / max(total_estimated, 1)) * 0.75), 1.0)
+                    
                     metric_placeholder.markdown(f"""
                     ### 📊 Progresso do Pipeline
-                    - 🔷 Fase: **4/4**
                     - 📂 Tabela: **{processed_tables}/{total_tables}**
-                    - 📦 Progresso tabela: **{table_progress * 100:.1f}%**
                     - 🧮 Registros: **{total_rows:,} / {total_estimated:,}**
                     - ⚡ Velocidade real: **{stable_speed:,.0f} linhas/s**
-                    - ⏳ ETA estável: **{eta_str}**
                     - ⏱️ Tempo: **{elapsed:.1f}s**
-                    - 💾 RAM: **{proc.memory_info().rss / (1024**2):.0f} MB**
-                    - 🔥 CPU: **{cpu:.0f}%**
+                    - 🔥 CPU: **{psutil.cpu_percent(interval=0.1):.0f}%**
                     """)
-
-                    progress_bar.progress(
-                        min(total_progress, 1.0)
-                    )
-
+                    progress_bar.progress(total_progress)
                     last_ui_update = now
 
-    # =========================
-    # FINALIZAÇÃO
-    # =========================
     db_utils.set_replication_mode(dst_engine, "origin")
-
     progress_bar.progress(1.0)
-
-    total_time = time.time() - t0_global
-
-    status.success(
-        f"✅ Pipeline concluído com sucesso • "
-        f"{total_rows:,} linhas em {total_time:.2f}s"
-    )
+    status.success(f"✅ Pipeline concluído com sucesso • {total_rows:,} linhas em {time.time() - t0_global:.2f}s")
 
 if start_btn:
     try:
         run_pipeline()
         st.balloons()
     except Exception as e:
-        st.error(f"Erro: {e}")
+        debug_box.error(f"🚨 Erro Fatal no Pipeline: {e}")
