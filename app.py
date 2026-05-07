@@ -72,7 +72,7 @@ def build_url(db_type, user, password, host, port, db):
     return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
 
 # ==================================================
-# PROCESSAMENTO CENTRAL (AGORA MAIS RÁPIDO E LIMPO)
+# PROCESSAMENTO CENTRAL
 # ==================================================
 def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=None):
     if modo != "🛡️ Anonimização Total" or not rows:
@@ -85,8 +85,6 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
 
     # Regex para o Escudo Dinâmico
     html_regex = re.compile(r"<[^>]+>|&[a-zA-Z0-9#]+;")
-    all_caps_regex = re.compile(r"\b[A-ZÀ-Ü]{3,}(?:\s+[A-ZÀ-Ü]{3,})+\b")
-    bullet_regex = re.compile(r"(?:^|\n|\r)\s*(?:[A-Za-z]\)|\d+[\.\-\)])\s*[A-ZÀ-Ü][a-zà-ü]+")
 
     processed = []
     for r in rows:
@@ -118,17 +116,21 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
                         pass
 
             try:
-                # --- 🛡️ INÍCIO DO ESCUDO (APENAS HTML) ---
+                # --- 🛡️ INÍCIO DO ESCUDO (COM ESPAÇAMENTOS) ---
                 vault = {}
                 def hide(match):
                     token = f"__SHLD{len(vault)}__"
                     vault[token] = match.group(0)
-                    return token
+                    # O SEGREDO: Adicionamos espaços antes e depois do token!
+                    return f" {token} "
 
-                # Protege apenas as tags HTML (<br>, <strong>, etc) para não quebrar a tela
-                safe_text = html_regex.sub(hide, old_str)
+                safe_text = old_str
+                safe_text = html_regex.sub(hide, safe_text)
                 
-                # --- 🤖 IA PROCESSA O TEXTO LIVRE ---
+                # Limpa espaços duplos criados pelo escudo para a IA ler perfeitamente
+                safe_text = re.sub(r'\s+', ' ', safe_text).strip()
+                
+                # --- 🤖 IA PROCESSA APENAS O TEXTO SEGURO ---
                 chunks = split_text_into_chunks(safe_text)
                 anon_chunks = []
                 
@@ -136,7 +138,6 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
                     new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo)
                     str_new_val = str(new_val)
                     
-                    # --- 🕵️ RASTREADOR DE TROCAS ---
                     if str_new_val != chunk:
                         seq = difflib.SequenceMatcher(None, chunk.split(), str_new_val.split())
                         for tag, i1, i2, j1, j2 in seq.get_opcodes():
@@ -152,13 +153,13 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
 
                 # --- 🔓 DESATIVA O ESCUDO ---
                 for token, original in vault.items():
-                    final_text = final_text.replace(token, original)
+                    # Tenta remover com os espaços de segurança primeiro, se não achar, tira só o token
+                    final_text = final_text.replace(f" {token} ", original).replace(token, original)
 
                 row_dict[col] = final_text
 
             except Exception as e:
                 print(f"[DEBUG GLINER] Falha ao processar texto na coluna '{col}': {e}")
-                # Se falhar uma coluna específica, não quebra a linha toda. Mantém o original.
                 row_dict[col] = old_str 
 
         processed.append(row_dict)
@@ -214,42 +215,53 @@ with st.sidebar:
             schemas = db_utils.get_user_schemas(src_engine)
             allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
             
-            sugeridas, todas = [], []
-            if schemas:
-                tables = [t for t in db_utils.get_tables(src_engine, schemas[0]) if not allowed or t in allowed]
-                if tables:
-                    chunk_gen = db_utils.fetch_rows_streaming(src_engine, tables[0], schemas[0], 200)
-                    primeiro_lote = next(chunk_gen, [])
-                    
-                    if primeiro_lote:
-                        rows_dict = [dict(r) for r in primeiro_lote]
-                        todas = list(rows_dict[0].keys())
-                        
-                        for col in todas:
-                            valores = [str(r.get(col, "")) for r in rows_dict if r.get(col) is not None]
-                            if anonymizer.should_anonymize_column(col, valores):
-                                sugeridas.append(col)
+            sugeridas_set = set()
+            todas_set = set()
             
-            # Se achou as colunas do banco, usa elas. Se não, deixa vazio para não quebrar a tela.
+            if schemas:
+                for schema in schemas: # Percorre TODOS os schemas
+                    tables = db_utils.get_tables(src_engine, schema)
+                    valid_tables = [t for t in tables if not allowed or t in allowed]
+                    
+                    for table in valid_tables: # Percorre TODAS as tabelas permitidas
+                        chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema, 200)
+                        primeiro_lote = next(chunk_gen, [])
+                        
+                        if primeiro_lote:
+                            rows_dict = [dict(r) for r in primeiro_lote]
+                            colunas_tabela = list(rows_dict[0].keys())
+                            
+                            for col in colunas_tabela:
+                                todas_set.add(col)
+                                valores = [str(r.get(col, "")) for r in rows_dict if r.get(col) is not None]
+                                if anonymizer.should_anonymize_column(col, valores):
+                                    sugeridas_set.add(col)
+            
+            todas = sorted(list(todas_set))
+            sugeridas = sorted(list(sugeridas_set))
+            
             st.session_state.todas_colunas_disponiveis = todas if todas else []
             st.session_state.colunas_para_anonimizar = sugeridas if sugeridas else []
             st.session_state.analise_concluida = True
-            st.success("✅ Análise concluída com sucesso!")
+            st.success(f"✅ Análise concluída! Encontradas {len(todas)} colunas distintas no banco.")
         except Exception as e:
             st.error(f"Erro ao analisar banco: {e}")
 
     if st.session_state.analise_concluida:
-        st.markdown("### Selecione as Colunas Alvo")
+        st.markdown("### Selecione as Exceções")
+        st.info("⚠️ Todas as colunas textuais serão anonimizadas por padrão. Escolha abaixo apenas as que devem ser **IGNORADAS** pelo sistema.")
         
-        # FILTRO DE SEGURANÇA: Só deixa como padrão as colunas que realmente existem na tabela
         opcoes_validas = st.session_state.todas_colunas_disponiveis
-        padroes_seguros = [col for col in st.session_state.colunas_para_anonimizar if col in opcoes_validas]
         
-        colunas_finais = st.multiselect(
-            "Colunas que SERÃO analisadas pela IA:",
+        # O usuário agora escolhe o que NÃO vai anonimizar
+        colunas_ignoradas = st.multiselect(
+            "Colunas que NÃO serão alteradas:",
             options=opcoes_validas, 
-            default=padroes_seguros
+            default=[] # Por padrão, não ignora nada
         )
+        
+        # A matemática da inversão: O que vai pro pipeline é Tudo MENOS o que foi ignorado
+        colunas_finais = [col for col in opcoes_validas if col not in colunas_ignoradas]
         
         start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
         if start_btn:
@@ -351,7 +363,6 @@ def run_pipeline():
                                 else:
                                     rows.extend(original_chunk)
                             except Exception as e: 
-                                # A SALVAGUARDA ESTÁ AQUI! Se a CPU/SSL morrer, grava o original.
                                 debug_box.error(f"🚨 Erro crítico na CPU worker. Copiando original. Erro: {e}")
                                 rows.extend(original_chunk)
                     else:

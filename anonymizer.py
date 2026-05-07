@@ -24,16 +24,19 @@ DEBUG_MODE = True
 
 # A MÁGICA: Passamos rótulos "iscas". A IA vai separar o que é médico/legal do que é nome real.
 GLINER_LABELS = [
-    "person",              # O que queremos
-    "address",             # O que queremos
-    "organization",        # O que queremos
-    "medical condition",   # Isca para não pegar doenças
-    "body part",           # Isca para não pegar partes do corpo
-    "measurement",         # Isca para não pegar cm, ml, kg
-    "profession",          # Isca para não pegar médico, juiz, legista
-    "legal term"           # Isca para não pegar processo, boletim
+    "person",              
+    "address",             
+    "organization",        
+    "medical condition",   
+    "body part",           
+    "measurement",         
+    "profession",          
+    "legal term"           
 ]
 
+# =========================================================
+# REGEX PRINCIPAIS
+# =========================================================
 # =========================================================
 # REGEX PRINCIPAIS
 # =========================================================
@@ -48,13 +51,12 @@ REGEX = {
     "LONG": re.compile(r"^\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"),
 }
 
-# Regex Segura: Pega apenas formato "Nome Sobrenome" perfeito (evita "Fratura De", etc)
+# Regex Segura: Pega apenas formato "Nome Sobrenome" perfeito
 NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][a-zà-ü]+(?:\s(?:de|da|do|dos|das)\s|\s)[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+){0,3})\b")
-
+CONTEXT_NAME_REGEX = re.compile(r"(?i)\b(?:ao|nome|v[ií]tima|paciente|examinado|requerente|autor|r[eé]u)\s*:?\s+([A-ZÀ-Ü][a-zA-ZÀ-Ü\s]{2,})\b")
 UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 DOC_PATTERN = re.compile(r"\b(cpf|rg|documentos?|cnpj|cnh|passaporte)\b")
 NAME_COL_PATTERN = re.compile(r"\b(nome|nomes|razao social)\b")
-
 SENSITIVE_HINTS = re.compile(r"\b(nome|mae|pai|filiacao|suspeito|autor|vitima|indiciado|cpf|rg|telefone|email|endereco|usuario|funcionario|servidor|pessoa)\b", re.IGNORECASE)
 NON_SENSITIVE_HINTS = re.compile(r"\b(natureza|crime|tipo|status|descricao|historico|categoria|municipio|cidade|bairro|marca|modelo|cor|orgao|setor|departamento|processo|protocolo|codigo|id)\b", re.IGNORECASE)
 CITY_LIKE_PATTERN = re.compile(r"^[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+)?$")
@@ -133,7 +135,7 @@ def get_gliner():
 def _detect_all(text: str, anon_loc: bool):
     found = []
 
-    # 1. Regex de Estruturas Fixas (CPF, Email, Telefone, etc)
+    # 1. Regex de Estruturas Fixas
     for typ, pat in REGEX.items():
         if typ in {"COORD", "LOC"} and not anon_loc: continue
         for match in pat.finditer(text):
@@ -142,6 +144,12 @@ def _detect_all(text: str, anon_loc: bool):
     # 2. Regex Segura de Nomes (Apenas garante formato "Nome Sobrenome")
     for match in NAME_REGEX.finditer(text):
         found.append((match.start(), match.end(), match.group(), "PER"))
+
+    # 👇 AQUI ENTRA A ATIVAÇÃO 👇
+    # 2.5 Gatilho Dinâmico de Contexto (Pega o 'Ao OLIVIA LIMA:' perfeitamente)
+    for match in CONTEXT_NAME_REGEX.finditer(text):
+        found.append((match.start(1), match.end(1), match.group(1).strip(), "PER"))
+    # 👆 ======================= 👆
 
     # 3. IA Lendo o Contexto
     if len(text) >= GLINER_MIN_TEXT:
