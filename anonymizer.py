@@ -21,8 +21,6 @@ _gliner_model = None
 CACHE_LIMIT = 500000
 GLINER_MIN_TEXT = 40 
 DEBUG_MODE = True
-
-# A MÁGICA: Passamos rótulos "iscas". A IA vai separar o que é médico/legal do que é nome real.
 GLINER_LABELS = [
     "person",              
     "address",             
@@ -37,9 +35,6 @@ GLINER_LABELS = [
 # =========================================================
 # REGEX PRINCIPAIS
 # =========================================================
-# =========================================================
-# REGEX PRINCIPAIS
-# =========================================================
 REGEX = {
     "CPF": re.compile(r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})\b"),
     "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
@@ -51,12 +46,38 @@ REGEX = {
     "LONG": re.compile(r"^\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"),
 }
 
+SECURITY_ROOTS = [
+    # 👮 Profissionais, Cargos e Papéis
+    "perit", "agent", "delegad", "escriva", "polici", "investigad", "juiz", 
+    "promotor", "legist", "medic", "enfermeir", "socorrist", "bombeir",
+    "vitim", "autor", "indiciad", "suspeit", "testemunh", "reclamant", 
+    "conduzid", "preso", "reu", "querelant", "advogad", "civil", "militar",
+    "ciclist", "pedestr", "passageir", "motorist", "condutor",
+
+    # 🏢 Instituições, Estruturas e Documentos
+    "laudo", "boletim", "ocorrencia", "inquerit", "processo", "vara", 
+    "comarca", "tribunal", "presidi", "penitenciari", "delegaci", "hospital",
+    "clinica", "instituto", "iml", "samu", "siate", "viatura", "fórum", "forum",
+
+    # 🩸 Termos Técnicos, Criminais e Médicos
+    "roubo", "furto", "homicidi", "estupr", "latrocini", "trafic", "contraband",
+    "lesao", "ameaca", "violenci", "traumatism", "hemorragi", "fratur", "cranian",
+    "escoriac", "equimos", "abdomen", "torax", "ventre", "cadaver", "obito"
+]
+
 # Regex Segura: Pega apenas formato "Nome Sobrenome" perfeito
 NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][a-zà-ü]+(?:\s(?:de|da|do|dos|das)\s|\s)[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+){0,3})\b")
+
+# Regex Dinâmica de Contexto: Pega nomes (maiúsculos ou não) após prefixos específicos
 CONTEXT_NAME_REGEX = re.compile(r"(?i)\b(?:ao|nome|v[ií]tima|paciente|examinado|requerente|autor|r[eé]u)\s*:?\s+([A-ZÀ-Ü][a-zA-ZÀ-Ü\s]{2,})\b")
+
+# Caçador de Quesitos: Pega nomes (especialmente os 100% maiúsculos) que aparecem antes das perguntas oficiais do IML/Laudos.
+QUESITO_REGEX = re.compile(r"(?i)\b([A-ZÀ-Üa-zà-ü]{2,}(?:\s[A-ZÀ-Üa-zà-ü]{2,}){1,4})\s*:\s*(?:Qual|Foi|Houve|Há|É|Ocorreu|Onde|Como|Quem)\b")
+
 UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
 DOC_PATTERN = re.compile(r"\b(cpf|rg|documentos?|cnpj|cnh|passaporte)\b")
 NAME_COL_PATTERN = re.compile(r"\b(nome|nomes|razao social)\b")
+
 SENSITIVE_HINTS = re.compile(r"\b(nome|mae|pai|filiacao|suspeito|autor|vitima|indiciado|cpf|rg|telefone|email|endereco|usuario|funcionario|servidor|pessoa)\b", re.IGNORECASE)
 NON_SENSITIVE_HINTS = re.compile(r"\b(natureza|crime|tipo|status|descricao|historico|categoria|municipio|cidade|bairro|marca|modelo|cor|orgao|setor|departamento|processo|protocolo|codigo|id)\b", re.IGNORECASE)
 CITY_LIKE_PATTERN = re.compile(r"^[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+)?$")
@@ -124,14 +145,26 @@ def _get_fake(value: str, typ: str) -> str:
 def get_gliner():
     global _gliner_model
     if _gliner_model is None:
-        # AQUI VOCÊ PODE MUDAR O MODELO NO FUTURO. 
-        # O base é rápido, mas para o seu caso o Multilingual entende melhor PT-BR.
         _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
     return _gliner_model
 
 # =========================================================
 # DETECÇÃO HÍBRIDA (REGEX + IA + STOP WORDS)
 # =========================================================
+def _is_hallucination(ent_text: str) -> bool:
+    """
+    Filtro Inteligente: Verifica se a entidade detectada é apenas jargão.
+    """
+    # Limpa a entidade, removendo preposições inúteis ("de", "do", "da")
+    words = [w for w in ent_text.lower().split() if len(w) > 2 and w not in ["dos", "das", "aos", "com", "por"]]
+    
+    if not words: 
+        return True # Se sobrou nada, era lixo
+        
+    jargon_count = sum(1 for w in words if any(root in w for root in SECURITY_ROOTS))
+    
+    return jargon_count == len(words)
+
 def _detect_all(text: str, anon_loc: bool):
     found = []
 
@@ -141,15 +174,17 @@ def _detect_all(text: str, anon_loc: bool):
         for match in pat.finditer(text):
             found.append((match.start(), match.end(), match.group(), typ))
 
-    # 2. Regex Segura de Nomes (Apenas garante formato "Nome Sobrenome")
+    # 2. Regex Segura de Nomes
     for match in NAME_REGEX.finditer(text):
         found.append((match.start(), match.end(), match.group(), "PER"))
 
-    # 👇 AQUI ENTRA A ATIVAÇÃO 👇
-    # 2.5 Gatilho Dinâmico de Contexto (Pega o 'Ao OLIVIA LIMA:' perfeitamente)
+    # 2.5 Gatilho Dinâmico de Contexto
     for match in CONTEXT_NAME_REGEX.finditer(text):
         found.append((match.start(1), match.end(1), match.group(1).strip(), "PER"))
-    # 👆 ======================= 👆
+
+    # 2.6 Caçador de Quesitos (Adicionado para capturar os casos como "VINICIUS ALVES:")
+    for match in QUESITO_REGEX.finditer(text):
+        found.append((match.start(1), match.end(1), match.group(1).strip(), "PER"))
 
     # 3. IA Lendo o Contexto
     if len(text) >= GLINER_MIN_TEXT:
@@ -157,31 +192,34 @@ def _detect_all(text: str, anon_loc: bool):
             preds = get_gliner().predict_entities(
                 text,
                 GLINER_LABELS,
-                threshold=0.55, # Um nível seguro de confiança
+                threshold=0.55, 
             )
 
             for entity in preds:
                 lbl = entity["label"].lower()
                 ent_text = entity["text"]
 
-                # SE NÃO FOR PESSOA, ENDEREÇO OU ORGANIZAÇÃO, NÓS IGNORAMOS!
-                # Isso mata as alucinações médicas/legais sem usar Stop Words
                 if lbl not in ["person", "address", "organization"]:
                     continue
 
-                # Evita nomes curtos demais ou que sejam só números
                 if len(ent_text) <= 2 or ent_text.isdigit():
+                    continue
+
+                if _is_hallucination(ent_text):
                     continue
 
                 typ = "PER" if lbl == "person" else "LOC" if lbl == "address" else "ORG"
                 
+                if typ == "PER" and any(char.isdigit() for char in ent_text):
+                    continue
+
                 if typ == "LOC" and not anon_loc: continue
                 found.append((entity["start"], entity["end"], ent_text, typ))
 
         except Exception as e:
             debug_log(f"[GLINER ERROR] {e}")
 
-    # Remove duplicatas
+    # Remove duplicatas e sobreposições
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
     for s, e, v, t in found:
@@ -198,7 +236,6 @@ def anonymize_text(text: str, anon_loc: bool = True) -> str:
     if not isinstance(text, str): return text
     text = text.strip()
     if len(text) < 3: return text
-
     entities = _detect_all(text, anon_loc)
     if not entities: return text
 
