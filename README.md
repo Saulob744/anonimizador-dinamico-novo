@@ -1,4 +1,4 @@
-# 🛡️ SESP Data Anonymizer (Local AI Edition)
+# 🛡️ ANONIMIZADOR SESP (Local AI Edition)
 
 Este projeto é uma ferramenta de anonimização de dados sensíveis desenvolvida para operar em ambiente de rede restrita (SESP). Ele utiliza uma abordagem híbrida de **Expressões Regulares (RegEx)** para dados estruturados e **Inteligência Artificial Local (Ollama/Llama 3)** para textos não estruturados.
 
