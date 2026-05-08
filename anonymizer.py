@@ -7,6 +7,7 @@ import logging
 from functools import lru_cache
 from faker import Faker
 from gliner import GLiNER
+import spacy
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ _MAPPING_CACHE = {}
 _USED_FAKES = set()
 fake = Faker("pt_BR")
 _gliner_model = None
-
+_spacy_model = None
 CACHE_LIMIT = 500000
 GLINER_MIN_TEXT = 40 
 DEBUG_MODE = True
@@ -126,7 +127,86 @@ def get_gliner():
         # O base é rápido, mas para o seu caso o Multilingual entende melhor PT-BR.
         _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
     return _gliner_model
+def get_spacy():
+    global _spacy_model
 
+    if _spacy_model is None:
+        _spacy_model = spacy.load("pt_core_news_lg")
+
+    return _spacy_model
+
+def validate_person_entity(entity_text: str, full_text: str) -> bool:
+    """
+    Decide se algo realmente parece um nome humano.
+    """
+
+    if not entity_text:
+        return False
+
+    entity_text = entity_text.strip()
+
+    # Muito curto
+    if len(entity_text) <= 2:
+        return False
+
+    nlp = get_spacy()
+    doc = nlp(entity_text)
+
+    total_tokens = 0
+    propn_tokens = 0
+    noun_tokens = 0
+    verb_tokens = 0
+
+    for token in doc:
+        if token.is_space or token.is_punct:
+            continue
+
+        total_tokens += 1
+
+        if token.pos_ == "PROPN":
+            propn_tokens += 1
+
+        elif token.pos_ == "NOUN":
+            noun_tokens += 1
+
+        elif token.pos_ == "VERB":
+            verb_tokens += 1
+
+    if total_tokens == 0:
+        return False
+
+    propn_ratio = propn_tokens / total_tokens
+
+    score = 0
+
+    # spaCy acredita ser nome próprio
+    score += int(propn_ratio * 60)
+
+    # múltiplas palavras
+    if len(entity_text.split()) >= 2:
+        score += 20
+
+    # capitalização humana
+    if re.match(r"^[A-ZÀ-Ü][a-zà-ü]+(?:\s+[A-ZÀ-Ü][a-zà-ü]+)+$", entity_text):
+        score += 20
+
+    # parece substantivo comum
+    score -= noun_tokens * 15
+
+    # parece verbo
+    score -= verb_tokens * 30
+
+    # tudo minúsculo
+    if entity_text.islower():
+        score -= 30
+
+    # palavra única
+    if len(entity_text.split()) == 1:
+        score -= 25
+
+    debug_log(f"[VALIDATOR] '{entity_text}' score={score}")
+
+    return score >= 45
 # =========================================================
 # DETECÇÃO HÍBRIDA (REGEX + IA + STOP WORDS)
 # =========================================================
@@ -166,7 +246,9 @@ def _detect_all(text: str, anon_loc: bool):
                     continue
 
                 typ = "PER" if lbl == "person" else "LOC" if lbl == "address" else "ORG"
-                
+                if typ == "PER":
+                 if not validate_person_entity(ent_text, text):
+                    continue
                 if typ == "LOC" and not anon_loc: continue
                 found.append((entity["start"], entity["end"], ent_text, typ))
 
@@ -186,11 +268,40 @@ def _detect_all(text: str, anon_loc: bool):
 # =========================================================
 # EXECUÇÃO DA ANONIMIZAÇÃO
 # =========================================================
+def preprocess_dirty_text(text: str) -> str:
+    if not text:
+        return text
+
+    # Corrige HTML quebrado
+    text = re.sub(r"<[^>]*>", " ", text)
+
+    # Remove entidades HTML
+    text = re.sub(r"&[a-zA-Z0-9#]+;", " ", text)
+
+    # Remove caracteres estranhos
+    text = re.sub(r"[\r\n\t]+", " ", text)
+
+    # Espaços múltiplos
+    text = re.sub(r"\s+", " ", text)
+
+    # Corrige caixa alta extrema
+    def smart_case(match):
+        word = match.group(0)
+
+        if len(word) <= 2:
+            return word
+
+        return word.capitalize()
+
+    text = re.sub(r"\b[A-ZÀ-Ü]{3,}\b", smart_case, text)
+
+    return text.strip()
+
 def anonymize_text(text: str, anon_loc: bool = True) -> str:
     if not isinstance(text, str): return text
     text = text.strip()
     if len(text) < 3: return text
-
+    text = preprocess_dirty_text(text)
     entities = _detect_all(text, anon_loc)
     if not entities: return text
 
