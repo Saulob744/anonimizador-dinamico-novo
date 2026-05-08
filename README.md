@@ -32,3 +32,17 @@ Para rodar o projeto atrás do proxy da SESP, utilize o protocolo de inicializa�
 ## 🔒 Segurança e Privacidade
 
 O sistema opera via **Localhost (127.0.0.1:11434)**. Os dados trafegam apenas entre a memória RAM e o processador local, garantindo conformidade total com a LGPD e soberania dos dados da SESP.
+
+
+# 1. Mata qualquer processo travado do Ollama para limpar a fila
+$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($proxyPass)
+$plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+
+# 3. Define as variáveis de ambiente para o Ollama conseguir "enxergar" a rede
+$env:HTTP_PROXY = "http://${proxyUser}:${plainPassword}@proxy00.sesp.parana:8080"
+$env:HTTPS_PROXY = $env:HTTP_PROXY
+
+Write-Host "✅ Proxy configurado. Iniciando servidor..." -ForegroundColor Green
+
+# 4. Inicia o servidor (Mantenha esta janela aberta)
+ollama serve
