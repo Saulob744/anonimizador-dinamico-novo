@@ -1,26 +1,49 @@
-# Web Framework
+
+# =========================================================
+# WEB UI
+# =========================================================
 streamlit>=1.30
 
-# Database & Conectividade
+# =========================================================
+# DATABASE
+# =========================================================
 sqlalchemy>=2.0
 psycopg2-binary>=2.9
 pyodbc>=5.0
 pymysql>=1.1
-pandas>=2.0
 
-# Utils
+# =========================================================
+# DATA / UTILS
+# =========================================================
+pandas>=2.0
+openpyxl>=3.1
+psutil>=5.9
 python-dotenv>=1.0
 
+# =========================================================
 # NLP / IA
+# =========================================================
 faker>=24.0
-spacy>=3.7
 
-# Modelo do spaCy (instalar separado via comando)
-# python -m spacy download pt_core_news_lg
+# Compatibilidade estável spaCy + GLiNER + Torch
+numpy<2
+setuptools<82
 
-# NER avançado (usado no seu código)
+spacy>=3.7,<3.8
 gliner>=0.2.0
 
-# Dependências comuns do gliner
 torch>=2.0
 transformers>=4.40
+
+# =========================================================
+# MODELO PT-BR
+# instalar separado:
+#
+# python -m spacy download pt_core_news_sm
+#
+# ou:
+#
+# pip install https://github.com/explosion/spacy-models/releases/download/pt_core_news_sm-3.7.0/pt_core_news_sm-3.7.0-py3-none-any.whl
+#
+# =========================================================
+

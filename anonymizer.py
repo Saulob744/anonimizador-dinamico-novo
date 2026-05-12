@@ -9,9 +9,12 @@ import requests
 import json
 from functools import lru_cache
 from faker import Faker
+import spacy
+from spacy.cli import download
 
 # Configurações de LOG e Ambiente
-logging.basicConfig(level=logging.INFO)
+# Mude para logging.INFO em produção para limpar o terminal
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 # =========================================================
@@ -23,6 +26,14 @@ fake = Faker("pt_BR")
 
 CACHE_LIMIT = 500000
 DEBUG_MODE = True
+
+# Inicialização segura do spaCy
+try:
+    nlp = spacy.load("pt_core_news_sm")
+    logger.info("[SPACY] Modelo linguístico carregado com sucesso.")
+except OSError:
+    logger.warning("[SPACY] Modelo ausente. Rodando em modo de segurança (sem NLP profunda).")
+    nlp = None
 
 # Blacklist definitiva para evitar que termos técnicos virem nomes
 MEDICAL_LEGAL_BLACKLIST = {
@@ -38,7 +49,10 @@ MEDICAL_LEGAL_BLACKLIST = {
     "encef", "cranio", "craniano", "sinal", "infarto", "miocardio", "agudo", "gradil", 
     "costal", "cavidades", "pleurais", "interface", "toracoabdominal", "toracoabdominais",
     "achado", "achados", "corporal", "geral", "santa", "tereza", "formosa", "oeste", 
-    "ceo", "periorbit", "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor"
+    "ceo", "periorbit", "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor",
+    "rio", "janeiro", "sao", "paulo", "curitiba", "parana", "brasil", "rua", "avenida", "praça","viatura", "veiculo", "veículo", "centro", "bairro", "rua", "avenida", 
+    "via", "publica", "pública", "desconhecido", "indivíduo", "elemento", 
+    "local", "estabelecimento", "cidade", "estado", "município", "distrito"
 }
 
 # =========================================================
@@ -53,32 +67,81 @@ REGEX = {
     "COORD": re.compile(r"^\s*-?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?)\s*,\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"),
 }
 
-# Regex de apoio para nomes e limpeza
-NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][a-zà-ü]+(?:\s(?:de|da|do|dos|das)\s|\s)[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+){0,3})\b")
+# Regex de apoio para nomes: Aceita ALL CAPS, Title Case, Mixed e abreviações com ponto (ex: D.)
+NAME_REGEX = re.compile(
+    r"\b("
+    r"[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+"                                     
+    r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E)\s+|\s+)"       
+    r"[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+"                                    
+    r"(?:\s+[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+){0,4}"                       
+    r")\b"
+)
 PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|em|na|no|de|do|da|vitima|autor|paciente)\s+", re.IGNORECASE)
 
 # =========================================================
-# IA: LLM LOCAL (OLLAMA)
+# IA: LLM LOCAL (OLLAMA) E NLP (SPACY)
 # =========================================================
+def _text_needs_llm(text: str) -> bool:
+    """Árbitro Dinâmico: Usa NLP para analisar a gramática."""
+    if not text: return False
+    text_clean = str(text).strip()
+    
+    if len(text_clean) < 3:
+        return False
+        
+    text_lower = text_clean.lower()
+    trigger_words = ["relat", "fugi", "agredi", "vitim", "vítim", "autor", "suspeit", "pres", "ocorrencia", "ocorrência", "evadi", "furt", "roub", "envolvi", "aborda"]
+    
+    if any(w in text_lower for w in trigger_words):
+        return True
+
+    # 🔥 CORREÇÃO: Se for texto em minúsculo com 2+ palavras, manda pra IA!
+    # A Regex não pega minúsculas, então a IA precisa atuar.
+    if text_clean.islower() and len(text_clean.split()) >= 2:
+        return True
+
+    if nlp:
+        doc = nlp(text_clean)
+        propn_count = sum(1 for token in doc if token.pos_ == "PROPN")
+        pron_count = sum(1 for token in doc if token.pos_ == "PRON")
+                
+        if pron_count >= 1 or propn_count >= 1:
+            return True
+            
+        if any(ent.label_ == "PER" for ent in doc.ents):
+            return True
+
+    if len(text_clean.split()) >= 4:
+        return True
+
+    return False
+
 def _ask_local_llm(text: str) -> list:
-    """Consulta o Ollama para extrair nomes próprios em formato JSON."""
-    prompt = f"""
-    Você é um perito em LGPD. Extraia APENAS os nomes próprios completos de PESSOAS do texto.
-    REGRAS:
-    1. IGNORE hospitais, cidades, ruas, jargões médicos e policiais.
-    2. Retorne APENAS um JSON: {{"nomes": ["NOME 1", "NOME 2"]}}
-    3. Se não houver nomes, retorne {{"nomes": []}}
-    Texto: {text}
-    """
+    """Consulta o Ollama APENAS para extrair os nomes reais encontrados."""
+    prompt = f"""Você é um extrator de nomes próprios para LGPD.
+Extraia APENAS os nomes completos de PESSOAS do texto abaixo.
+
+REGRAS:
+1. Ignore cargos, locais, objetos ou jargões.
+2. Não invente nomes falsos. Apenas extraia os reais.
+3. Retorne APENAS um JSON: {{"nomes": ["NOME 1", "NOME 2"]}}
+
+Texto: {text}
+"""
     try:
         response = requests.post("http://localhost:11434/api/generate", json={
-            "model": "llama3", # Certifique-se de que baixou este modelo
+            "model": "llama3", 
             "prompt": prompt,
-            "format": "json",
-            "stream": False
-        }, timeout=45)
-        return json.loads(response.json()["response"]).get("nomes", [])
-    except:
+            "format": "json", 
+            "stream": False,
+            "options": {"temperature": 0.0}
+        }, timeout=120)
+        
+        if response.status_code == 200:
+            return json.loads(response.json().get("response", "{}")).get("nomes", [])
+        return []
+    except Exception as e:
+        logger.error(f"Erro na IA: {e}")
         return []
 
 # =========================================================
@@ -92,9 +155,10 @@ def _normalize(text: str) -> str:
 
 def _is_hallucination(ent_text: str) -> bool:
     """Verifica se o termo detectado é lixo ou jargão técnico."""
-    if not ent_text or ent_text.islower() or len(ent_text) <= 3:
+    # 🔥 Corrigido: Remoção do islower() e tolerância para nomes de 3 letras (ex: Ana)
+    if not ent_text or len(str(ent_text)) <= 2:
         return True
-    words = [w.strip(string.punctuation).lower() for w in ent_text.split()]
+    words = [w.strip(string.punctuation).lower() for w in str(ent_text).split()]
     if any(w in MEDICAL_LEGAL_BLACKLIST for w in words):
         return True
     return False
@@ -104,18 +168,22 @@ def _is_hallucination(ent_text: str) -> bool:
 # =========================================================
 def _get_fake(value: str, typ: str) -> str:
     global _MAPPING_CACHE
+    
+    if len(_MAPPING_CACHE) >= CACHE_LIMIT:
+        first_key = next(iter(_MAPPING_CACHE))
+        del _MAPPING_CACHE[first_key]
+        
     norm_val = _normalize(value)
     cache_key = f"{typ}:{norm_val}"
     
     if cache_key in _MAPPING_CACHE: 
         return _MAPPING_CACHE[cache_key]
 
-    # Seed determinística: garante que o mesmo valor original sempre gere o mesmo fake
     seed = int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16)
     fake.seed_instance(seed)
     random.seed(seed)
 
-    if typ == "PER": val = fake.name().upper()
+    if typ == "PER": val = f"{fake.first_name()} {fake.last_name()}".upper()
     elif typ == "CPF": val = fake.cpf()
     elif typ == "EMAIL": val = fake.email()
     elif typ == "PLATE": val = fake.license_plate().upper()
@@ -134,29 +202,35 @@ def _get_fake(value: str, typ: str) -> str:
 def _detect_all(text: str, anon_loc: bool):
     found = []
 
-    # 1. Regex: Dados Estruturados (CPF, Placas, etc)
+    # 1. Regex: Dados Estruturados
     for typ, pat in REGEX.items():
         for match in pat.finditer(text):
             found.append((match.start(), match.end(), match.group(), typ))
 
-    # 2. Regex: Nomes Óbvios (Title Case)
+    # 2. Regex de Nomes: Casos óbvios
     for match in NAME_REGEX.finditer(text):
         if not _is_hallucination(match.group()):
             found.append((match.start(), match.end(), match.group(), "PER"))
 
-    # 3. Inteligência Artificial: Ollama (Contexto)
-    if len(text) > 40:
-        nomes_ia = _ask_local_llm(text)
-        for nome in nomes_ia:
-            # Limpa prefixos como "Vitima " do retorno da IA
-            nome_limpo = PREFIX_TRIMMER.sub("", nome).strip()
-            if _is_hallucination(nome_limpo): continue
+    # 3. Inteligência Artificial: Agora apenas para capturar nomes difíceis/minúsculos
+    if _text_needs_llm(text):
+        nomes_reais = _ask_local_llm(text)
+        
+        for nome_real in nomes_reais:
+            nome_limpo = PREFIX_TRIMMER.sub("", str(nome_real)).strip()
+            
+            if _is_hallucination(nome_limpo): 
+                continue
+            
+            # Aqui não injetamos mais o fake no cache. 
+            # Deixamos o _get_fake gerar um nome único baseado no hash do nome_limpo.
             
             # Localiza no texto original para substituição exata
-            for match in re.finditer(re.escape(nome_limpo), text, re.IGNORECASE):
+            padrao = re.compile(rf"\b{re.escape(nome_limpo)}\b", re.IGNORECASE)
+            for match in padrao.finditer(text):
                 found.append((match.start(), match.end(), match.group(), "PER"))
 
-    # Ordenar e remover sobreposições
+    # 4. Tratamento de Sobreposições
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
     for s, e, v, t in found:
@@ -187,7 +261,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
     return new_v, ("TEXT" if new_v != val else None)
 
 def should_anonymize_column(col_name: str, sample_values) -> bool:
-    # Lógica baseada no nome da coluna ou conteúdo
     c = col_name.lower()
     if any(k in c for k in ["nome", "vitima", "autor", "cpf", "rg", "placa"]):
         return True
@@ -196,3 +269,24 @@ def should_anonymize_column(col_name: str, sample_values) -> bool:
 def reset_memory():
     _MAPPING_CACHE.clear()
     _USED_FAKES.clear()
+
+# =========================================================
+# GLINER CACHE
+# =========================================================
+
+_GLINER_MODEL = None
+
+def get_gliner():
+    global _GLINER_MODEL
+    if _GLINER_MODEL is not None:
+        return _GLINER_MODEL
+    try:
+        from gliner import GLiNER
+        logger.info("[GLINER] carregando modelo")
+        _GLINER_MODEL = GLiNER.from_pretrained("urchade/gliner_medium-v2.1")
+        logger.info("[GLINER] modelo carregado")
+        return _GLINER_MODEL
+    except Exception as e:
+        logger.warning(f"[GLINER DISABLED] {e}")
+        _GLINER_MODEL = False
+        return _GLINER_MODEL
