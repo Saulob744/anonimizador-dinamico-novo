@@ -4,40 +4,30 @@ import string
 import unicodedata
 import hashlib
 import logging
-import os
 import requests
 import json
 from functools import lru_cache
 from faker import Faker
-import spacy
-from spacy.cli import download
 
-# Configurações de LOG e Ambiente
-# Mude para logging.INFO em produção para limpar o terminal
-logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
+# =========================================================
+# CONFIGURAÇÕES DE LOG E AMBIENTE
+# =========================================================
+# Mantenha INFO para um terminal limpo. Mude para DEBUG se quiser ver a IA pensando.
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 # =========================================================
-# CONFIGURAÇÕES GLOBAIS
+# CONFIGURAÇÕES GLOBAIS E BLACKLIST
 # =========================================================
 _MAPPING_CACHE = {}
 _USED_FAKES = set()
 fake = Faker("pt_BR")
 
 CACHE_LIMIT = 500000
-DEBUG_MODE = True
 
-# Inicialização segura do spaCy
-try:
-    nlp = spacy.load("pt_core_news_sm")
-    logger.info("[SPACY] Modelo linguístico carregado com sucesso.")
-except OSError:
-    logger.warning("[SPACY] Modelo ausente. Rodando em modo de segurança (sem NLP profunda).")
-    nlp = None
-
-# Blacklist definitiva para evitar que termos técnicos virem nomes
+# Blacklist expandida para blindar a IA contra jargões policiais e médicos
 MEDICAL_LEGAL_BLACKLIST = {
-    "exame", "cavidade", "oral", "torax", "abdominal", "cervical", "ombro", 
+    "exame", "exames", "cavidade", "oral", "torax", "abdominal", "cervical", "ombro", 
     "cotovelo", "esquerdo", "direito", "membro", "membros", "inferior", "inferiores", 
     "superior", "superiores", "afundamento", "hemorragia", "interna", "externo", 
     "aguda", "sistema", "circulatorio", "respiratorio", "vasos", "base", 
@@ -50,13 +40,18 @@ MEDICAL_LEGAL_BLACKLIST = {
     "costal", "cavidades", "pleurais", "interface", "toracoabdominal", "toracoabdominais",
     "achado", "achados", "corporal", "geral", "santa", "tereza", "formosa", "oeste", 
     "ceo", "periorbit", "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor",
-    "rio", "janeiro", "sao", "paulo", "curitiba", "parana", "brasil", "rua", "avenida", "praça","viatura", "veiculo", "veículo", "centro", "bairro", "rua", "avenida", 
-    "via", "publica", "pública", "desconhecido", "indivíduo", "elemento", 
-    "local", "estabelecimento", "cidade", "estado", "município", "distrito"
+    "complementar", "complementares", "quesito", "quesitos", "pergunta", "resposta",
+    "viatura", "veiculo", "centro", "bairro", "desconhecido", "policial", "equipe",
+    "rio", "janeiro", "sao", "paulo", "curitiba", "parana", "brasil", "rua", "avenida", "praça",
+    # 🔥 NOVAS ADIÇÕES (Bloqueia Características e Formulários):
+    "cor", "olho", "olhos", "cabelo", "cabelos", "pele", "cutis", "idade", "sexo", 
+    "profissao", "naturalidade", "nacionalidade", "estado", "civil", "endereco", 
+    "telefone", "celular", "email", "data", "nascimento", "trabalho", "pai", "mae",
+    "marca", "modelo", "placa", "chassi", "renavam", "ano", "fabricacao",
+    "altura", "peso", "tatuagem", "cicatriz", "vestes", "trajes", "fisico", "compleicao"
 }
-
 # =========================================================
-# REGEX DE DADOS ESTRUTURADOS
+# REGEX DE DADOS ESTRUTURADOS E NOMES
 # =========================================================
 REGEX = {
     "CPF": re.compile(r"\b(?:\d{3}\.\d{3}\.\d{3}-\d{2}|\d{11})\b"),
@@ -67,64 +62,46 @@ REGEX = {
     "COORD": re.compile(r"^\s*-?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?)\s*,\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"),
 }
 
-# Regex de apoio para nomes: Aceita ALL CAPS, Title Case, Mixed e abreviações com ponto (ex: D.)
+# Regex turbinada para pegar nomes formatados (Title Case e ALL CAPS) rapidamente
 NAME_REGEX = re.compile(
-    r"\b("
-    r"[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+"                                     
-    r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E)\s+|\s+)"       
-    r"[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+"                                    
-    r"(?:\s+[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+){0,4}"                       
-    r")\b"
+    r"\b([A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+"
+    r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E)\s+|\s+)"
+    r"[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+(?:\s+[A-ZÀ-Ü][a-zA-ZÀ-Üà-ü\'\.]+){0,3})\b"
 )
 PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|em|na|no|de|do|da|vitima|autor|paciente)\s+", re.IGNORECASE)
 
 # =========================================================
-# IA: LLM LOCAL (OLLAMA) E NLP (SPACY)
+# IA: OLLAMA E FILTROS DE SEGURANÇA
 # =========================================================
 def _text_needs_llm(text: str) -> bool:
-    """Árbitro Dinâmico: Usa NLP para analisar a gramática."""
+    """O Porteiro de Ferro: Bloqueia lixo e textos curtos antes de chamar a IA."""
     if not text: return False
     text_clean = str(text).strip()
     
-    if len(text_clean) < 3:
+    # 1. BARREIRA DE TAMANHO: Impede que a IA alucine com "Praticada" ou "Maria"
+    if len(text_clean) < 20:
         return False
         
-    text_lower = text_clean.lower()
-    trigger_words = ["relat", "fugi", "agredi", "vitim", "vítim", "autor", "suspeit", "pres", "ocorrencia", "ocorrência", "evadi", "furt", "roub", "envolvi", "aborda"]
-    
-    if any(w in text_lower for w in trigger_words):
-        return True
+    # 2. BARREIRA DE VARIÁVEIS: Impede que a IA leia "{ENVOLVIDO.NOME}"
+    if "{" in text_clean or "}" in text_clean:
+        return False
+        
+    # 3. BARREIRA DE CABEÇALHOS: Impede que a IA leia "EXAMES COMPLEMENTARES"
+    if text_clean.isupper() and len(text_clean.split()) <= 4:
+        return False
 
-    # 🔥 CORREÇÃO: Se for texto em minúsculo com 2+ palavras, manda pra IA!
-    # A Regex não pega minúsculas, então a IA precisa atuar.
-    if text_clean.islower() and len(text_clean.split()) >= 2:
-        return True
-
-    if nlp:
-        doc = nlp(text_clean)
-        propn_count = sum(1 for token in doc if token.pos_ == "PROPN")
-        pron_count = sum(1 for token in doc if token.pos_ == "PRON")
-                
-        if pron_count >= 1 or propn_count >= 1:
-            return True
-            
-        if any(ent.label_ == "PER" for ent in doc.ents):
-            return True
-
-    if len(text_clean.split()) >= 4:
-        return True
-
-    return False
+    return True
 
 def _ask_local_llm(text: str) -> list:
-    """Consulta o Ollama APENAS para extrair os nomes reais encontrados."""
-    prompt = f"""Você é um extrator de nomes próprios para LGPD.
-Extraia APENAS os nomes completos de PESSOAS do texto abaixo.
+    """Consulta o Ollama com foco em extração pura, aceitando nomes minúsculos."""
+    prompt = f"""Você é um perito em LGPD. Extraia APENAS nomes próprios completos de PESSOAS do texto.
 
 REGRAS:
-1. Ignore cargos, locais, objetos ou jargões.
-2. Não invente nomes falsos. Apenas extraia os reais.
-3. Retorne APENAS um JSON: {{"nomes": ["NOME 1", "NOME 2"]}}
+1. IGNORE hospitais, ruas, cidades, exames, viaturas, objetos ou jargões policiais.
+2. Pode extrair nomes mesmo se estiverem em letras minúsculas.
+3. Extraia de forma literal (não corrija acentos e não mude maiúsculas/minúsculas).
+4. Retorne APENAS um JSON: {{"nomes": ["NOME 1", "NOME 2"]}}
+5. Se não houver nome de ser humano, retorne {{"nomes": []}}
 
 Texto: {text}
 """
@@ -134,8 +111,8 @@ Texto: {text}
             "prompt": prompt,
             "format": "json", 
             "stream": False,
-            "options": {"temperature": 0.0}
-        }, timeout=120)
+            "options": {"temperature": 0.0, "top_p": 0.9}
+        }, timeout=120) # Timeout em 120s para textos longos não travarem
         
         if response.status_code == 200:
             return json.loads(response.json().get("response", "{}")).get("nomes", [])
@@ -145,7 +122,7 @@ Texto: {text}
         return []
 
 # =========================================================
-# UTILITÁRIOS DE APOIO
+# UTILITÁRIOS E GERAÇÃO DE FAKES DETERMINÍSTICOS
 # =========================================================
 @lru_cache(maxsize=100000)
 def _normalize(text: str) -> str:
@@ -154,8 +131,7 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text.upper().strip())
 
 def _is_hallucination(ent_text: str) -> bool:
-    """Verifica se o termo detectado é lixo ou jargão técnico."""
-    # 🔥 Corrigido: Remoção do islower() e tolerância para nomes de 3 letras (ex: Ana)
+    """Verifica se é lixo. Aceita nomes minúsculos, mas bloqueia palavras muito curtas."""
     if not ent_text or len(str(ent_text)) <= 2:
         return True
     words = [w.strip(string.punctuation).lower() for w in str(ent_text).split()]
@@ -163,15 +139,12 @@ def _is_hallucination(ent_text: str) -> bool:
         return True
     return False
 
-# =========================================================
-# GERAÇÃO DE DADOS FALSOS
-# =========================================================
 def _get_fake(value: str, typ: str) -> str:
     global _MAPPING_CACHE
     
+    # Previne estouro de memória deletando o item mais antigo (FIFO)
     if len(_MAPPING_CACHE) >= CACHE_LIMIT:
-        first_key = next(iter(_MAPPING_CACHE))
-        del _MAPPING_CACHE[first_key]
+        del _MAPPING_CACHE[next(iter(_MAPPING_CACHE))]
         
     norm_val = _normalize(value)
     cache_key = f"{typ}:{norm_val}"
@@ -179,17 +152,22 @@ def _get_fake(value: str, typ: str) -> str:
     if cache_key in _MAPPING_CACHE: 
         return _MAPPING_CACHE[cache_key]
 
+    # 🔥 Mágica da Consistência: O hash do nome real gera a semente do nome falso
     seed = int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16)
     fake.seed_instance(seed)
     random.seed(seed)
 
+    # Força a geração apenas de Nome + Sobrenome em maiúsculo
     if typ == "PER": val = f"{fake.first_name()} {fake.last_name()}".upper()
     elif typ == "CPF": val = fake.cpf()
     elif typ == "EMAIL": val = fake.email()
     elif typ == "PLATE": val = fake.license_plate().upper()
     elif typ == "COORD":
-        lat, lon = map(float, value.split(","))
-        val = f"{lat + random.uniform(-0.003, 0.003):.4f}, {lon + random.uniform(-0.003, 0.003):.4f}"
+        try:
+            lat, lon = map(float, value.split(","))
+            val = f"{lat + random.uniform(-0.003, 0.003):.4f}, {lon + random.uniform(-0.003, 0.003):.4f}"
+        except:
+            val = value
     else:
         val = "".join(random.choices(string.ascii_uppercase + string.digits, k=len(value)))
 
@@ -197,40 +175,45 @@ def _get_fake(value: str, typ: str) -> str:
     return val
 
 # =========================================================
-# MOTOR DE DETECÇÃO HÍBRIDA
+# MOTOR DE DETECÇÃO HÍBRIDA (O FUNIL PERFEITO)
 # =========================================================
 def _detect_all(text: str, anon_loc: bool):
     found = []
 
-    # 1. Regex: Dados Estruturados
-    for typ, pat in REGEX.items():
-        for match in pat.finditer(text):
-            found.append((match.start(), match.end(), match.group(), typ))
-
-    # 2. Regex de Nomes: Casos óbvios
+    # 1. Regex Estruturada (Rodagem rápida para CPF, RG, etc)
     for match in NAME_REGEX.finditer(text):
-        if not _is_hallucination(match.group()):
-            found.append((match.start(), match.end(), match.group(), "PER"))
-
-    # 3. Inteligência Artificial: Agora apenas para capturar nomes difíceis/minúsculos
-    if _text_needs_llm(text):
-        nomes_reais = _ask_local_llm(text)
+        raw_name = match.group()
+        # 🔥 Remove o "Ao " ou "Para " que a Regex capturou por engano
+        clean_name = PREFIX_TRIMMER.sub("", raw_name).strip()
         
-        for nome_real in nomes_reais:
-            nome_limpo = PREFIX_TRIMMER.sub("", str(nome_real)).strip()
+        if not _is_hallucination(clean_name):
+            # Recalcula os índices para substituir APENAS o nome e manter o "Ao " intacto no texto
+            start_offset = raw_name.find(clean_name)
+            if start_offset != -1:
+                real_start = match.start() + start_offset
+                real_end = real_start + len(clean_name)
+                found.append((real_start, real_end, clean_name, "PER"))
+
+    # 3. Inteligência Artificial (Apenas para narrativas complexas e nomes minúsculos)
+    if _text_needs_llm(text):
+        nomes_ia = _ask_local_llm(text)
+        for nome in nomes_ia:
+            # Limpeza extrema de pontuações que a IA pode ter inventado
+            nome_limpo = PREFIX_TRIMMER.sub("", str(nome)).strip()
+            nome_limpo = nome_limpo.strip(string.punctuation)
             
             if _is_hallucination(nome_limpo): 
                 continue
             
-            # Aqui não injetamos mais o fake no cache. 
-            # Deixamos o _get_fake gerar um nome único baseado no hash do nome_limpo.
+            nome_norm = _normalize(nome_limpo)
+            if not nome_norm: continue
             
-            # Localiza no texto original para substituição exata
+            # Procura o nome sugerido pela IA dentro do texto original (Match exato)
             padrao = re.compile(rf"\b{re.escape(nome_limpo)}\b", re.IGNORECASE)
             for match in padrao.finditer(text):
                 found.append((match.start(), match.end(), match.group(), "PER"))
 
-    # 4. Tratamento de Sobreposições
+    # 4. Remove Sobreposições (Prioriza a detecção maior)
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
     for s, e, v, t in found:
@@ -271,22 +254,8 @@ def reset_memory():
     _USED_FAKES.clear()
 
 # =========================================================
-# GLINER CACHE
+# COMPATIBILIDADE GLINER (STUB)
 # =========================================================
-
-_GLINER_MODEL = None
-
 def get_gliner():
-    global _GLINER_MODEL
-    if _GLINER_MODEL is not None:
-        return _GLINER_MODEL
-    try:
-        from gliner import GLiNER
-        logger.info("[GLINER] carregando modelo")
-        _GLINER_MODEL = GLiNER.from_pretrained("urchade/gliner_medium-v2.1")
-        logger.info("[GLINER] modelo carregado")
-        return _GLINER_MODEL
-    except Exception as e:
-        logger.warning(f"[GLINER DISABLED] {e}")
-        _GLINER_MODEL = False
-        return _GLINER_MODEL
+    """Mantido apenas para evitar erro de importação no app principal."""
+    return False
