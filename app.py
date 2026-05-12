@@ -298,7 +298,7 @@ def run_pipeline():
     set_phase("Mapeando estruturas", "schemas e tabelas")
     if modo == "🛡️ Anonimização Total":
         try:
-            anonymizer.get_gliner()
+            anonymizer.get_gliner() # Se você estiver usando o GLiNER
             status.success("🧠 IA carregada com sucesso")
         except Exception as e:
             debug_box.error(f"🚨 Falha ao carregar IA: {e}")
@@ -311,8 +311,6 @@ def run_pipeline():
     for s in schemas:
         db_utils.copy_schema(src_engine, dst_engine, s)
         tables = [t for t in db_utils.get_tables(src_engine, s) if not allowed or t in allowed]
-        
-        print(f"[DEBUG] Schema: {s} | Tabelas encontradas: {tables}")
         
         ordered = db_utils.build_dependency_graph(src_engine, tables, s)
         for t in ordered:
@@ -338,12 +336,18 @@ def run_pipeline():
             processed_tables += 1
             table_rows_processed = 0
 
-            for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
+            # --- 🛡️ AJUSTE PARA ORDENAÇÃO EXATA ---
+            # Identifica a PK para forçar o ORDER BY no banco
+            info = db_utils.get_table_info(src_engine, t, s)
+            pks = info.get("primary_keys", [])
+            pk_col = pks[0] if pks else None 
+            # -------------------------------------
+
+            # Passamos o pk_col para o streaming
+            for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size, order_by=pk_col):
                 chunk_start = time.time()
                 rows = [dict(r) for r in chunk]
                 
-                print(f"[DEBUG] Tabela {t} | Buscou: {len(rows)} linhas no chunk atual")
-
                 if modo == "🛡️ Anonimização Total":
                     if n_cores > 1:
                         sub_sz = max(1, len(rows) // n_cores)
@@ -358,35 +362,29 @@ def run_pipeline():
                         for original_chunk, f in zip(sub_chunks, futures):
                             try: 
                                 result = f.result()
-                                if result:
-                                    rows.extend(result)
-                                else:
-                                    rows.extend(original_chunk)
+                                if result: rows.extend(result)
+                                else: rows.extend(original_chunk)
                             except Exception as e: 
-                                debug_box.error(f"🚨 Erro crítico na CPU worker. Copiando original. Erro: {e}")
+                                debug_box.error(f"🚨 Erro crítico no worker. Erro: {e}")
                                 rows.extend(original_chunk)
                     else:
                         try:
                             res = process_chunk_parallel(rows, modo, anon_geo, target_cols)
                             if res: rows = res
                         except Exception as e:
-                            debug_box.error(f"🚨 Erro na IA. Copiando original. Erro: {e}")
+                            debug_box.error(f"🚨 Erro na IA. Erro: {e}")
 
-                print(f"[DEBUG] Tabela {t} | Vai inserir: {len(rows)} linhas formatadas")
-                
                 if rows:
                     db_utils.insert_rows(dst_engine, t, s, rows)
-                else:
-                    debug_box.warning(f"⚠️ Chunk da tabela {t} retornou VAZIO após processamento!")
 
                 inserted_count = len(rows)
                 total_rows += inserted_count
                 table_rows_processed += inserted_count
 
+                # Atualização de métricas (mantido o original)
                 chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
                 weighted_speed_samples.append(chunk_speed)
-                if len(weighted_speed_samples) > 30:
-                    weighted_speed_samples.pop(0)
+                if len(weighted_speed_samples) > 30: weighted_speed_samples.pop(0)
 
                 now = time.time()
                 if now - last_ui_update > 1:
@@ -398,16 +396,15 @@ def run_pipeline():
                     ### 📊 Progresso do Pipeline
                     - 📂 Tabela: **{processed_tables}/{total_tables}**
                     - 🧮 Registros: **{total_rows:,} / {total_estimated:,}**
-                    - ⚡ Velocidade real: **{stable_speed:,.0f} linhas/s**
+                    - ⚡ Velocidade: **{stable_speed:,.0f} linhas/s**
                     - ⏱️ Tempo: **{elapsed:.1f}s**
-                    - 🔥 CPU: **{psutil.cpu_percent(interval=0.1):.0f}%**
                     """)
                     progress_bar.progress(total_progress)
                     last_ui_update = now
 
     db_utils.set_replication_mode(dst_engine, "origin")
     progress_bar.progress(1.0)
-    status.success(f"✅ Pipeline concluído com sucesso • {total_rows:,} linhas em {time.time() - t0_global:.2f}s")
+    status.success(f"✅ Pipeline concluído • {total_rows:,} linhas em {time.time() - t0_global:.2f}s")
 
 if start_btn:
     try:

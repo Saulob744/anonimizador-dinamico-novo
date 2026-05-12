@@ -126,10 +126,20 @@ def copy_schema(src_engine: Engine, dst_engine: Engine, schema: str):
             except Exception as e:
                 logger.warning(f"CREATE SKIP {schema}.{table.name}: {e}")
 
-def fetch_rows_streaming(engine: Engine, table: str, schema: str, chunk_size: int = 1000) -> Generator:
+def fetch_rows_streaming(engine: Engine, table: str, schema: str, chunk_size: int = 1000, order_by: Optional[str] = None) -> Generator:
     full_name = format_table_name(engine, schema, table)
+    
+    # Constrói a query com ordenação se uma coluna for fornecida
+    query_str = f"SELECT * FROM {full_name}"
+    if order_by:
+        # Sanitização básica para evitar problemas com nomes de colunas reservados
+        db_type = get_db_type(engine)
+        quoted_pk = f'"{order_by}"' if db_type != "mysql" else f"`{order_by}`"
+        query_str += f" ORDER BY {quoted_pk}"
+    
     with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(text(f"SELECT * FROM {full_name}"))
+        # execution_options(stream_results=True) é vital para não estourar a RAM
+        result = conn.execution_options(stream_results=True).execute(text(query_str))
         while rows := result.mappings().fetchmany(chunk_size):
             yield rows
 
