@@ -5,9 +5,11 @@ import unicodedata
 import hashlib
 import logging
 import spacy
+import requests
 from functools import lru_cache
 from faker import Faker
 from bs4 import BeautifulSoup
+import html
 
 # =========================================================
 # CONFIGURAÇÕES GLOBAIS E INICIALIZAÇÃO
@@ -19,34 +21,76 @@ _MAPPING_CACHE = {}
 _USED_FAKES = set()
 fake = Faker("pt_BR")
 
+# Configuração Ollama
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_MODEL = "llama3"
+
 try:
     nlp = spacy.load("pt_core_news_lg")
 except OSError:
     logger.error("Modelo SpaCy não encontrado! Rode: python -m spacy download pt_core_news_lg")
     nlp = None
 
-# Blacklist expandida com base nos falsos positivos detectados (verbos e termos técnicos)
 MEDICAL_LEGAL_BLACKLIST = {
-    "exame", "cavidade", "oral", "torax", "abdominal", "cervical", "ombro", 
-    "cotovelo", "esquerdo", "direito", "membro", "membros", "inferior", "inferiores", 
-    "superior", "superiores", "afundamento", "hemorragia", "interna", "externo", 
-    "aguda", "sistema", "circulatorio", "respiratorio", "vasos", "base", 
-    "hospital", "clinica", "boletim", "ocorrencia", "internamento", "distrito", 
+    # Termos médicos, legais e anatômicos
+    "exame", "cavidade", "oral", "torax", "abdominal", "cervical", "ombro", "cotovelo", 
+    "esquerdo", "direito", "membro", "inferior", "superior", "afundamento", "hemorragia", 
+    "interna", "externo", "aguda", "sistema", "circulatorio", "respiratorio", "vasos", 
+    "base", "hospital", "clinica", "boletim", "ocorrencia", "internamento", "distrito", 
     "ficha", "encaminhamento", "acidente", "transito", "medindo", "aproximadamente", 
     "regional", "processo", "penal", "delegacia", "atropelamento", "historico",
     "animal", "silvestre", "colidir", "tancredo", "neves", "coronel", "vivida",
     "hist", "rico", "sinistro", "guaxinim", "battle", "politrauma", "forame", "magno", 
     "encef", "cranio", "craniano", "sinal", "infarto", "miocardio", "agudo", "gradil", 
-    "costal", "cavidades", "pleurais", "interface", "toracoabdominal", "toracoabdominais",
-    "achado", "achados", "corporal", "geral", "santa", "tereza", "formosa", "oeste", 
-    "ceo", "periorbit", "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor",
-    "estavam", "atendendo", "conforme", "apurado", "irregurales", "energia", "mec",
-    "petequias", "esclerais", "frontal", "axila", "coxa", "hematoma", "subcapsular",
-    "couro", "cabeludo", "outras", "les", "coluna", "escoria", "rupturas", "multiplas",
-    "mesenterio", "fraturas", "cominutivas", "via", "publica", "feridas", "cortocontusas",
-    "sinais", "atitude", "pugilista", "policia", "civil", "agente", "oficial", "criminal","pr", "sc", "sp", "rj", "iml", "pm", "prv", "prf", "pcpr", "pmpr",
-    "detran", "samu", "siate", "upa", "sus", "crm", "oab", "rg", "cpf"
+    "costal", "cavidades", "pleurais", "interface", "toracoabdominal", "achado", "achados", 
+    "corporal", "geral", "santa", "tereza", "formosa", "oeste", "ceo", "periorbit", 
+    "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor", "estavam", 
+    "atendendo", "conforme", "apurado", "irregurales", "energia", "mec", "petequias", 
+    "esclerais", "frontal", "axila", "coxa", "hematoma", "subcapsular", "couro", "cabeludo", 
+    "outras", "les", "coluna", "escoria", "rupturas", "multiplas", "mesenterio", "fraturas", 
+    "cominutivas", "via", "publica", "feridas", "cortocontusas", "sinais", "atitude", 
+    "pugilista", "policia", "civil", "agente", "oficial", "criminal", "escoriacoes", 
+    "subcutanea", "regiao", "lesao", "pr", "sc", "sp", "rj", "iml", "pm", "prv", "prf", 
+    "pcpr", "pmpr", "detran", "samu", "siate", "upa", "sus", "crm", "oab", "rg", "cpf",
+    "trata", "se", "cad", "pe", "ba", "al", "cr", "hemorr", "morfol", "test", "envolveu",
+    "auto", "vinte", "trinta", "quarenta", "cinquenta", "sessenta", "setenta", "oitenta", 
+    "noventa", "cem", "mil", "estendendo", "conclui", "zigom", "traqueia", "abd", "clav", 
+    "supra", "infra", "terco", "distal", "proximal", "medial", "lateral", "anterior", 
+    "posterior", "tibia", "fibula", "clavicula", "cadaver", "sexo", "masculino", "feminino",
+    "esquerda", "extensa", "fossa", "iliaca", "hipogastrio", "coxas", "viatura", "pessoa",
+    "estrada", "pulm", "dorso", "instrumento", "contundente", "eviscera", "coracao",
+    "cicatriz", "asa", "menor", "maior", "esfen", "tombamento", "laparotomia", "utero",
+    # Fragmentos e vazamentos recentes
+    "regi", "neo", "falencia", "card", "pol", "lio", "ac", "sentido", "carlopolis", 
+    "tavora", "rodoviario", "federal", "passageira", "condutor", "identificado", "como", "policial"
 }
+
+# =========================================================
+# INTEGRAÇÃO OLLAMA (O JUIZ FINAL)
+# =========================================================
+@lru_cache(maxsize=10000)
+def _ask_ollama_is_name(text: str) -> bool:
+    prompt = (
+        f"Você é um juiz de dados ultrarigoroso. "
+        f"Responda APENAS 'SIM' se o texto a seguir for CLARAMENTE um nome próprio de pessoa humana. "
+        f"Responda 'NAO' se for parte do corpo, termo médico, cargo (ex: Policial, Soldado), cidade, fragmento de palavra ou qualquer outra coisa.\n"
+        f"Texto: '{text}'"
+    )
+    try:
+        response = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False
+        }, timeout=30)
+        
+        if response.status_code == 200:
+            answer = response.json().get("response", "").strip().upper()
+            return "SIM" in answer or "YES" in answer
+    except Exception as e:
+        logger.warning(f"Ollama falhou ao analisar '{text}': {e}. Assumindo True por segurança.")
+        return True 
+    
+    return False
 
 # =========================================================
 # REGEX DE DADOS ESTRUTURADOS
@@ -60,14 +104,31 @@ REGEX = {
     "COORD": re.compile(r"-?\d{1,2}\.\d+,\s*-?\d{1,3}\.\d+"),
 }
 
-# Regex de Nomes: Captura Title Case e ALL CAPS (comum em HTML/Laudos)
-# Adicionado suporte para nomes em maiúsculas que terminam com ":" ou espaços extras
-NAME_REGEX = re.compile(r"\b(?!(?:TRAUMATISMO|EQUIMOSE|COR|DATA|FOTOS|LAUDO|SEXO)\b)([A-ZÀ-Ü]{3,}(?:\s(?:DE|DA|DO|DOS|DAS)\s|\s)[A-ZÀ-Ü]{2,}(?:\s[A-ZÀ-Ü]{2,})*)\b")
-PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|em|na|no|de|do|da|vitima|autor|paciente)\s+", re.IGNORECASE)
+NAME_REGEX = re.compile(
+    r"(?<![a-zA-ZÀ-ÿ])"
+    r"(?:"
+        r"(?:[A-ZÀ-Ÿ]{2,}\s+(?:DE\s+|DA\s+|DO\s+|DOS\s+|DAS\s+|E\s+)?)+[A-ZÀ-Ÿ]{2,}"
+        r"|"
+        r"(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,}\s+(?:de\s+|da\s+|do\s+|dos\s+|das\s+|e\s+)?)+[A-ZÀ-Ÿ][a-zà-ÿ]{1,}"
+    r")"
+    r"(?![a-zA-ZÀ-ÿ])"
+)
+
+PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial)\s+", re.IGNORECASE)
 
 # =========================================================
 # UTILITÁRIOS E FILTROS
 # =========================================================
+def _preprocess_text(text: str) -> str:
+    if not text: return ""
+    text = re.sub(r'<[^>]+>', lambda m: ' ' * len(m.group()), text)
+    def replace_entity(m):
+        ent = m.group()
+        decoded = html.unescape(ent)
+        return decoded + (' ' * (len(ent) - len(decoded)))
+    text = re.sub(r'&[a-z0-9#]+;', replace_entity, text, flags=re.IGNORECASE)
+    return text
+
 @lru_cache(maxsize=100000)
 def _normalize(text: str) -> str:
     if not text: return ""
@@ -75,48 +136,36 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text.upper().strip())
 
 def _is_hallucination(ent_text: str) -> bool:
-    # 1. Filtro de comprimento mínimo e integridade
-    if not ent_text or len(ent_text) < 3: 
-        return True
+    # Aumentado o rigor de tamanho: nomes isolados de 3 letras ou menos costumam ser lixo ou siglas
+    if not ent_text or len(ent_text.strip()) <= 3: return True
     
-    # 2. Bloqueio de Siglas e Abreviações (Ex: P.R., I.M.L., P.M.)
-    # Captura letras isoladas com pontos ou siglas de 2-3 letras em maiúsculo
-    if re.match(r"^([A-Z]\.){1,3}[A-Z]?$", ent_text.upper()) or \
-       (ent_text.isupper() and len(ent_text) <= 3 and ent_text.upper() in ["PR", "PM", "IML", "SAMU", "DR", "DRA"]):
-        return True
-
-    # 3. Verificação de "Labels" de formulário e termos estáticos
-    # Transformamos em set para busca O(1) e adicionamos novos culpados dos logs
-    labels_proibidas = {
-        "COR DOS OLHOS", "FOTOS EM ANEXO", "DATA DE", "SEXO MASCULINO", 
-        "VINICIUS ALVES:", "OLIVIA LIMA:", "RESPOSTA", "PERGUNTA", "LAUDO"
-    }
-    if ent_text.upper().strip() in labels_proibidas:
-        return True
+    if not any(c.isupper() for c in ent_text): return True
+    if re.match(r"^([A-Z]\.){1,3}[A-Z]?$", ent_text.upper().strip()): return True
+    
+    labels_proibidas = {"COR DOS OLHOS", "FOTOS EM ANEXO", "DATA DE", "SEXO MASCULINO", "LAUDO"}
+    if ent_text.upper().strip() in labels_proibidas: return True
 
     clean_text = _normalize(ent_text).lower()
     words = clean_text.split()
     
-    # 4. Blacklist Expandida (Baseada nos seus logs recentes)
-    # Verificamos se qualquer palavra do termo está na lista de termos proibidos
     if any(w in MEDICAL_LEGAL_BLACKLIST for w in words):
         return True
 
-    # 5. Truque do POS-Tagging (Refinado)
     if nlp:
-        # Analisamos o texto em minúsculo para "forçar" o SpaCy a ver o significado real da palavra
         test_doc = nlp(ent_text.lower())
+        palavras_comuns = 0
+        palavras_validas = [w for w in test_doc if w.text not in ["de", "da", "do", "dos", "das", "e"]]
         
-        # Se o termo for composto (ex: "EQUIMOSE EXTENSA"), e as palavras forem substantivos/adjetivos
-        # comuns em minúsculo, é uma alucinação de nome próprio.
-        for token in test_doc:
-            # NOUN (Substantivo), ADJ (Adjetivo), VERB (Verbo), ADV (Advérbio)
-            if token.pos_ in ["NOUN", "ADJ", "VERB", "ADV"]:
-                 # Partículas de nomes próprios brasileiros que devem ser ignoradas no filtro
-                 if token.text not in ["de", "da", "do", "dos", "das"]:
-                    # Se a palavra em minúsculo tem um significado comum, descartamos como nome
-                    return True
-                    
+        for token in palavras_validas:
+            if token.pos_ in ["NOUN", "ADJ", "VERB", "ADV", "NUM", "PRON", "SYM"]:
+                palavras_comuns += 1
+                
+        if palavras_validas and palavras_comuns == len(palavras_validas):
+            return True
+
+    if not _ask_ollama_is_name(ent_text):
+        return True 
+
     return False
 
 # =========================================================
@@ -124,49 +173,41 @@ def _is_hallucination(ent_text: str) -> bool:
 # =========================================================
 def _detect_all(text: str, anon_loc: bool):
     found = []
-    
-    # 1. Limpeza de HTML para análise (mas manteremos as posições do texto original)
-    soup = BeautifulSoup(text, "html.parser")
-    texto_puro = soup.get_text()
+    det_text = _preprocess_text(text)
 
-    # 2. Regex de Dados Estruturados (CPF, Placas, etc)
     for typ, pat in REGEX.items():
         for match in pat.finditer(text):
             found.append((match.start(), match.end(), match.group(), typ))
 
-    # 3. SpaCy para Nomes Próprios (PER)
     if nlp:
-        doc = nlp(text)
+        doc = nlp(det_text)
         for ent in doc.ents:
             if ent.label_ == "PER":
                 nome_limpo = PREFIX_TRIMMER.sub("", ent.text).strip()
                 if not _is_hallucination(nome_limpo):
                     found.append((ent.start_char, ent.end_char, ent.text, "PER"))
 
-    # 4. Fallback: Regex de Nomes para capturar o que o SpaCy perde (como nomes em HTML ou ALL CAPS)
-    # Procuramos no texto original para não perder os offsets
-    for match in NAME_REGEX.finditer(text):
+    for match in NAME_REGEX.finditer(det_text):
         val = match.group().strip()
-        if not _is_hallucination(val):
-            # Evita duplicar se o SpaCy já pegou
+        val_clean = re.sub(r'\s+', ' ', val)
+        if not _is_hallucination(val_clean):
             if not any(s <= match.start() < e for s, e, v, t in found):
                 found.append((match.start(), match.end(), val, "PER"))
 
-    # Ordenar por início e remover sobreposições
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
     for s, e, v, t in found:
         if s >= last:
-            clean.append((s, e, v, t))
+            clean.append((s, e, text[s:e], t))
             last = e
-            
     return clean
 
 # =========================================================
 # GERAÇÃO E INTERFACE
 # =========================================================
 def _get_fake(value: str, typ: str) -> str:
-    norm_val = _normalize(value)
+    clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
+    norm_val = _normalize(clean_value)
     cache_key = f"{typ}:{norm_val}"
     
     if cache_key in _MAPPING_CACHE: 
@@ -176,10 +217,10 @@ def _get_fake(value: str, typ: str) -> str:
     fake.seed_instance(seed)
     
     if typ == "PER":
-        # Se o original tinha prefixos como "Dr.", mantemos a estrutura mas trocamos o nome
         prefix = ""
-        if "DR." in value.upper(): prefix = "DR. "
-        elif "DRA." in value.upper(): prefix = "DRA. "
+        u_val = clean_value.upper()
+        if "DR." in u_val: prefix = "DR. "
+        elif "DRA." in u_val: prefix = "DRA. "
         val = prefix + fake.name().upper()
     elif typ == "CPF": val = fake.cpf()
     elif typ == "PLATE": val = fake.license_plate().upper()
@@ -194,7 +235,8 @@ def anonymize_text(text: str, anon_loc: bool = True) -> str:
     
     result, last = [], 0
     for s, e, v, t in entities:
-        result.extend([text[last:s], _get_fake(v, t)])
+        result.append(text[last:s])
+        result.append(_get_fake(v, t))
         last = e
     result.append(text[last:])
     return "".join(result)
@@ -214,7 +256,6 @@ def reset_memory():
     _MAPPING_CACHE.clear()
     _USED_FAKES.clear()
 
-# Função solicitada para compatibilidade de log
 def filtrar_nomes_proprios(texto_html):
     entities = _detect_all(texto_html, True)
     return [v for s, e, v, t in entities if t == "PER"]
