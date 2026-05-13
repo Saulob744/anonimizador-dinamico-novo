@@ -4,27 +4,28 @@ import string
 import unicodedata
 import hashlib
 import logging
-import os
-import requests
-import json
+import spacy
 from functools import lru_cache
 from faker import Faker
+from bs4 import BeautifulSoup
 
-# Configurações de LOG e Ambiente
+# =========================================================
+# CONFIGURAÇÕES GLOBAIS E INICIALIZAÇÃO
+# =========================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# =========================================================
-# CONFIGURAÇÕES GLOBAIS
-# =========================================================
 _MAPPING_CACHE = {}
 _USED_FAKES = set()
 fake = Faker("pt_BR")
 
-CACHE_LIMIT = 500000
-DEBUG_MODE = True
+try:
+    nlp = spacy.load("pt_core_news_lg")
+except OSError:
+    logger.error("Modelo SpaCy não encontrado! Rode: python -m spacy download pt_core_news_lg")
+    nlp = None
 
-# Blacklist definitiva para evitar que termos técnicos virem nomes
+# Blacklist expandida com base nos falsos positivos detectados (verbos e termos técnicos)
 MEDICAL_LEGAL_BLACKLIST = {
     "exame", "cavidade", "oral", "torax", "abdominal", "cervical", "ombro", 
     "cotovelo", "esquerdo", "direito", "membro", "membros", "inferior", "inferiores", 
@@ -38,7 +39,13 @@ MEDICAL_LEGAL_BLACKLIST = {
     "encef", "cranio", "craniano", "sinal", "infarto", "miocardio", "agudo", "gradil", 
     "costal", "cavidades", "pleurais", "interface", "toracoabdominal", "toracoabdominais",
     "achado", "achados", "corporal", "geral", "santa", "tereza", "formosa", "oeste", 
-    "ceo", "periorbit", "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor"
+    "ceo", "periorbit", "revestimento", "cut", "nio", "local", "patol", "cef", "vitima", "autor",
+    "estavam", "atendendo", "conforme", "apurado", "irregurales", "energia", "mec",
+    "petequias", "esclerais", "frontal", "axila", "coxa", "hematoma", "subcapsular",
+    "couro", "cabeludo", "outras", "les", "coluna", "escoria", "rupturas", "multiplas",
+    "mesenterio", "fraturas", "cominutivas", "via", "publica", "feridas", "cortocontusas",
+    "sinais", "atitude", "pugilista", "policia", "civil", "agente", "oficial", "criminal","pr", "sc", "sp", "rj", "iml", "pm", "prv", "prf", "pcpr", "pmpr",
+    "detran", "samu", "siate", "upa", "sus", "crm", "oab", "rg", "cpf"
 }
 
 # =========================================================
@@ -50,87 +57,16 @@ REGEX = {
     "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(\d{2}\)|\d{2})\s?(?:9\d{4}|\d{4})-?\d{4}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
     "RG": re.compile(r"\b\d{1,2}\.?\d{3}\.?\d{3}-?[0-9X]\b"),
-    "COORD": re.compile(r"^\s*-?(?:90(?:\.0+)?|[0-8]?\d(?:\.\d+)?)\s*,\s*-?(?:180(?:\.0+)?|1[0-7]\d(?:\.\d+)?|\d{1,2}(?:\.\d+)?)\s*$"),
+    "COORD": re.compile(r"-?\d{1,2}\.\d+,\s*-?\d{1,3}\.\d+"),
 }
 
-# Regex de apoio para nomes e limpeza
-NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][a-zà-ü]+(?:\s(?:de|da|do|dos|das)\s|\s)[A-ZÀ-Ü][a-zà-ü]+(?:\s[A-ZÀ-Ü][a-zà-ü]+){0,3})\b")
+# Regex de Nomes: Captura Title Case e ALL CAPS (comum em HTML/Laudos)
+# Adicionado suporte para nomes em maiúsculas que terminam com ":" ou espaços extras
+NAME_REGEX = re.compile(r"\b(?!(?:TRAUMATISMO|EQUIMOSE|COR|DATA|FOTOS|LAUDO|SEXO)\b)([A-ZÀ-Ü]{3,}(?:\s(?:DE|DA|DO|DOS|DAS)\s|\s)[A-ZÀ-Ü]{2,}(?:\s[A-ZÀ-Ü]{2,})*)\b")
 PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|em|na|no|de|do|da|vitima|autor|paciente)\s+", re.IGNORECASE)
 
 # =========================================================
-# COMPATIBILIDADE COM VERSÕES ANTIGAS
-# =========================================================
-def get_gliner():
-    """
-    Função de compatibilidade para versões antigas do app.
-    O projeto antigo esperava um modelo GLiNER, mas agora
-    usamos Ollama. Retornamos um objeto dummy apenas para
-    evitar quebra de importação.
-    """
-    return {
-        "provider": "ollama",
-        "model": "llama3",
-        "status": "ready"
-    }
-# =========================================================
-# IA: LLM LOCAL (OLLAMA)
-# =========================================================
-def _ask_local_llm(text: str) -> list:
-    """Consulta o Ollama para extrair nomes próprios em formato JSON."""
-    prompt = f"""
-Você é um sistema profissional de anonimização LGPD.
-
-OBJETIVO:
-Extrair SOMENTE nomes reais de pessoas físicas.
-
-NÃO extraia:
-- hospitais
-- ruas
-- cidades
-- bairros
-- igrejas
-- locais
-- empresas
-- órgãos públicos
-- rodovias
-- regiões
-- estabelecimentos
-- termos médicos
-- expressões religiosas
-
-EXEMPLOS INVÁLIDOS:
-- Nossa Senhora
-- Trevo de Lobato
-- Hospital Regional
-- Avenida Brasil
-
-EXEMPLOS VÁLIDOS:
-- João da Silva
-- Maria Oliveira Santos
-
-Retorne APENAS JSON válido:
-
-{{"nomes":[]}}
-
-Texto:
-{text}
-"""
-    try:
-        response = requests.post(
-    "http://127.0.0.1:11434/api/generate",
-    json={
-        "model": "llama3:8b",
-        "prompt": prompt,
-        "stream": False
-    },
-    timeout=160
-)
-        return json.loads(response.json()["response"]).get("nomes", [])
-    except:
-        return []
-
-# =========================================================
-# UTILITÁRIOS DE APOIO
+# UTILITÁRIOS E FILTROS
 # =========================================================
 @lru_cache(maxsize=100000)
 def _normalize(text: str) -> str:
@@ -139,163 +75,123 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text.upper().strip())
 
 def _is_hallucination(ent_text: str) -> bool:
-    """
-    Filtra entidades falsas, locais, hospitais,
-    termos técnicos e lixo semântico.
-    """
-
-    if not ent_text:
+    # 1. Filtro de comprimento mínimo e integridade
+    if not ent_text or len(ent_text) < 3: 
+        return True
+    
+    # 2. Bloqueio de Siglas e Abreviações (Ex: P.R., I.M.L., P.M.)
+    # Captura letras isoladas com pontos ou siglas de 2-3 letras em maiúsculo
+    if re.match(r"^([A-Z]\.){1,3}[A-Z]?$", ent_text.upper()) or \
+       (ent_text.isupper() and len(ent_text) <= 3 and ent_text.upper() in ["PR", "PM", "IML", "SAMU", "DR", "DRA"]):
         return True
 
-    ent_text = ent_text.strip()
-
-    # Muito curto
-    if len(ent_text) < 5:
+    # 3. Verificação de "Labels" de formulário e termos estáticos
+    # Transformamos em set para busca O(1) e adicionamos novos culpados dos logs
+    labels_proibidas = {
+        "COR DOS OLHOS", "FOTOS EM ANEXO", "DATA DE", "SEXO MASCULINO", 
+        "VINICIUS ALVES:", "OLIVIA LIMA:", "RESPOSTA", "PERGUNTA", "LAUDO"
+    }
+    if ent_text.upper().strip() in labels_proibidas:
         return True
 
-    # Tudo minúsculo
-    if ent_text.islower():
-        return True
-
-    words = [
-        w.strip(string.punctuation).lower()
-        for w in ent_text.split()
-    ]
-
-    # Nome precisa ter ao menos 2 palavras
-    if len(words) < 2:
-        return True
-
-    # Blacklist médica/jurídica
+    clean_text = _normalize(ent_text).lower()
+    words = clean_text.split()
+    
+    # 4. Blacklist Expandida (Baseada nos seus logs recentes)
+    # Verificamos se qualquer palavra do termo está na lista de termos proibidos
     if any(w in MEDICAL_LEGAL_BLACKLIST for w in words):
         return True
 
-    # Lugares / instituições / religião
-    forbidden = {
-        "hospital",
-        "igreja",
-        "prefeitura",
-        "delegacia",
-        "rodovia",
-        "bairro",
-        "rua",
-        "avenida",
-        "br",
-        "pr",
-        "km",
-        "trevo",
-        "posto",
-        "upa",
-        "ubs",
-        "santa",
-        "senhora",
-        "cristo",
-        "jesus",
-        "deus",
-        "nossa",
-        "capela",
-        "cemiterio",
-        "parque",
-        "municipio",
-        "cidade"
-    }
-
-    if any(w in forbidden for w in words):
-        return True
-
-    # Muitas palavras -> provavelmente frase
-    if len(words) > 5:
-        return True
-
-    # Palavras totalmente maiúsculas estranhas
-    weird = 0
-    for w in ent_text.split():
-        if len(w) > 3 and w.isupper():
-            weird += 1
-
-    if weird >= 4:
-        return True
-
-    # Não pode ter números
-    if re.search(r"\d", ent_text):
-        return True
-
+    # 5. Truque do POS-Tagging (Refinado)
+    if nlp:
+        # Analisamos o texto em minúsculo para "forçar" o SpaCy a ver o significado real da palavra
+        test_doc = nlp(ent_text.lower())
+        
+        # Se o termo for composto (ex: "EQUIMOSE EXTENSA"), e as palavras forem substantivos/adjetivos
+        # comuns em minúsculo, é uma alucinação de nome próprio.
+        for token in test_doc:
+            # NOUN (Substantivo), ADJ (Adjetivo), VERB (Verbo), ADV (Advérbio)
+            if token.pos_ in ["NOUN", "ADJ", "VERB", "ADV"]:
+                 # Partículas de nomes próprios brasileiros que devem ser ignoradas no filtro
+                 if token.text not in ["de", "da", "do", "dos", "das"]:
+                    # Se a palavra em minúsculo tem um significado comum, descartamos como nome
+                    return True
+                    
     return False
-
-# =========================================================
-# GERAÇÃO DE DADOS FALSOS
-# =========================================================
-def _get_fake(value: str, typ: str) -> str:
-    global _MAPPING_CACHE
-    norm_val = _normalize(value)
-    cache_key = f"{typ}:{norm_val}"
-    
-    if cache_key in _MAPPING_CACHE: 
-        return _MAPPING_CACHE[cache_key]
-
-    # Seed determinística: garante que o mesmo valor original sempre gere o mesmo fake
-    seed = int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16)
-    fake.seed_instance(seed)
-    random.seed(seed)
-
-    if typ == "PER": val = fake.name().upper()
-    elif typ == "CPF": val = fake.cpf()
-    elif typ == "EMAIL": val = fake.email()
-    elif typ == "PLATE": val = fake.license_plate().upper()
-    elif typ == "COORD":
-        lat, lon = map(float, value.split(","))
-        val = f"{lat + random.uniform(-0.003, 0.003):.4f}, {lon + random.uniform(-0.003, 0.003):.4f}"
-    else:
-        val = "".join(random.choices(string.ascii_uppercase + string.digits, k=len(value)))
-
-    _MAPPING_CACHE[cache_key] = val
-    return val
 
 # =========================================================
 # MOTOR DE DETECÇÃO HÍBRIDA
 # =========================================================
 def _detect_all(text: str, anon_loc: bool):
     found = []
+    
+    # 1. Limpeza de HTML para análise (mas manteremos as posições do texto original)
+    soup = BeautifulSoup(text, "html.parser")
+    texto_puro = soup.get_text()
 
-    # 1. Regex: Dados Estruturados (CPF, Placas, etc)
+    # 2. Regex de Dados Estruturados (CPF, Placas, etc)
     for typ, pat in REGEX.items():
         for match in pat.finditer(text):
             found.append((match.start(), match.end(), match.group(), typ))
 
-    # 2. Regex: Nomes Óbvios (Title Case)
+    # 3. SpaCy para Nomes Próprios (PER)
+    if nlp:
+        doc = nlp(text)
+        for ent in doc.ents:
+            if ent.label_ == "PER":
+                nome_limpo = PREFIX_TRIMMER.sub("", ent.text).strip()
+                if not _is_hallucination(nome_limpo):
+                    found.append((ent.start_char, ent.end_char, ent.text, "PER"))
+
+    # 4. Fallback: Regex de Nomes para capturar o que o SpaCy perde (como nomes em HTML ou ALL CAPS)
+    # Procuramos no texto original para não perder os offsets
     for match in NAME_REGEX.finditer(text):
-        if not _is_hallucination(match.group()):
-            found.append((match.start(), match.end(), match.group(), "PER"))
+        val = match.group().strip()
+        if not _is_hallucination(val):
+            # Evita duplicar se o SpaCy já pegou
+            if not any(s <= match.start() < e for s, e, v, t in found):
+                found.append((match.start(), match.end(), val, "PER"))
 
-    # 3. Inteligência Artificial: Ollama (Contexto)
-    if len(text) > 40:
-        nomes_ia = _ask_local_llm(text)
-        for nome in nomes_ia:
-            # Limpa prefixos como "Vitima " do retorno da IA
-            nome_limpo = PREFIX_TRIMMER.sub("", nome).strip()
-            if _is_hallucination(nome_limpo): continue
-            
-            # Localiza no texto original para substituição exata
-            for match in re.finditer(re.escape(nome_limpo), text, re.IGNORECASE):
-                found.append((match.start(), match.end(), match.group(), "PER"))
-
-    # Ordenar e remover sobreposições
+    # Ordenar por início e remover sobreposições
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
     for s, e, v, t in found:
         if s >= last:
             clean.append((s, e, v, t))
             last = e
+            
     return clean
 
 # =========================================================
-# FUNÇÕES DE INTERFACE COM O APP.PY
+# GERAÇÃO E INTERFACE
 # =========================================================
+def _get_fake(value: str, typ: str) -> str:
+    norm_val = _normalize(value)
+    cache_key = f"{typ}:{norm_val}"
+    
+    if cache_key in _MAPPING_CACHE: 
+        return _MAPPING_CACHE[cache_key]
+
+    seed = int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16)
+    fake.seed_instance(seed)
+    
+    if typ == "PER":
+        # Se o original tinha prefixos como "Dr.", mantemos a estrutura mas trocamos o nome
+        prefix = ""
+        if "DR." in value.upper(): prefix = "DR. "
+        elif "DRA." in value.upper(): prefix = "DRA. "
+        val = prefix + fake.name().upper()
+    elif typ == "CPF": val = fake.cpf()
+    elif typ == "PLATE": val = fake.license_plate().upper()
+    else: val = fake.word().upper()
+
+    _MAPPING_CACHE[cache_key] = val
+    return val
+
 def anonymize_text(text: str, anon_loc: bool = True) -> str:
     if not isinstance(text, str) or len(text) < 3: return text
     entities = _detect_all(text, anon_loc)
-    if not entities: return text
-
+    
     result, last = [], 0
     for s, e, v, t in entities:
         result.extend([text[last:s], _get_fake(v, t)])
@@ -311,22 +207,14 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 
 def should_anonymize_column(col_name: str, sample_values) -> bool:
     c = col_name.lower()
-    if any(k in c for k in ["nome", "vitima", "autor", "cpf", "rg", "placa"]):
-        return True
-    return False
-
-
-# =========================================================
-# COMPATIBILIDADE COM VERSÕES ANTIGAS
-# =========================================================
-def get_gliner():
-    return {
-        "provider": "ollama",
-        "model": "llama3",
-        "status": "ready"
-    }
-
+    targets = ["nome", "vitima", "autor", "cpf", "rg", "placa", "condutor", "proprietario"]
+    return any(k in c for k in targets)
 
 def reset_memory():
     _MAPPING_CACHE.clear()
     _USED_FAKES.clear()
+
+# Função solicitada para compatibilidade de log
+def filtrar_nomes_proprios(texto_html):
+    entities = _detect_all(texto_html, True)
+    return [v for s, e, v, t in entities if t == "PER"]

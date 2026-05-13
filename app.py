@@ -32,6 +32,7 @@ st.markdown("""
     [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; font-weight: bold; }
     .stProgress .st-at { background-color: #00ffcc; }
     .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
+    .var-display { background-color: #1e1e2e; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 5px solid #00ffcc; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -121,13 +122,12 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
                 def hide(match):
                     token = f"__SHLD{len(vault)}__"
                     vault[token] = match.group(0)
-                    # O SEGREDO: Adicionamos espaços antes e depois do token!
                     return f" {token} "
 
                 safe_text = old_str
                 safe_text = html_regex.sub(hide, safe_text)
                 
-                # Limpa espaços duplos criados pelo escudo para a IA ler perfeitamente
+                # Limpa espaços duplos
                 safe_text = re.sub(r'\s+', ' ', safe_text).strip()
                 
                 # --- 🤖 IA PROCESSA APENAS O TEXTO SEGURO ---
@@ -153,7 +153,6 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
 
                 # --- 🔓 DESATIVA O ESCUDO ---
                 for token, original in vault.items():
-                    # Tenta remover com os espaços de segurança primeiro, se não achar, tira só o token
                     final_text = final_text.replace(f" {token} ", original).replace(token, original)
 
                 row_dict[col] = final_text
@@ -177,6 +176,8 @@ if "colunas_selecionadas_finais" not in st.session_state:
     st.session_state.colunas_selecionadas_finais = []
 if "todas_colunas_disponiveis" not in st.session_state:
     st.session_state.todas_colunas_disponiveis = []
+if "colunas_ignoradas" not in st.session_state:
+    st.session_state.colunas_ignoradas = []
 
 start_btn = False
 
@@ -184,7 +185,7 @@ with st.sidebar:
     st.title("🛡️ Aegis Control")
     db_type = st.selectbox("Tipo de Banco de Dados", ["postgresql", "mysql", "mssql"])
 
-    aba_origem, aba_destino = st.tabs(["🔴 Banco Origem", "🟢 Banco Destino"])
+    aba_origem, aba_destino = st.tabs(["🔴 Origem", "🟢 Destino"])
 
     def render_db_form(prefix):
         return {
@@ -210,57 +211,58 @@ with st.sidebar:
     btn_analisar = st.button("1. Analisar Estrutura", use_container_width=True)
     
     if btn_analisar:
-        try:
-            src_engine = db_utils.connect(build_url(db_type, **src_cfg))
-            schemas = db_utils.get_user_schemas(src_engine)
-            allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
-            
-            sugeridas_set = set()
-            todas_set = set()
-            
-            if schemas:
-                for schema in schemas: # Percorre TODOS os schemas
-                    tables = db_utils.get_tables(src_engine, schema)
-                    valid_tables = [t for t in tables if not allowed or t in allowed]
-                    
-                    for table in valid_tables: # Percorre TODAS as tabelas permitidas
-                        chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema, 200)
-                        primeiro_lote = next(chunk_gen, [])
+        with st.spinner("Analisando banco de dados..."):
+            try:
+                src_engine = db_utils.connect(build_url(db_type, **src_cfg))
+                schemas = db_utils.get_user_schemas(src_engine)
+                allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
+                
+                sugeridas_set = set()
+                todas_set = set()
+                
+                if schemas:
+                    for schema in schemas:
+                        tables = db_utils.get_tables(src_engine, schema)
+                        valid_tables = [t for t in tables if not allowed or t in allowed]
                         
-                        if primeiro_lote:
-                            rows_dict = [dict(r) for r in primeiro_lote]
-                            colunas_tabela = list(rows_dict[0].keys())
+                        for table in valid_tables:
+                            chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema, 200)
+                            primeiro_lote = next(chunk_gen, [])
                             
-                            for col in colunas_tabela:
-                                todas_set.add(col)
-                                valores = [str(r.get(col, "")) for r in rows_dict if r.get(col) is not None]
-                                if anonymizer.should_anonymize_column(col, valores):
-                                    sugeridas_set.add(col)
-            
-            todas = sorted(list(todas_set))
-            sugeridas = sorted(list(sugeridas_set))
-            
-            st.session_state.todas_colunas_disponiveis = todas if todas else []
-            st.session_state.colunas_para_anonimizar = sugeridas if sugeridas else []
-            st.session_state.analise_concluida = True
-            st.success(f"✅ Análise concluída! Encontradas {len(todas)} colunas distintas no banco.")
-        except Exception as e:
-            st.error(f"Erro ao analisar banco: {e}")
+                            if primeiro_lote:
+                                rows_dict = [dict(r) for r in primeiro_lote]
+                                colunas_tabela = list(rows_dict[0].keys())
+                                
+                                for col in colunas_tabela:
+                                    todas_set.add(col)
+                                    valores = [str(r.get(col, "")) for r in rows_dict if r.get(col) is not None]
+                                    if anonymizer.should_anonymize_column(col, valores):
+                                        sugeridas_set.add(col)
+                
+                todas = sorted(list(todas_set))
+                sugeridas = sorted(list(sugeridas_set))
+                
+                st.session_state.todas_colunas_disponiveis = todas if todas else []
+                st.session_state.colunas_para_anonimizar = sugeridas if sugeridas else []
+                st.session_state.analise_concluida = True
+                st.success(f"✅ Encontradas {len(todas)} colunas distintas.")
+            except Exception as e:
+                st.error(f"Erro ao analisar banco: {e}")
 
     if st.session_state.analise_concluida:
         st.markdown("### Selecione as Exceções")
-        st.info("⚠️ Todas as colunas textuais serão anonimizadas por padrão. Escolha abaixo apenas as que devem ser **IGNORADAS** pelo sistema.")
+        st.info("⚠️ Escolha abaixo apenas as colunas que devem ser **IGNORADAS** pelo sistema.")
         
         opcoes_validas = st.session_state.todas_colunas_disponiveis
         
-        # O usuário agora escolhe o que NÃO vai anonimizar
+        # Salvando as ignoradas no estado para não perder durante os re-renders
         colunas_ignoradas = st.multiselect(
             "Colunas que NÃO serão alteradas:",
             options=opcoes_validas, 
-            default=[] # Por padrão, não ignora nada
+            default=st.session_state.colunas_ignoradas
         )
+        st.session_state.colunas_ignoradas = colunas_ignoradas
         
-        # A matemática da inversão: O que vai pro pipeline é Tudo MENOS o que foi ignorado
         colunas_finais = [col for col in opcoes_validas if col not in colunas_ignoradas]
         
         start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
@@ -268,9 +270,28 @@ with st.sidebar:
             st.session_state.colunas_selecionadas_finais = colunas_finais
 
 # ==================================================
-# PIPELINE
+# UI PRINCIPAL & PIPELINE
 # ==================================================
 st.title("🛡️ Pipeline De Proteção De Dados")
+
+# MOSTRADOR DINÂMICO DE VARIÁVEIS NA TELA
+if st.session_state.analise_concluida:
+    with st.expander("👁️ Ver Variáveis e Estrutura Mapeada", expanded=True):
+        st.markdown("<div class='var-display'>", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total de Colunas Lidas", len(st.session_state.todas_colunas_disponiveis))
+        col2.metric("Colunas Ignoradas", len(st.session_state.colunas_ignoradas))
+        
+        qtd_alvo = len(st.session_state.todas_colunas_disponiveis) - len(st.session_state.colunas_ignoradas)
+        col3.metric("Alvos da IA (A Processar)", qtd_alvo)
+        
+        st.markdown("**🎯 Lista de Colunas que passarão pela IA:**")
+        if qtd_alvo > 0:
+            st.code(", ".join([c for c in st.session_state.todas_colunas_disponiveis if c not in st.session_state.colunas_ignoradas]))
+        else:
+            st.warning("Nenhuma coluna selecionada para processamento.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
 debug_box = st.empty() 
 progress_bar = st.progress(0)
 status = st.empty()
@@ -287,7 +308,7 @@ def run_pipeline():
     def set_phase(title, subtitle=""):
         nonlocal current_phase
         current_phase += 1
-        status.info(f"🔷 Fase {current_phase}/{phase_total} • {title}")
+        status.info(f"🔷 Fase {current_phase}/{phase_total} • {title} ({subtitle})")
         progress_bar.progress(min((current_phase - 1) / phase_total * 0.25, 0.25))
 
     set_phase("Conectando bancos de dados", "estabelecendo conexões")
@@ -298,7 +319,7 @@ def run_pipeline():
     set_phase("Mapeando estruturas", "schemas e tabelas")
     if modo == "🛡️ Anonimização Total":
         try:
-            anonymizer.get_gliner() # Se você estiver usando o GLiNER
+            anonymizer.get_gliner() 
             status.success("🧠 IA carregada com sucesso")
         except Exception as e:
             debug_box.error(f"🚨 Falha ao carregar IA: {e}")
@@ -336,14 +357,10 @@ def run_pipeline():
             processed_tables += 1
             table_rows_processed = 0
 
-            # --- 🛡️ AJUSTE PARA ORDENAÇÃO EXATA ---
-            # Identifica a PK para forçar o ORDER BY no banco
             info = db_utils.get_table_info(src_engine, t, s)
             pks = info.get("primary_keys", [])
             pk_col = pks[0] if pks else None 
-            # -------------------------------------
 
-            # Passamos o pk_col para o streaming
             for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size, order_by=pk_col):
                 chunk_start = time.time()
                 rows = [dict(r) for r in chunk]
@@ -381,7 +398,6 @@ def run_pipeline():
                 total_rows += inserted_count
                 table_rows_processed += inserted_count
 
-                # Atualização de métricas (mantido o original)
                 chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
                 weighted_speed_samples.append(chunk_speed)
                 if len(weighted_speed_samples) > 30: weighted_speed_samples.pop(0)
