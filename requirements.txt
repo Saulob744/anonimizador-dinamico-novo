@@ -24,3 +24,24 @@ gliner>=0.2.0
 # Dependências comuns do gliner
 torch>=2.0
 transformers>=4.40
+faker
+pandas
+psutil
+psycopg2-binary
+pymysql
+python-dotenv
+sqlalchemy
+streamlit
+faker>=24.0
+gliner>=0.2.0
+pandas>=2.0
+psutil
+psycopg2-binary>=2.9
+pymysql>=1.1
+pyodbc>=5.0
+python-dotenv>=1.0
+spacy>=3.7
+sqlalchemy>=2.0
+streamlit>=1.30
+torch>=2.0
+transformers>=4.40
