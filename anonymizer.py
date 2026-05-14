@@ -10,6 +10,7 @@ from functools import lru_cache
 from faker import Faker
 from bs4 import BeautifulSoup
 import html
+import os
 
 # =========================================================
 # CONFIGURAÇÕES GLOBAIS E INICIALIZAÇÃO
@@ -83,7 +84,7 @@ def _ask_ollama_is_name(text: str) -> bool:
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False
-        }, timeout=2) # Timeout ajustado para respostas rápidas
+        }, timeout=40) # 
         
         if response.status_code == 200:
             answer = response.json().get("response", "").strip().upper()
