@@ -294,6 +294,7 @@ def should_anonymize_column(col_name: str, sample_values) -> bool:
     targets = ["nome", "vitima", "autor", "cpf", "rg", "placa", "condutor", "proprietario"]
     return any(k in c for k in targets)
 
+
 def reset_memory():
     _MAPPING_CACHE.clear()
     _USED_FAKES.clear()
