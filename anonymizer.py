@@ -60,9 +60,11 @@ MEDICAL_LEGAL_BLACKLIST = {
     "esquerda", "extensa", "fossa", "iliaca", "hipogastrio", "coxas", "viatura", "pessoa",
     "estrada", "pulm", "dorso", "instrumento", "contundente", "eviscera", "coracao",
     "cicatriz", "asa", "menor", "maior", "esfen", "tombamento", "laparotomia", "utero",
-    # Fragmentos e vazamentos recentes
     "regi", "neo", "falencia", "card", "pol", "lio", "ac", "sentido", "carlopolis", 
-    "tavora", "rodoviario", "federal", "passageira", "condutor", "identificado", "como", "policial"
+    "tavora", "rodoviario", "federal", "passageira", "condutor", "identificado", "como", "policial",
+    # Fragmentos corrompidos, acentos quebrados e Cidades da última execução
+    "munic", "pio", "decorr", "tico", "ncia", "clico", "ortod", "hemit", "presen", "avuls",
+    "foz", "igua", "moreira", "sales", "ouro", "verde", "cafezal", "sul", "portes", "vila"
 }
 
 # =========================================================
@@ -72,8 +74,8 @@ MEDICAL_LEGAL_BLACKLIST = {
 def _ask_ollama_is_name(text: str) -> bool:
     prompt = (
         f"Você é um juiz de dados ultrarigoroso. "
-        f"Responda APENAS 'SIM' se o texto a seguir for CLARAMENTE um nome próprio de pessoa humana. "
-        f"Responda 'NAO' se for parte do corpo, termo médico, cargo (ex: Policial, Soldado), cidade, fragmento de palavra ou qualquer outra coisa.\n"
+        f"Responda APENAS 'SIM' se o texto a seguir for CLARAMENTE um nome próprio completo de pessoa humana. "
+        f"Responda 'NAO' se for parte do corpo, termo médico, cargo (ex: Policial, Soldado), cidade, fragmento de palavra cortada, ou texto incompleto.\n"
         f"Texto: '{text}'"
     )
     try:
@@ -81,14 +83,15 @@ def _ask_ollama_is_name(text: str) -> bool:
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False
-        }, timeout=30)
+        }, timeout=2) # Timeout ajustado para respostas rápidas
         
         if response.status_code == 200:
             answer = response.json().get("response", "").strip().upper()
             return "SIM" in answer or "YES" in answer
     except Exception as e:
-        logger.warning(f"Ollama falhou ao analisar '{text}': {e}. Assumindo True por segurança.")
-        return True 
+        logger.warning(f"Ollama falhou ao analisar '{text}': {e}. Assumindo FALSE para evitar mascarar fragmentos.")
+        # Se a IA local travar ou demorar, NÃO mascara. (Segurança contra falsos positivos)
+        return False 
     
     return False
 
@@ -136,7 +139,6 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text.upper().strip())
 
 def _is_hallucination(ent_text: str) -> bool:
-    # Aumentado o rigor de tamanho: nomes isolados de 3 letras ou menos costumam ser lixo ou siglas
     if not ent_text or len(ent_text.strip()) <= 3: return True
     
     if not any(c.isupper() for c in ent_text): return True
