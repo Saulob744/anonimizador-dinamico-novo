@@ -62,36 +62,47 @@ MEDICAL_LEGAL_BLACKLIST = {
     "estrada", "pulm", "dorso", "instrumento", "contundente", "eviscera", "coracao",
     "cicatriz", "asa", "menor", "maior", "esfen", "tombamento", "laparotomia", "utero",
     "regi", "neo", "falencia", "card", "pol", "lio", "ac", "sentido", "carlopolis", 
-    "tavora", "rodoviario", "federal", "passageira", "condutor", "identificado", "como", "policial",
-    # Fragmentos corrompidos, acentos quebrados e Cidades da última execução
+    "tavora", "rodoviario", "federal", "passageira", "condutor", "identificado", "como", "policial","fratura",
     "munic", "pio", "decorr", "tico", "ncia", "clico", "ortod", "hemit", "presen", "avuls",
-    "foz", "igua", "moreira", "sales", "ouro", "verde", "cafezal", "sul", "portes", "vila"
+    "foz", "igua", "moreira", "sales", "ouro", "verde", "cafezal", "sul", "portes", "vila","munic", "pio", "decorr", "tico", "ncia", "clico", "ortod", "hemit", "presen", "avuls",
+    "foz", "igua", "moreira", "sales", "ouro", "verde", "cafezal", "sul", "portes", "vila",
+    "fcc", "cranioencef", "es", "tor", "mandirituba", "roque", "pinhal", 
+    "estava", "sendo", "conduzido", "conduzindo", "qual", "senhor", "senhora"
+    "rua","ES CRANIOENCEF", "avenida", "trevo", "cia", "batalhao", "veiculo", "placa", "placas", "gmvectra", "vectra", "bairro", "rodovia", "br", "km", "logradouro", "moto", "carro", "gm","costelas", "bilaterais", "toraco", "abdominais", "desloquei", "ate", "ponta", "grossa", 
+    "mandirituba", "guaratuba", "maringa", "stico", "fcc", "cranioencef", "cerebelar", 
+    "luxa", "abras", "rua", "avenida", "veiculo", "placa", "placas", "gmvectra", "qual", 
+    "estava", "sendo", "conduzido", "senhor", "senhora","acromio", "clavicular", "bra", "impress", "vel", "medio", "terco"
 }
 
+
 # =========================================================
-# INTEGRAÇÃO OLLAMA (O JUIZ FINAL)
+# INTEGRAÇÃO OLLAMA 
 # =========================================================
 @lru_cache(maxsize=10000)
 def _ask_ollama_is_name(text: str) -> bool:
     prompt = (
         f"Você é um juiz de dados ultrarigoroso. "
         f"Responda APENAS 'SIM' se o texto a seguir for CLARAMENTE um nome próprio completo de pessoa humana. "
-        f"Responda 'NAO' se for parte do corpo, termo médico, cargo (ex: Policial, Soldado), cidade, fragmento de palavra cortada, ou texto incompleto.\n"
+        f"Responda 'NAO' se for veículo, placa de carro, endereço, nome de rua, rodovia, empresa, instituição (como CIA), parte do corpo, termo médico, cargo, cidade, ou fragmento de texto.\n"
         f"Texto: '{text}'"
     )
+    
+    # Trava do proxy local 
+    proxies_vazios = {"http": "", "https": ""}
+    
     try:
         response = requests.post(OLLAMA_URL, json={
             "model": OLLAMA_MODEL,
             "prompt": prompt,
             "stream": False
-        }, timeout=40) # 
+        }, timeout=40, proxies=proxies_vazios)
         
         if response.status_code == 200:
             answer = response.json().get("response", "").strip().upper()
             return "SIM" in answer or "YES" in answer
+            
     except Exception as e:
         logger.warning(f"Ollama falhou ao analisar '{text}': {e}. Assumindo FALSE para evitar mascarar fragmentos.")
-        # Se a IA local travar ou demorar, NÃO mascara. (Segurança contra falsos positivos)
         return False 
     
     return False
@@ -118,9 +129,10 @@ NAME_REGEX = re.compile(
     r"(?![a-zA-ZÀ-ÿ])"
 )
 
-PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial)\s+", re.IGNORECASE)
+PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senhora|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial|rua|avenida|trevo|cia)\s+", re.IGNORECASE)
 
-# =========================================================
+# Corta sujeira no FINAL do nome (ex: "RUY SIM" -> "RUY", "GUSTAVO-PR" -> "GUSTAVO")
+SUFFIX_TRIMMER = re.compile(r"[-.,\s]+(sim|nao|e|com|pr|sc|sp|rs|mg|rj)$", re.IGNORECASE)# =========================================================
 # UTILITÁRIOS E FILTROS
 # =========================================================
 def _preprocess_text(text: str) -> str:
@@ -140,20 +152,42 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^\w\s]", "", text.upper().strip())
 
 def _is_hallucination(ent_text: str) -> bool:
-    if not ent_text or len(ent_text.strip()) <= 3: return True
-    
+    # LIMPEZA: Remove pontuações grudadas
+    ent_text = ent_text.strip(".,;:-\n ")
+
+    if not ent_text or len(ent_text) <= 3: return True
     if not any(c.isupper() for c in ent_text): return True
     if re.match(r"^([A-Z]\.){1,3}[A-Z]?$", ent_text.upper().strip()): return True
     
     labels_proibidas = {"COR DOS OLHOS", "FOTOS EM ANEXO", "DATA DE", "SEXO MASCULINO", "LAUDO"}
-    if ent_text.upper().strip() in labels_proibidas: return True
+    if ent_text.upper() in labels_proibidas: return True
 
     clean_text = _normalize(ent_text).lower()
     words = clean_text.split()
     
+    # TRAVA DE TAMANHO: Se tiver mais de 5 palavras, é uma frase, não um nome.
+    if len(words) > 5:
+        return True
+        
+    conectores_invalidos = {"com", "sem", "ao", "aos", "em", "no", "na", "pelo", "pela", "por", "para"}
+    if any(w in conectores_invalidos for w in words):
+        return True
+    
+    # TRAVA ESTÁTICA
     if any(w in MEDICAL_LEGAL_BLACKLIST for w in words):
         return True
+    termos_institucionais = {
+        "universidade", "faculdade", "escola", "colegio", "instituto", "fundacao", 
+        "prefeitura", "secretaria", "ministerio", "tribunal", "vara", "forum", 
+        "igreja", "paroquia", "banco", "unidade", "centro", "estado", "estadual", 
+        "federal", "municipal", "nacional", "departamento", "conselho", "clube",
+        "condominio", "edificio", "residencial", "comercial", "sindicato", "associacao", "CICO CONTUSO","CM DE EXENS","DO FEMUR DIR","dir", "esq", "inf", "sup", "ant", "post", "lat", "med", "prox", "dist",
+        "direito", "esquerdo", "inferior", "superior", "anterior", "posterior", "lateral", "medial"
+    }
+    if any(w in termos_institucionais for w in words):
+        return True
 
+    # ANÁLISE DO SPACY
     if nlp:
         test_doc = nlp(ent_text.lower())
         palavras_comuns = 0
@@ -166,6 +200,7 @@ def _is_hallucination(ent_text: str) -> bool:
         if palavras_validas and palavras_comuns == len(palavras_validas):
             return True
 
+    # JUIZ OLLAMA
     if not _ask_ollama_is_name(ent_text):
         return True 
 
@@ -178,10 +213,12 @@ def _detect_all(text: str, anon_loc: bool):
     found = []
     det_text = _preprocess_text(text)
 
+    # 1. Regex de Estruturas Fixas (CPF, Placas, etc)
     for typ, pat in REGEX.items():
         for match in pat.finditer(text):
             found.append((match.start(), match.end(), match.group(), typ))
 
+    # 2. SpaCy (Deixamos ele achar o que quiser)
     if nlp:
         doc = nlp(det_text)
         for ent in doc.ents:
@@ -190,12 +227,13 @@ def _detect_all(text: str, anon_loc: bool):
                 if not _is_hallucination(nome_limpo):
                     found.append((ent.start_char, ent.end_char, ent.text, "PER"))
 
+    # 3. Regex Customizada de Nomes (Deixamos ela achar o que quiser também)
     for match in NAME_REGEX.finditer(det_text):
         val = match.group().strip()
         val_clean = re.sub(r'\s+', ' ', val)
         if not _is_hallucination(val_clean):
-            if not any(s <= match.start() < e for s, e, v, t in found):
-                found.append((match.start(), match.end(), val, "PER"))
+            # Removemos a "trava" que impedia ele de adicionar nomes sobrepostos
+            found.append((match.start(), match.end(), val, "PER"))
 
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
@@ -203,6 +241,7 @@ def _detect_all(text: str, anon_loc: bool):
         if s >= last:
             clean.append((s, e, text[s:e], t))
             last = e
+            
     return clean
 
 # =========================================================

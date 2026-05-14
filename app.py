@@ -158,7 +158,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, pre_decisions=N
                 row_dict[col] = final_text
 
             except Exception as e:
-                print(f"[DEBUG GLINER] Falha ao processar texto na coluna '{col}': {e}")
+                print(f"[DEBUG IA] Falha ao processar texto na coluna '{col}': {e}")
                 row_dict[col] = old_str 
 
         processed.append(row_dict)
@@ -203,6 +203,9 @@ with st.sidebar:
     chunk_size = st.number_input("Chunk", value=1000, step=1000) 
     filter_tables = st.text_input("Filtrar tabelas (separadas por vírgula)")
     anon_geo = st.toggle("Mascara De GPS", value=True)
+
+    # NOVO: Toggle para ignorar duplicatas (resolve o erro de inserção que você teve)
+    ignorar_duplicatas = st.toggle("🔄 Ignorar Duplicatas (Evita Erros de Chave)", value=True, help="Se o banco de destino já tiver o registro, ele não quebra o pipeline, apenas ignora ou atualiza.")
 
     super_proc = st.toggle("🚀 Multi CPU (Atenção)", value=False)
     n_cores = st.slider("CPU", 1, db_utils.get_cpu_info(), db_utils.get_cpu_info()) if super_proc else 1
@@ -319,10 +322,11 @@ def run_pipeline():
     set_phase("Mapeando estruturas", "schemas e tabelas")
     if modo == "🛡️ Anonimização Total":
         try:
-            anonymizer.get_gliner() 
-            status.success("🧠 IA carregada com sucesso")
+            # NOVO: Chamada corrigida. Limpa o cache e avisa que está pronto.
+            anonymizer.reset_memory() 
+            status.success("🧠 Preparando motor de anonimização (Cache limpo)")
         except Exception as e:
-            debug_box.error(f"🚨 Falha ao carregar IA: {e}")
+            debug_box.error(f"🚨 Falha ao inicializar motor: {e}")
 
     schemas = db_utils.get_user_schemas(src_engine)
     allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
@@ -392,7 +396,8 @@ def run_pipeline():
                             debug_box.error(f"🚨 Erro na IA. Erro: {e}")
 
                 if rows:
-                    db_utils.insert_rows(dst_engine, t, s, rows)
+                    # NOVO: Passando o ignore_conflicts diretamente para o db_utils
+                    db_utils.insert_rows(dst_engine, t, s, rows, ignore_conflicts=ignorar_duplicatas)
 
                 inserted_count = len(rows)
                 total_rows += inserted_count

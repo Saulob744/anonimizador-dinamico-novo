@@ -8,12 +8,15 @@ import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text, Table, MetaData
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
+
+# Imports de dialetos para ignorar conflitos de forma nativa em múltiplos bancos
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 # Configuração de Logs
 logger = logging.getLogger(__name__)
 
-# O cache agora será mapeado usando a URL do banco para evitar colisão entre DBs diferentes
 _TABLE_CACHE: Dict[str, Table] = {}
 
 # ==================================================
@@ -44,29 +47,35 @@ def connect(url: str) -> Engine:
     backend = parsed.get_backend_name()
     admin_db = "postgres" if backend == "postgresql" else "master" if backend == "mssql" else None
     
+    # Tenta criar o banco de dados se tiver privilégios
     if admin_db:
         server_url = parsed.set(database=admin_db)
-        engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
-
-        create_queries = {
-            "postgresql": f'CREATE DATABASE "{db_name}"',
-            "mysql": f"CREATE DATABASE IF NOT EXISTS `{db_name}`",
-            "mssql": f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}') EXEC('CREATE DATABASE [{db_name}]')"
-        }
-        
         try:
+            engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
+            create_queries = {
+                "postgresql": f'CREATE DATABASE "{db_name}"',
+                "mysql": f"CREATE DATABASE IF NOT EXISTS `{db_name}`",
+                "mssql": f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}') EXEC('CREATE DATABASE [{db_name}]')"
+            }
+            
             with engine_server.connect() as conn:
                 if backend == "postgresql":
                     exists = conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": db_name}).scalar()
                     if not exists:
                         conn.execute(text(create_queries[backend]))
+                        logger.info(f"✅ Banco de dados '{db_name}' criado com sucesso.")
                 elif backend in create_queries:
                     conn.execute(text(create_queries[backend]))
+                    
+        except sa.exc.OperationalError as e:
+            logger.warning(f"⚠️ Não foi possível conectar ao banco admin ({admin_db}) para verificar/criar o banco '{db_name}'. O usuário pode não ter permissão.")
+        except sa.exc.ProgrammingError as e:
+            logger.warning(f"⚠️ Usuário sem privilégios para executar CREATE DATABASE. Assumindo que o banco '{db_name}' já existe.")
         except Exception as e:
-            logger.error(f"Erro ao criar DB: {e}")
-            raise
+            logger.error(f"⚠️ Erro ao tentar criar DB (Pode ser ignorado se o banco já existir): {e}")
         finally:
-            engine_server.dispose()
+            if 'engine_server' in locals():
+                engine_server.dispose()
 
     return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
@@ -103,12 +112,11 @@ def get_table_info(engine: Engine, table: str, schema: Optional[str] = None) -> 
 
 def get_table_count(engine: Engine, table: str, schema: Optional[str] = None) -> int:
     try:
-        # Usando SQLAlchemy Core ao invés de string crua
         tbl = Table(table, MetaData(), autoload_with=engine, schema=schema)
         with engine.connect() as conn:
             return conn.execute(sa.select(sa.func.count()).select_from(tbl)).scalar() or 0
     except Exception as e:
-        logger.warning(f"COUNT fallback {schema or 'default'}.{table}: {e}")
+        logger.warning(f"⚠️ COUNT fallback {schema or 'default'}.{table}: {e}")
         return 1000
 
 def get_user_schemas(engine: Engine) -> List[str]:
@@ -121,8 +129,11 @@ def get_user_schemas(engine: Engine) -> List[str]:
 # ==================================================
 def copy_schema(src_engine: Engine, dst_engine: Engine, schema: Optional[str] = None):
     if schema and get_db_type(dst_engine) == "postgresql":
-        with dst_engine.begin() as conn:
-            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        try:
+            with dst_engine.begin() as conn:
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        except Exception as e:
+            logger.warning(f"⚠️ Sem permissão para criar o schema '{schema}'. Tentando continuar... Erro: {e}")
 
     meta = MetaData()
     with src_engine.connect() as conn:
@@ -136,19 +147,16 @@ def copy_schema(src_engine: Engine, dst_engine: Engine, schema: Optional[str] = 
                     col.server_default = None
                 table.create(bind=conn, checkfirst=True)
             except Exception as e:
-                logger.warning(f"CREATE SKIP {schema or 'default'}.{table.name}: {e}")
+                logger.warning(f"⚠️ Falha ao criar tabela {schema or 'default'}.{table.name} (Pode já existir ou sem permissão). Erro: {e}")
 
 def fetch_rows_streaming(engine: Engine, table: str, schema: Optional[str] = None, chunk_size: int = 1000, order_by: Optional[str] = None) -> Generator:
-    # Usando SQLAlchemy Core para garantir sanitização e independência de banco
     meta = MetaData()
     tbl = Table(table, meta, autoload_with=engine, schema=schema)
     stmt = sa.select(tbl)
     
-    # Lógica aprimorada de ordenação
     if order_by:
         stmt = stmt.order_by(sa.column(order_by))
     else:
-        # Fallback inteligente: tentar ordenar pela(s) chave(s) primária(s) para garantir consistência
         pks = [c for c in tbl.primary_key.columns]
         if pks:
             stmt = stmt.order_by(*pks)
@@ -172,7 +180,6 @@ def _sanitize_row_data(table: Table, rows: List[Dict]) -> List[Dict]:
 def insert_rows(engine: Engine, table_name: str, schema: Optional[str] = None, rows: List[Dict] = None, max_retries: int = 3, ignore_conflicts: bool = False):
     if not rows: return
     
-    # Chave de cache mais robusta
     key = f"{engine.url}_{schema or 'default'}_{table_name}"
     if key not in _TABLE_CACHE:
         _TABLE_CACHE[key] = Table(table_name, MetaData(), autoload_with=engine, schema=schema)
@@ -185,14 +192,31 @@ def insert_rows(engine: Engine, table_name: str, schema: Optional[str] = None, r
             safe_rows = _sanitize_row_data(table, rows)
             
             with engine.begin() as conn:
-                if db_type == "postgresql" and ignore_conflicts:
-                    # Só usa on_conflict_do_nothing se explicitamente solicitado (evita gastar sequências à toa)
-                    stmt = pg_insert(table).values(safe_rows).on_conflict_do_nothing()
-                    conn.execute(stmt)
+                if ignore_conflicts:
+                    # Lida com conflitos de chave dependendo do banco de dados
+                    if db_type == "postgresql":
+                        stmt = pg_insert(table).values(safe_rows).on_conflict_do_nothing()
+                    elif db_type == "mysql":
+                        stmt = mysql_insert(table).values(safe_rows).on_duplicate_key_update(**{c.name: c for c in mysql_insert(table).inserted})
+                    elif db_type == "sqlite":
+                        stmt = sqlite_insert(table).values(safe_rows).on_conflict_do_nothing()
+                    else:
+                        # Fallback se o banco não suportar sintaxe específica de ignorar conflito
+                        stmt = table.insert().values(safe_rows)
                 else:
-                    # Insert padrão e limpo
-                    conn.execute(table.insert(), safe_rows)
-            return
+                    stmt = table.insert().values(safe_rows)
+
+                conn.execute(stmt)
+            return  # Sucesso, sai da função
+            
+        except sa.exc.IntegrityError as e:
+            # Se ignore_conflicts for True num banco genérico, apenas loga e ignora
+            if ignore_conflicts:
+                logger.warning(f"⚠️ Conflito de integridade ignorado em {table_name}.")
+                return
+            else:
+                logger.warning(f"⚠️ Erro de Integridade na tentativa {attempt+1} em {table_name}: {e}")
+                time.sleep(1)
         except Exception as e:
             logger.warning(f"⚠️ Erro tentativa {attempt+1} em {table_name}: {e}")
             time.sleep(1)
@@ -201,18 +225,22 @@ def insert_rows(engine: Engine, table_name: str, schema: Optional[str] = None, r
 
 def truncate_table(engine: Engine, table_name: str, schema: Optional[str] = None):
     if not table_exists(engine, schema, table_name):
-        logger.warning(f"⚠️ SKIP TRUNCATE (não existe): {schema or 'default'}.{table_name}")
         return
 
     table_ref = format_table_name(engine, schema, table_name)
-    main_query = f'TRUNCATE TABLE {table_ref} CASCADE' if get_db_type(engine) == "postgresql" else f'DELETE FROM {table_ref}'
-
+    
     with engine.begin() as conn:
         try:
-            conn.execute(text(main_query))
+            if get_db_type(engine) == "postgresql":
+                conn.execute(text(f'TRUNCATE TABLE {table_ref} CASCADE'))
+            else:
+                conn.execute(text(f'TRUNCATE TABLE {table_ref}'))
         except Exception as e:
-            logger.warning(f"TRUNCATE fallback em {schema or 'default'}.{table_name}: {e}")
-            conn.execute(text(f'DELETE FROM {table_ref}'))
+            logger.warning(f"⚠️ Falha no TRUNCATE para {table_ref}. Fallback para DELETE FROM. Erro: {e}")
+            try:
+                conn.execute(text(f'DELETE FROM {table_ref}'))
+            except Exception as delete_e:
+                logger.error(f"❌ Falha até no DELETE FROM para {table_ref}: {delete_e}")
 
 # ==================================================
 # DEPENDÊNCIAS
@@ -244,5 +272,8 @@ def build_dependency_graph(engine: Engine, tables: List[str], schema: Optional[s
 
 def set_replication_mode(engine: Engine, mode: str = 'replica'):
     if get_db_type(engine) == "postgresql":
-        with engine.begin() as conn:
-            conn.execute(text(f"SET session_replication_role = '{mode}'"))
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"SET session_replication_role = '{mode}'"))
+        except Exception as e:
+            logger.warning(f"⚠️ Sem privilégio (SUPERUSER) para alterar 'session_replication_role' para '{mode}'. As validações de chaves estrangeiras continuarão ativas.")
