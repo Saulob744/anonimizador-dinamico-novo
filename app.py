@@ -10,7 +10,6 @@ import time
 import psutil
 import os
 import pyodbc
-from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import difflib
 
@@ -33,7 +32,6 @@ st.markdown("""
     .stProgress .st-at { background-color: #00ffcc; }
     .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
     .var-display { background-color: #1e1e2e; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 5px solid #00ffcc; }
-    .tag-type { background-color: #00ffcc; color: #000; padding: 2px 8px; border-radius: 12px; font-size: 0.8rem; font-weight: bold; margin-left: 10px;}
     </style>
 """, unsafe_allow_html=True)
 
@@ -43,31 +41,18 @@ st.markdown("""
 def apply_gps_jitter(coord_str):
     try:
         coord_str = str(coord_str).strip()
-        # Se tiver ponto ou vírgula, é decimal (Float)
         if "." in coord_str or "," in coord_str:
             c = float(coord_str.replace(",", "."))
             return f"{c + random.uniform(-0.003, 0.003):.6f}"
         else:
-            # Se for um número inteiro (ex: -123321)
             c = int(coord_str)
-            # Soma um desvio inteiro para bagunçar a localização sem quebrar o formato
             return str(c + random.randint(-300, 300)) 
     except ValueError:
         return coord_str
 
-def generate_dynamic_code(original_str):
-    rng = random.Random(original_str)
-    return "".join(
-        rng.choice(string.ascii_uppercase) if c.isupper() else
-        rng.choice(string.ascii_lowercase) if c.islower() else
-        rng.choice(string.digits) if c.isdigit() else c
-        for c in original_str
-    )
-
 def split_text_into_chunks(text, max_tokens=300):
     words = text.split()
-    if len(words) <= max_tokens:
-        return [text]
+    if len(words) <= max_tokens: return [text]
     return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
 
 def build_url(db_type, user, password, host, port, db):
@@ -77,7 +62,6 @@ def build_url(db_type, user, password, host, port, db):
             odbc_str = rf"DRIVER={{{driver}}};SERVER=(localdb)\MSSQLLocalDB;DATABASE={db};Trusted_Connection=yes;"
             return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
         return f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
-    
     prefix = "postgresql+psycopg2" if db_type == "postgresql" else "mysql+pymysql"
     return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
 
@@ -85,13 +69,9 @@ def build_url(db_type, user, password, host, port, db):
 # PROCESSAMENTO CENTRAL
 # ==================================================
 def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=None):
-    if modo != "🛡️ Anonimização Total" or not rows:
-        return rows
-        
-    if col_profiles is None:
-        col_profiles = {}
+    if modo != "🛡️ Anonimização Total" or not rows: return rows
+    if col_profiles is None: col_profiles = {}
 
-    # Regex Utilitárias Fixas
     uuid_regex = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
     html_regex = re.compile(r"<[^>]+>|&[a-zA-Z0-9#]+;")
 
@@ -100,77 +80,46 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
         row_dict = dict(r)
 
         for col, old in row_dict.items():
+            # ⚡ REMOVIDO: 'int' e 'float'. Agora o sistema NÃO ignora CPFs ou GPS numéricos!
             if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool']:
                 continue
 
             old_str = str(old).strip()
-
-            if uuid_regex.match(old_str):
-                continue 
-
-            if not target_columns or col not in target_columns:
-                continue
+            if not old_str or uuid_regex.match(old_str): continue 
+            if not target_columns or col not in target_columns: continue
                         
-            # Descobre o perfil da coluna levantado no Passo 1
             tipo_perfil = col_profiles.get(col, "DESCONHECIDO")
 
             try:
-                # ==================================================
                 # ⚡ DESVIO EXPRESSO (FAST-PATH)
-                # ==================================================
                 if tipo_perfil in ["GPS", "GPS_SINGLE"]:
-                    if not anon_geo:
-                        continue 
+                    if not anon_geo: continue 
                     if "," in old_str:
                         partes = old_str.split(",")
-                        if len(partes) >= 2:
-                            row_dict[col] = f"{apply_gps_jitter(partes[0])}, {apply_gps_jitter(partes[1])}"
+                        if len(partes) >= 2: row_dict[col] = f"{apply_gps_jitter(partes[0])}, {apply_gps_jitter(partes[1])}"
                     else:
                         row_dict[col] = apply_gps_jitter(old_str)
-                    
-                    print(f"⚡ [FAST-PATH | {col}] Coordenada GPS ocultada")
+                    print(f"⚡ [FAST-PATH | {col}] GPS Ocultado")
                     continue
                     
-                elif tipo_perfil == "CPF":
-                    row_dict[col] = anonymizer._get_fake(old_str, "CPF")
-                    print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
-                    continue
-                elif tipo_perfil == "RG":
-                    row_dict[col] = anonymizer._get_fake(old_str, "RG")
-                    print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
-                    continue
-                elif tipo_perfil == "PLACA":
-                    row_dict[col] = anonymizer._get_fake(old_str, "PLATE")
-                    print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
-                    continue
-                elif tipo_perfil == "EMAIL":
-                    row_dict[col] = anonymizer._get_fake(old_str, "EMAIL")
-                    print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
-                    continue
-                elif tipo_perfil == "NOME_SOLTO":
-                    row_dict[col] = anonymizer._get_fake(old_str, "PER")
-                    print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
-                    continue
-                elif tipo_perfil == "RENAVAM":
-                    row_dict[col] = anonymizer._get_fake(old_str, "RENAVAM")
-                    print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
-                    continue
-                elif tipo_perfil == "MATRICULA":
-                    row_dict[col] = anonymizer._get_fake(old_str, "MATRICULA")
+                elif tipo_perfil in ["CPF", "RG", "PLACA", "EMAIL", "NOME_SOLTO", "RENAVAM", "MATRICULA", "PHONE"]:
+                    # Mapeando a chave do Faker baseada no Perfil
+                    faker_key = tipo_perfil
+                    if tipo_perfil == "PLACA": faker_key = "PLATE"
+                    elif tipo_perfil == "NOME_SOLTO": faker_key = "PER"
+
+                    row_dict[col] = anonymizer._get_fake(old_str, faker_key)
                     print(f"⚡ [FAST-PATH | {col}] {old_str} ➡️ {row_dict[col]}")
                     continue
 
-                # ==================================================
-                # 🛡️ IA PESADA APENAS PARA TEXTO_LIVRE E DESCONHECIDO
-                # ==================================================
+                # 🛡️ TEXTO LIVRE E DESCONHECIDOS (PENTE FINO COM IA)
                 vault = {}
                 def hide(match):
                     token = f"__SHLD{len(vault)}__"
                     vault[token] = match.group(0)
                     return f" {token} "
 
-                safe_text = old_str
-                safe_text = html_regex.sub(hide, safe_text)
+                safe_text = html_regex.sub(hide, old_str)
                 safe_text = re.sub(r'\s+', ' ', safe_text).strip()
                 
                 chunks = split_text_into_chunks(safe_text)
@@ -188,48 +137,37 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
                                 termo_falso = " ".join(str_new_val.split()[j1:j2])
                                 if "__SHLD" not in termo_original:
                                     print(f"🕵️ [IA | {col}] {termo_original} ➡️ {termo_falso}")
-                    
                     anon_chunks.append(str_new_val)
                 
                 final_text = " ".join(anon_chunks)
-
                 for token, original in vault.items():
                     final_text = final_text.replace(f" {token} ", original).replace(token, original)
 
                 row_dict[col] = final_text
 
             except Exception as e:
-                print(f"[DEBUG IA] Falha ao processar texto na coluna '{col}': {e}")
+                print(f"[DEBUG IA] Falha ao processar coluna '{col}': {e}")
                 row_dict[col] = old_str 
 
         processed.append(row_dict)
-
     return processed
 
 # ==================================================
 # ESTADO DA UI & MENU LATERAL
 # ==================================================
-if "colunas_para_anonimizar" not in st.session_state:
-    st.session_state.colunas_para_anonimizar = []
-if "analise_concluida" not in st.session_state:
-    st.session_state.analise_concluida = False
-if "colunas_selecionadas_finais" not in st.session_state:
-    st.session_state.colunas_selecionadas_finais = []
-if "todas_colunas_disponiveis" not in st.session_state:
-    st.session_state.todas_colunas_disponiveis = []
-if "colunas_ignoradas" not in st.session_state:
-    st.session_state.colunas_ignoradas = []
-if "colunas_perfiladas" not in st.session_state:
-    st.session_state.colunas_perfiladas = {}
+if "analise_concluida" not in st.session_state: st.session_state.analise_concluida = False
+if "todas_colunas_disponiveis" not in st.session_state: st.session_state.todas_colunas_disponiveis = []
+if "colunas_ignoradas" not in st.session_state: st.session_state.colunas_ignoradas = []
+if "colunas_perfiladas" not in st.session_state: st.session_state.colunas_perfiladas = {}
+if "colunas_selecionadas_finais" not in st.session_state: st.session_state.colunas_selecionadas_finais = []
 
 start_btn = False
 
 with st.sidebar:
     st.title("🛡️ Aegis Control")
-    db_type = st.selectbox("Tipo de Banco de Dados", ["postgresql", "mysql", "mssql"])
+    db_type = st.selectbox("Banco de Dados", ["postgresql", "mysql", "mssql"])
 
     aba_origem, aba_destino = st.tabs(["🔴 Origem", "🟢 Destino"])
-
     def render_db_form(prefix):
         return {
             "host": st.text_input("Host", value="localhost", key=f"{prefix}_host"),
@@ -244,25 +182,22 @@ with st.sidebar:
 
     modo = st.selectbox("Modo", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
     chunk_size = st.number_input("Chunk", value=1000, step=1000) 
-    filter_tables = st.text_input("Filtrar tabelas (separadas por vírgula)")
+    filter_tables = st.text_input("Filtrar tabelas (vírgula)")
     anon_geo = st.toggle("Mascara De GPS", value=True)
-
-    ignorar_duplicatas = st.toggle("🔄 Ignorar Duplicatas (Evita Erros)", value=True)
-
-    super_proc = st.toggle("🚀 Multi CPU (Atenção)", value=False)
+    ignorar_duplicatas = st.toggle("🔄 Ignorar Duplicatas", value=True)
+    super_proc = st.toggle("🚀 Multi CPU", value=False)
     n_cores = st.slider("CPU", 1, db_utils.get_cpu_info(), db_utils.get_cpu_info()) if super_proc else 1
 
     st.divider()
     btn_analisar = st.button("1. Analisar Estrutura", use_container_width=True)
     
     if btn_analisar:
-        with st.spinner("Analisando banco de dados e perfilando colunas com IA..."):
+        with st.spinner("Analisando banco e perfilando colunas com IA..."):
             try:
                 src_engine = db_utils.connect(build_url(db_type, **src_cfg))
                 schemas = db_utils.get_user_schemas(src_engine)
                 allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
                 
-                sugeridas_set = set()
                 todas_set = set()
                 perfis_detectados = {}
                 
@@ -272,7 +207,7 @@ with st.sidebar:
                         valid_tables = [t for t in tables if not allowed or t in allowed]
                         
                         for table in valid_tables:
-                            chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema, 50)
+                            chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema, 100)
                             primeiro_lote = next(chunk_gen, [])
                             
                             if primeiro_lote:
@@ -283,57 +218,29 @@ with st.sidebar:
                                     todas_set.add(col)
                                     valores = [r.get(col) for r in rows_dict if r.get(col) is not None]
                                     
-                                    # AQUI OCORRE A MÁGICA DO PROFILING
+                                    # O CÉREBRO CENTRALIZADO (Sem regras misturadas no app.py)
                                     tipo_dado = anonymizer.profile_column_type(col, valores)
                                     
                                     if tipo_dado != "IGNORAR":
-                                        sugeridas_set.add(col)
                                         perfis_detectados[col] = tipo_dado
-                                    # Fallback de segurança pelo nome da coluna (Blindagem final)
-                                    elif anonymizer.should_anonymize_column(col, []):
-                                        sugeridas_set.add(col)
-                                        c_lower = col.lower()
-                                        if "cpf" in c_lower: 
-                                            perfis_detectados[col] = "CPF"
-                                        elif "rg" in c_lower: 
-                                            perfis_detectados[col] = "RG"
-                                        elif "placa" in c_lower: 
-                                            perfis_detectados[col] = "PLACA"
-                                        elif "email" in c_lower or "e-mail" in c_lower or "mail" in c_lower: 
-                                            perfis_detectados[col] = "EMAIL"
-                                        elif any(k in c_lower for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): 
-                                            perfis_detectados[col] = "NOME_SOLTO"
-                                        elif "renavam" in c_lower:
-                                            perfis_detectados[col] = "RENAVAM"
-                                        elif "matricula" in c_lower:
-                                            perfis_detectados[col] = "MATRICULA"
-                                        elif any(k in c_lower for k in ["lat", "lon", "gps", "coord"]):
-                                            perfis_detectados[col] = "GPS_SINGLE"
-                                        else:
-                                            perfis_detectados[col] = "DESCONHECIDO"
                 
                 todas = sorted(list(todas_set))
-                sugeridas = sorted(list(sugeridas_set))
-                
                 st.session_state.todas_colunas_disponiveis = todas if todas else []
-                st.session_state.colunas_para_anonimizar = sugeridas if sugeridas else []
                 st.session_state.colunas_perfiladas = perfis_detectados
                 st.session_state.analise_concluida = True
-                st.success(f"✅ Encontradas {len(todas)} colunas. {len(sugeridas)} perfiladas para IA.")
+                st.success(f"✅ Encontradas {len(todas)} colunas. {len(perfis_detectados)} alvos mapeados.")
             except Exception as e:
                 st.error(f"Erro ao analisar banco: {e}")
 
     if st.session_state.analise_concluida:
         st.markdown("### Selecione as Exceções")
-        st.info("⚠️ Escolha abaixo apenas as colunas que devem ser **IGNORADAS** pelo sistema.")
+        st.info("⚠️ Escolha apenas as colunas que devem ser **IGNORADAS** pelo sistema.")
         
         opcoes_validas = st.session_state.todas_colunas_disponiveis
+        # Preenche automaticamente com as colunas que não entraram no perfis_detectados
+        sugeridas_ignorar = [c for c in opcoes_validas if c not in st.session_state.colunas_perfiladas]
         
-        colunas_ignoradas = st.multiselect(
-            "Colunas que NÃO serão alteradas:",
-            options=opcoes_validas, 
-            default=st.session_state.colunas_ignoradas
-        )
+        colunas_ignoradas = st.multiselect("NÃO serão alteradas:", options=opcoes_validas, default=sugeridas_ignorar)
         st.session_state.colunas_ignoradas = colunas_ignoradas
         
         colunas_finais = [col for col in opcoes_validas if col not in colunas_ignoradas]
@@ -351,21 +258,18 @@ if st.session_state.analise_concluida:
     with st.expander("👁️ Ver Perfilamento da IA", expanded=True):
         st.markdown("<div class='var-display'>", unsafe_allow_html=True)
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total de Colunas Lidas", len(st.session_state.todas_colunas_disponiveis))
-        col2.metric("Colunas Ignoradas", len(st.session_state.colunas_ignoradas))
+        col1.metric("Total Lidas", len(st.session_state.todas_colunas_disponiveis))
+        col2.metric("Ignoradas", len(st.session_state.colunas_ignoradas))
         
         qtd_alvo = len(st.session_state.todas_colunas_disponiveis) - len(st.session_state.colunas_ignoradas)
-        col3.metric("Alvos da IA (A Processar)", qtd_alvo)
+        col3.metric("A Processar", qtd_alvo)
         
         st.markdown("**🎯 Tipos Detectados:**")
         if qtd_alvo > 0:
             for c in st.session_state.todas_colunas_disponiveis:
-                if c not in st.session_state.colunas_ignoradas:
-                    tipo = st.session_state.colunas_perfiladas.get(c, "IGNORADO")
-                    cor = "green" if tipo in ["CPF", "RG", "NOME_SOLTO", "EMAIL", "PLACA", "RENAVAM", "MATRICULA", "GPS", "GPS_SINGLE"] else "orange" if tipo == "TEXTO_LIVRE" else "gray"
-                    st.markdown(f"- **{c}**: <span style='color:{cor}; font-weight:bold;'>[{tipo}]</span>", unsafe_allow_html=True)
-        else:
-            st.warning("Nenhuma coluna selecionada para processamento.")
+                tipo = st.session_state.colunas_perfiladas.get(c, "IGNORADO")
+                cor = "green" if tipo in ["CPF", "RG", "NOME_SOLTO", "EMAIL", "PLACA", "RENAVAM", "MATRICULA", "GPS", "GPS_SINGLE", "PHONE"] else "orange" if tipo == "TEXTO_LIVRE" else "gray"
+                st.markdown(f"- **{c}**: <span style='color:{cor}; font-weight:bold;'>[{tipo}]</span>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 debug_box = st.empty() 
@@ -388,28 +292,21 @@ def run_pipeline():
         status.info(f"🔷 Fase {current_phase}/{phase_total} • {title} ({subtitle})")
         progress_bar.progress(min((current_phase - 1) / phase_total * 0.25, 0.25))
 
-    set_phase("Conectando bancos de dados", "estabelecendo conexões")
+    set_phase("Conectando bancos", "estabelecendo conexões")
     src_engine = db_utils.connect(build_url(db_type, **src_cfg))
     dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
     db_utils.set_replication_mode(dst_engine, "replica")
 
     set_phase("Mapeando estruturas", "schemas e tabelas")
-    if modo == "🛡️ Anonimização Total":
-        try:
-            anonymizer.reset_memory() 
-            status.success("🧠 Preparando motor de anonimização (Cache limpo)")
-        except Exception as e:
-            debug_box.error(f"🚨 Falha ao inicializar motor: {e}")
+    if modo == "🛡️ Anonimização Total": anonymizer.reset_memory() 
 
     schemas = db_utils.get_user_schemas(src_engine)
     allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
-    work_list = []
-    total_estimated, total_tables = 0, 0
+    work_list, total_estimated, total_tables = [], 0, 0
 
     for s in schemas:
         db_utils.copy_schema(src_engine, dst_engine, s)
         tables = [t for t in db_utils.get_tables(src_engine, s) if not allowed or t in allowed]
-        
         ordered = db_utils.build_dependency_graph(src_engine, tables, s)
         for t in ordered:
             count = db_utils.get_table_count(src_engine, t, s)
@@ -418,12 +315,11 @@ def run_pipeline():
             total_tables += 1
 
     if total_estimated == 0:
-        debug_box.warning("⚠️ Nenhuma linha encontrada nas tabelas de origem! Verifique o banco fonte.")
+        debug_box.warning("⚠️ Nenhuma linha encontrada nas tabelas!")
         return
 
-    set_phase("Preparando destino", "limpeza de tabelas")
-    for s, t, _ in reversed(work_list):
-        db_utils.truncate_table(dst_engine, t, s)
+    set_phase("Preparando destino", "limpeza")
+    for s, t, _ in reversed(work_list): db_utils.truncate_table(dst_engine, t, s)
 
     set_phase("Executando pipeline", "processamento e carga")
     total_rows, processed_tables, last_ui_update = 0, 0, 0
@@ -432,11 +328,8 @@ def run_pipeline():
     with ProcessPoolExecutor(max_workers=n_cores) as executor:
         for s, t, t_count in work_list:
             processed_tables += 1
-            table_rows_processed = 0
-
             info = db_utils.get_table_info(src_engine, t, s)
-            pks = info.get("primary_keys", [])
-            pk_col = pks[0] if pks else None 
+            pk_col = info.get("primary_keys", [None])[0]
 
             for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size, order_by=pk_col):
                 chunk_start = time.time()
@@ -446,36 +339,20 @@ def run_pipeline():
                     if n_cores > 1:
                         sub_sz = max(1, len(rows) // n_cores)
                         sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
-                        
-                        #  Enviando os perfis para as threads
-                        futures = [
-                            executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols, perfis)
-                            for sub_chunk in sub_chunks
-                        ]
-                        
+                        futures = [executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols, perfis) for sub_chunk in sub_chunks]
                         rows = []
                         for original_chunk, f in zip(sub_chunks, futures):
-                            try: 
-                                result = f.result()
-                                if result: rows.extend(result)
-                                else: rows.extend(original_chunk)
+                            try: rows.extend(f.result() or original_chunk)
                             except Exception as e: 
-                                debug_box.error(f"🚨 Erro crítico no worker. Erro: {e}")
+                                debug_box.error(f"🚨 Erro worker: {e}")
                                 rows.extend(original_chunk)
                     else:
-                        try:
-                            # Enviando os perfis na thread principal
-                            res = process_chunk_parallel(rows, modo, anon_geo, target_cols, perfis)
-                            if res: rows = res
-                        except Exception as e:
-                            debug_box.error(f"🚨 Erro na IA. Erro: {e}")
+                        rows = process_chunk_parallel(rows, modo, anon_geo, target_cols, perfis) or rows
 
-                if rows:
-                    db_utils.insert_rows(dst_engine, t, s, rows, ignore_conflicts=ignorar_duplicatas)
+                if rows: db_utils.insert_rows(dst_engine, t, s, rows, ignore_conflicts=ignorar_duplicatas)
 
                 inserted_count = len(rows)
                 total_rows += inserted_count
-                table_rows_processed += inserted_count
 
                 chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
                 weighted_speed_samples.append(chunk_speed)
@@ -487,13 +364,7 @@ def run_pipeline():
                     stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
                     total_progress = min(0.25 + ((total_rows / max(total_estimated, 1)) * 0.75), 1.0)
                     
-                    metric_placeholder.markdown(f"""
-                    ### 📊 Progresso do Pipeline
-                    - 📂 Tabela: **{processed_tables}/{total_tables}**
-                    - 🧮 Registros: **{total_rows:,} / {total_estimated:,}**
-                    - ⚡ Velocidade: **{stable_speed:,.0f} linhas/s**
-                    - ⏱️ Tempo: **{elapsed:.1f}s**
-                    """)
+                    metric_placeholder.markdown(f"### 📊 Progresso\n- 📂 Tabela: **{processed_tables}/{total_tables}**\n- 🧮 Registros: **{total_rows:,} / {total_estimated:,}**\n- ⚡ Vel: **{stable_speed:,.0f} linhas/s**")
                     progress_bar.progress(total_progress)
                     last_ui_update = now
 
@@ -506,4 +377,4 @@ if start_btn:
         run_pipeline()
         st.balloons()
     except Exception as e:
-        debug_box.error(f"🚨 Erro Fatal no Pipeline: {e}")
+        debug_box.error(f"🚨 Erro Fatal: {e}")

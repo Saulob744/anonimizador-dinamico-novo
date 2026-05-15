@@ -16,23 +16,18 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 # ==================================================
 # LOGS
 # ==================================================
-
 logger = logging.getLogger(__name__)
 
 _TABLE_CACHE: Dict[str, Table] = {}
-
 # ==================================================
 # ENCODING / SANITIZAÇÃO
 # ==================================================
-
 def safe_decode(value):
     """
     Corrige problemas de encoding sem derrubar pipeline.
     """
-
     if value is None:
         return None
-
     # bytes -> utf8 -> latin1 -> replace
     if isinstance(value, bytes):
         try:
@@ -56,40 +51,30 @@ def safe_decode(value):
 
     return value
 
-
 # ==================================================
 # PERFORMANCE E CPU
 # ==================================================
-
 def get_cpu_info() -> int:
     return os.cpu_count() or 1
-
 
 def calculate_safe_workers(
     requested_cores: Optional[int] = None
 ) -> int:
 
     total = get_cpu_info()
-
     if requested_cores:
         return min(requested_cores, total)
-
     return max(1, int(total * 0.75))
-
 
 # ==================================================
 # CONEXÃO E BANCO
 # ==================================================
-
 def connect(url: str) -> Engine:
-
     parsed = make_url(url)
-
     if "odbc_connect" in url:
         logger.warning(
             "⚠️ ODBC detectado → usando conexão direta"
         )
-
         return create_engine(
             url,
             pool_pre_ping=True,
@@ -111,30 +96,22 @@ def connect(url: str) -> Engine:
         if backend == "mssql"
         else None
     )
-
     # ==================================================
     # CRIAÇÃO DE DATABASE
-    # ==================================================
-
+    # =================================================
     if admin_db:
-
         server_url = parsed.set(database=admin_db)
-
         try:
-
             engine_server = create_engine(
                 server_url,
                 isolation_level="AUTOCOMMIT",
                 future=True
             )
-
             create_queries = {
                 "postgresql":
                     f'CREATE DATABASE "{db_name}"',
-
                 "mysql":
                     f"CREATE DATABASE IF NOT EXISTS `{db_name}`",
-
                 "mssql":
                     f"""
                     IF NOT EXISTS (
@@ -145,11 +122,9 @@ def connect(url: str) -> Engine:
                     EXEC('CREATE DATABASE [{db_name}]')
                     """
             }
-
             with engine_server.connect() as conn:
 
                 if backend == "postgresql":
-
                     exists = conn.execute(
                         text(
                             """
@@ -169,44 +144,34 @@ def connect(url: str) -> Engine:
                         logger.info(
                             f"✅ Banco '{db_name}' criado."
                         )
-
                 elif backend in create_queries:
-
                     conn.execute(
                         text(create_queries[backend])
                     )
-
         except sa.exc.OperationalError:
             logger.warning(
                 f"⚠️ Sem acesso ao banco admin "
                 f"para criar/verificar '{db_name}'."
             )
-
         except sa.exc.ProgrammingError:
             logger.warning(
                 f"⚠️ Sem permissão CREATE DATABASE "
                 f"para '{db_name}'."
             )
-
         except Exception as e:
             logger.error(
                 f"⚠️ Erro ao criar/verificar DB: {e}"
             )
-
         finally:
 
             if "engine_server" in locals():
                 engine_server.dispose()
-
     # ==================================================
     # ENGINE PRINCIPAL
     # ==================================================
-
     connect_args = {}
-
     if backend == "postgresql":
         connect_args["client_encoding"] = "utf8"
-
     return create_engine(
         url,
         pool_pre_ping=True,
@@ -215,23 +180,18 @@ def connect(url: str) -> Engine:
         connect_args=connect_args
     )
 
-
 # ==================================================
 # INSPEÇÃO
 # ==================================================
-
 def get_db_type(engine: Engine) -> str:
     return engine.dialect.name
-
 
 def format_table_name(
     engine: Engine,
     schema: Optional[str],
     table: str
 ) -> str:
-
     db_type = get_db_type(engine)
-
     if not schema:
         return (
             f"`{table}`"
@@ -249,37 +209,30 @@ def format_table_name(
         f'"{schema}"."{table}"'
     )
 
-
 def table_exists(
     engine: Engine,
     schema: Optional[str],
     table: str
 ) -> bool:
-
     return inspect(engine).has_table(
         table,
         schema=schema
     )
 
-
 def get_tables(
     engine: Engine,
     schema: Optional[str] = None
 ) -> List[str]:
-
     return sorted(
         inspect(engine).get_table_names(schema=schema)
     )
-
 
 def get_table_info(
     engine: Engine,
     table: str,
     schema: Optional[str] = None
 ) -> Dict[str, Any]:
-
     insp = inspect(engine)
-
     return {
         "columns":
             insp.get_columns(table, schema=schema),
@@ -297,13 +250,11 @@ def get_table_info(
             )
     }
 
-
 def get_table_count(
     engine: Engine,
     table: str,
     schema: Optional[str] = None
 ) -> int:
-
     try:
 
         tbl = Table(
@@ -312,108 +263,79 @@ def get_table_count(
             autoload_with=engine,
             schema=schema
         )
-
         with engine.connect() as conn:
-
             return conn.execute(
                 sa.select(sa.func.count())
                 .select_from(tbl)
             ).scalar() or 0
-
     except Exception as e:
-
         logger.warning(
             f"⚠️ COUNT fallback "
             f"{schema or 'default'}.{table}: {e}"
         )
-
         return 1000
 
-
 def get_user_schemas(engine: Engine) -> List[str]:
-
     db_type = get_db_type(engine)
     insp = inspect(engine)
-
     ignored = (
         {"information_schema", "pg_catalog", "pg_toast"}
         if db_type == "postgresql"
         else {"information_schema"}
     )
-
     return sorted([
         s for s in insp.get_schema_names()
         if s not in ignored and not s.startswith("pg_")
     ])
 
-
 # ==================================================
 # SCHEMA
 # ==================================================
-
 def copy_schema(
     src_engine: Engine,
     dst_engine: Engine,
     schema: Optional[str] = None
 ):
-
     if (
         schema
         and get_db_type(dst_engine) == "postgresql"
     ):
-
         try:
-
             with dst_engine.begin() as conn:
-
                 conn.execute(
                     text(
                         f'CREATE SCHEMA IF NOT EXISTS "{schema}"'
                     )
                 )
-
         except Exception as e:
 
             logger.warning(
                 f"⚠️ Sem permissão para criar "
                 f"schema '{schema}': {e}"
             )
-
     meta = MetaData()
-
     with src_engine.connect() as conn:
-
         meta.reflect(
             bind=conn,
             schema=schema,
             resolve_fks=False
         )
-
     with dst_engine.begin() as conn:
-
         for table in meta.sorted_tables:
-
             try:
-
                 table.schema = schema
-
                 for col in table.columns:
                     col.server_default = None
-
                 table.create(
                     bind=conn,
                     checkfirst=True
                 )
-
             except Exception as e:
-
                 logger.warning(
                     f"⚠️ Falha criar tabela "
                     f"{schema or 'default'}."
                     f"{table.name}: {e}"
                 )
-
-
 # ==================================================
 # STREAMING
 # ==================================================
