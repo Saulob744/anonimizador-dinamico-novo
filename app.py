@@ -413,8 +413,29 @@ def run_pipeline():
     status.success(msg_sucesso)
 
 if start_btn:
-    try:
-        run_pipeline()
-        st.balloons()
-    except Exception as e:
-        debug_box.error(f"🚨 Erro Fatal: {e}")
+    # ⚡ DEFESA 1: Prevenção de Autofill Teimoso
+    if src_cfg["db"] == src_cfg["user"] or dst_cfg["db"] == dst_cfg["user"]:
+        st.warning("⚠️ Atenção: O nome do banco de dados está idêntico ao nome de usuário. O seu navegador pode ter preenchido isso automaticamente por engano. Por favor, verifique os campos 'Banco' nas abas Origem e Destino.")
+    elif not src_cfg["db"] or not dst_cfg["db"]:
+        st.warning("⚠️ Atenção: O campo 'Banco' não pode ficar vazio.")
+    else:
+        try:
+            run_pipeline()
+            st.balloons()
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # ⚡ DEFESA 2: Tratamento Elegante do erro do pg_hba.conf
+            if "pg_hba.conf rejects" in error_str:
+                debug_box.error(
+                    "🚨 Acesso Negado pelo Banco de Dados!\n\n"
+                    "O servidor rejeitou a conexão. O usuário está sem permissão "
+                    "ou o nome do 'Banco' digitado está errado (talvez preenchido sozinho pelo navegador)."
+                )
+            elif "database" in error_str and "does not exist" in error_str:
+                debug_box.error(
+                    "🚨 Banco de Dados não encontrado!\n\n"
+                    "Verifique se você digitou o nome do Banco corretamente nas abas de conexão."
+                )
+            else:
+                debug_box.error(f"🚨 Erro Fatal: {e}")
