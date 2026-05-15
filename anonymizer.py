@@ -116,25 +116,39 @@ def profile_column_type(col_name: str, values_sample: list) -> str:
     try:
         c = str(col_name).lower().strip()
         
-        blacklist = ["cidade", "municipio", "bairro", "estado", "uf", "pais", "cep", "papel", "prefixo", "status", "situacao", "tipo", "cor", "marca", "modelo", "id", "uuid", "guid", "created_at", "updated_at"]
-        if c in blacklist or c.endswith("_id") or c.startswith("id_") or c == "id":
+        
+        c_words = set(c.replace("_", " ").replace("-", " ").split())
+        
+        blacklist = {"cidade", "municipio", "bairro", "estado", "uf", "pais", "cep", "papel", "prefixo", "status", "situacao", "tipo", "cor", "marca", "modelo", "id", "uuid", "guid", "created_at", "updated_at"}
+        
+   
+        if c in blacklist or "id" in c_words or c.endswith("id"):
             return "IGNORAR"
             
-        if "pix" in c or "chave" in c:
+        if "pix" in c_words or "chave" in c_words:
             return "TEXTO_LIVRE"
             
-        if any(k in c for k in ["lat", "lon", "gps", "coord", "geo", "loc"]): 
+        
+        if any(k in c_words for k in ["lat", "latitude", "lon", "longitude", "gps", "coord", "coordenada", "geo", "loc"]): 
             return "GPS_SINGLE"
             
-        if "cpf" in c: return "CPF"
-        if "rg" in c: return "RG"
-        if "placa" in c: return "PLACA"
-        if "email" in c or "mail" in c: return "EMAIL"
-        if "renavam" in c: return "RENAVAM"
-        if "matricula" in c: return "MATRICULA"
-        if "telefone" in c or "celular" in c or "fone" in c: return "PHONE"
-        if any(k in c for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): return "NOME_SOLTO"
+        if "cpf" in c_words or "cpf" in c: return "CPF"
+        
+       
+        if "rg" in c_words or c == "rg": return "RG"
+        
+        if "placa" in c_words or "placa" in c: return "PLACA"
+        if "email" in c_words or "mail" in c_words or "email" in c: return "EMAIL"
+        if "renavam" in c_words or "renavam" in c: return "RENAVAM"
+        if "matricula" in c_words or "matricula" in c: return "MATRICULA"
+        
+        # Telefones (evitando que "microfone" ative "fone")
+        if "telefone" in c_words or "celular" in c_words or "fone" in c_words: return "PHONE"
+        
+        # Nomes (evitando que "fenomeno" ative "nome")
+        if any(k in c_words for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): return "NOME_SOLTO"
 
+        # === Se falhou em prever pelo nome, manda a IA olhar os valores ===
         valid_strings = [str(v) for v in values_sample if v is not None and str(v).strip() != ""]
         if not valid_strings: return "IGNORAR"
             
@@ -150,6 +164,10 @@ def profile_column_type(col_name: str, values_sample: list) -> str:
             return max(hits_validos, key=hits_validos.get)
             
         return "DESCONHECIDO"
+
+    except Exception as e:
+        logger.critical(f"🚨 [ERRO FATAL] Colapso no Profiler na coluna '{col_name}': {e}")
+        raise
 
     except Exception as e:
         # ⚡ AJUSTE: Erro fatal disparado APENAS se a lógica de profiling colapsar.
