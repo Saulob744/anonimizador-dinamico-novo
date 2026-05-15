@@ -100,7 +100,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
         row_dict = dict(r)
 
         for col, old in row_dict.items():
-            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool', 'int', 'float']:
+            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool']:
                 continue
 
             old_str = str(old).strip()
