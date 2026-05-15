@@ -80,7 +80,6 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
         row_dict = dict(r)
 
         for col, old in row_dict.items():
-            # ⚡ REMOVIDO: 'int' e 'float'. Agora o sistema NÃO ignora CPFs ou GPS numéricos!
             if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool']:
                 continue
 
@@ -103,7 +102,6 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
                     continue
                     
                 elif tipo_perfil in ["CPF", "RG", "PLACA", "EMAIL", "NOME_SOLTO", "RENAVAM", "MATRICULA", "PHONE"]:
-                    # Mapeando a chave do Faker baseada no Perfil
                     faker_key = tipo_perfil
                     if tipo_perfil == "PLACA": faker_key = "PLATE"
                     elif tipo_perfil == "NOME_SOLTO": faker_key = "PER"
@@ -161,6 +159,12 @@ if "colunas_ignoradas" not in st.session_state: st.session_state.colunas_ignorad
 if "colunas_perfiladas" not in st.session_state: st.session_state.colunas_perfiladas = {}
 if "colunas_selecionadas_finais" not in st.session_state: st.session_state.colunas_selecionadas_finais = []
 
+
+if "ultimo_progresso" not in st.session_state: st.session_state.ultimo_progresso = 0.0
+if "ultimo_status_msg" not in st.session_state: st.session_state.ultimo_status_msg = ""
+if "ultimo_status_tipo" not in st.session_state: st.session_state.ultimo_status_tipo = "info"
+if "ultima_metrica" not in st.session_state: st.session_state.ultima_metrica = ""
+
 start_btn = False
 
 with st.sidebar:
@@ -168,13 +172,15 @@ with st.sidebar:
     db_type = st.selectbox("Banco de Dados", ["postgresql", "mysql", "mssql"])
 
     aba_origem, aba_destino = st.tabs(["🔴 Origem", "🟢 Destino"])
+    
+    # ⚡ Função ajustada para bloquear o preenchimento automático do navegador
     def render_db_form(prefix):
         return {
-            "host": st.text_input("Host", value="localhost", key=f"{prefix}_host"),
-            "port": st.text_input("Porta", key=f"{prefix}_port"),
-            "db": st.text_input("Banco", key=f"{prefix}_db"),
-            "user": st.text_input("Usuário", key=f"{prefix}_user"),
-            "password": st.text_input("Senha", type="password", key=f"{prefix}_pass")
+            "host": st.text_input("Host", value="localhost", key=f"{prefix}_host", autocomplete="off"),
+            "port": st.text_input("Porta", key=f"{prefix}_port", placeholder="Ex: 5432", autocomplete="off"),
+            "db": st.text_input("Banco", key=f"{prefix}_db", placeholder="Nome do banco", autocomplete="off"),
+            "user": st.text_input("Usuário", key=f"{prefix}_user", autocomplete="new-password"),
+            "password": st.text_input("Senha", type="password", key=f"{prefix}_pass", autocomplete="new-password")
         }
 
     with aba_origem: src_cfg = render_db_form("origem")
@@ -218,7 +224,6 @@ with st.sidebar:
                                     todas_set.add(col)
                                     valores = [r.get(col) for r in rows_dict if r.get(col) is not None]
                                     
-                                    # O CÉREBRO CENTRALIZADO (Sem regras misturadas no app.py)
                                     tipo_dado = anonymizer.profile_column_type(col, valores)
                                     
                                     if tipo_dado != "IGNORAR":
@@ -237,7 +242,6 @@ with st.sidebar:
         st.info("⚠️ Escolha apenas as colunas que devem ser **IGNORADAS** pelo sistema.")
         
         opcoes_validas = st.session_state.todas_colunas_disponiveis
-        # Preenche automaticamente com as colunas que não entraram no perfis_detectados
         sugeridas_ignorar = [c for c in opcoes_validas if c not in st.session_state.colunas_perfiladas]
         
         colunas_ignoradas = st.multiselect("NÃO serão alteradas:", options=opcoes_validas, default=sugeridas_ignorar)
@@ -248,6 +252,10 @@ with st.sidebar:
         start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
         if start_btn:
             st.session_state.colunas_selecionadas_finais = colunas_finais
+            # ⚡ NOVO: Reseta os dados visuais antes de um novo processamento
+            st.session_state.ultimo_progresso = 0.0
+            st.session_state.ultimo_status_msg = ""
+            st.session_state.ultima_metrica = ""
 
 # ==================================================
 # UI PRINCIPAL & PIPELINE
@@ -273,9 +281,20 @@ if st.session_state.analise_concluida:
         st.markdown("</div>", unsafe_allow_html=True)
 
 debug_box = st.empty() 
-progress_bar = st.progress(0)
+
+# ⚡ NOVO: Renderiza a barra e métricas SEMPRE lendo do session_state
+progress_bar = st.progress(st.session_state.ultimo_progresso)
+
 status = st.empty()
+if st.session_state.ultimo_status_msg:
+    if st.session_state.ultimo_status_tipo == "info":
+        status.info(st.session_state.ultimo_status_msg)
+    else:
+        status.success(st.session_state.ultimo_status_msg)
+
 metric_placeholder = st.empty()
+if st.session_state.ultima_metrica:
+    metric_placeholder.markdown(st.session_state.ultima_metrica)
 
 def run_pipeline():
     proc = psutil.Process(os.getpid())
@@ -289,8 +308,16 @@ def run_pipeline():
     def set_phase(title, subtitle=""):
         nonlocal current_phase
         current_phase += 1
-        status.info(f"🔷 Fase {current_phase}/{phase_total} • {title} ({subtitle})")
-        progress_bar.progress(min((current_phase - 1) / phase_total * 0.25, 0.25))
+        msg = f"🔷 Fase {current_phase}/{phase_total} • {title} ({subtitle})"
+        
+        # ⚡ NOVO: Salva no state e renderiza
+        st.session_state.ultimo_status_msg = msg
+        st.session_state.ultimo_status_tipo = "info"
+        status.info(msg)
+        
+        novo_prog = min((current_phase - 1) / phase_total * 0.25, 0.25)
+        st.session_state.ultimo_progresso = novo_prog
+        progress_bar.progress(novo_prog)
 
     set_phase("Conectando bancos", "estabelecendo conexões")
     src_engine = db_utils.connect(build_url(db_type, **src_cfg))
@@ -364,13 +391,26 @@ def run_pipeline():
                     stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
                     total_progress = min(0.25 + ((total_rows / max(total_estimated, 1)) * 0.75), 1.0)
                     
-                    metric_placeholder.markdown(f"### 📊 Progresso\n- 📂 Tabela: **{processed_tables}/{total_tables}**\n- 🧮 Registros: **{total_rows:,} / {total_estimated:,}**\n- ⚡ Vel: **{stable_speed:,.0f} linhas/s**")
+                    msg_metrica = f"### 📊 Progresso\n- 📂 Tabela: **{processed_tables}/{total_tables}**\n- 🧮 Registros: **{total_rows:,} / {total_estimated:,}**\n- ⚡ Vel: **{stable_speed:,.0f} linhas/s**"
+                    
+                    # ⚡ NOVO: Salva os valores no session_state no meio do loop
+                    st.session_state.ultima_metrica = msg_metrica
+                    st.session_state.ultimo_progresso = total_progress
+                    
+                    metric_placeholder.markdown(msg_metrica)
                     progress_bar.progress(total_progress)
                     last_ui_update = now
 
     db_utils.set_replication_mode(dst_engine, "origin")
+    
+    # ⚡ NOVO: Finalização 100% gravada no state
+    st.session_state.ultimo_progresso = 1.0
     progress_bar.progress(1.0)
-    status.success(f"✅ Pipeline concluído • {total_rows:,} linhas em {time.time() - t0_global:.2f}s")
+    
+    msg_sucesso = f"✅ Pipeline concluído • {total_rows:,} linhas em {time.time() - t0_global:.2f}s"
+    st.session_state.ultimo_status_msg = msg_sucesso
+    st.session_state.ultimo_status_tipo = "success"
+    status.success(msg_sucesso)
 
 if start_btn:
     try:

@@ -701,27 +701,50 @@ def set_replication_mode(
     engine: Engine,
     mode: str = "replica"
 ):
+    """
+    Tenta ativar modo replica no PostgreSQL.
+    Se o usuário não possuir SUPERUSER,
+    apenas ignora sem quebrar pipeline.
+    """
 
-    if get_db_type(engine) == "postgresql":
+    if get_db_type(engine) != "postgresql":
+        return
 
-        try:
+    try:
 
-            with engine.begin() as conn:
+        with engine.begin() as conn:
 
-                conn.execute(
-                    text(
-                        f"""
-                        SET session_replication_role
-                        = '{mode}'
-                        """
-                    )
-                )
+            conn.execute(
+                text(
+                    """
+                    SET session_replication_role
+                    = :mode
+                    """
+                ),
+                {"mode": mode}
+            )
 
-        except Exception as e:
+            logger.info(
+                f"✅ session_replication_role={mode}"
+            )
+
+    except sa.exc.DBAPIError as e:
+
+        error_msg = str(e).lower()
+
+        # Sem permissão -> ignora
+        if (
+            "permission denied" in error_msg
+            or "insufficientprivilege" in error_msg
+            or "session_replication_role" in error_msg
+        ):
 
             logger.warning(
-                f"⚠️ Sem privilégio "
-                f"SUPERUSER para alterar "
-                f"session_replication_role "
-                f"para '{mode}': {e}"
+                "⚠️ Sem privilégio SUPERUSER. "
+                "Continuando sem replication_role."
             )
+
+            return
+
+        # outros erros reais
+        raise
