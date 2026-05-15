@@ -33,13 +33,13 @@ OLLAMA_MODEL = "llama3"
 # REGEX ESTRUTURAIS 
 # =========================================================
 REGEX = {
-    "CPF": re.compile(r"(?<!\d)(?:\d{3}[.\-\s]?\d{3}[.\-\s]?\d{3}[.\-\s]?\d{2}|\d{11})(?!\d)"),
-    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
-    "PHONE": re.compile(r"(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})[-\s]?\d{4}"),
-    "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    "RG": re.compile(r"(?<!\d)(?:[A-Z]{2}[-\s]?)?\d{1,3}\.?\d{3}\.?\d{3}[-\s]?[0-9A-Z](?!\w)|(?<!\d)\d{5,11}(?!\d)", re.IGNORECASE),
     "COORD": re.compile(r"-?\d{1,2}\.\d+,\s*-?\d{1,3}\.\d+"),
     "COORD_SINGLE": re.compile(r"^-?\d{1,3}\.\d{4,}$|^-\d{5,10}$"), 
+    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
+    "PHONE": re.compile(r"(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})[-\s]?\d{4}"),
+    "CPF": re.compile(r"(?<!\d)(?:\d{3}[.\-\s]?\d{3}[.\-\s]?\d{3}[.\-\s]?\d{2}|\d{11})(?!\d)"),
+    "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
+    "RG": re.compile(r"(?<![\d.,])(?:[A-Z]{2}[-\s]?)?\d{1,3}\.?\d{3}\.?\d{3}[-\s]?[0-9A-Z](?![\w.,])|(?<![\d.,])\d{5,11}(?![\d.,])", re.IGNORECASE),
 }
 
 NAME_REGEX = re.compile(
@@ -105,19 +105,31 @@ def evaluate_nome(text: str) -> bool:
 # PROFILER DE COLUNAS 
 # =========================================================
 def classify_cell(text: str) -> str:
+    """Classifica a célula testando formatos rigorosos antes dos formatos flexíveis."""
     text = str(text).strip()
     words = text.split()
+    
     if not text or len(text) < 3: return "IGNORAR"
     if len(text) > 80 or len(words) > 8: return "TEXTO_LIVRE"
         
-    if evaluate_cpf(text): return "CPF"
-    if evaluate_rg(text): return "RG"
-    if evaluate_placa(text): return "PLACA"
+    # =========================================================
+    # 1. DADOS EXATOS 
+    # =========================================================
+    if REGEX["COORD"].search(text) or REGEX["COORD_SINGLE"].search(text): return "GPS"
     if REGEX["EMAIL"].search(text) or "@" in text: return "EMAIL"
     if REGEX["PHONE"].search(text): return "PHONE"
-    if REGEX["COORD"].search(text) or REGEX["COORD_SINGLE"].search(text): return "GPS"
     
-    if evaluate_nome(text): return "NOME_SOLTO"
+    # =========================================================
+    # 2. DADOS FLEXÍVEIS 
+    # =========================================================
+    if REGEX["CPF"].search(text) and _ask_ollama_type(text, "CPF"): return "CPF"
+    if REGEX["RG"].search(text) and _ask_ollama_type(text, "RG"): return "RG"
+    if REGEX["PLATE"].search(text) and _ask_ollama_type(text, "PLACA"): return "PLACA"
+    
+    if 3 <= len(text) <= 60 and 1 <= len(words) <= 6:
+        if NAME_REGEX.search(text) and _ask_ollama_type(text, "NOME"): 
+            return "NOME_SOLTO"
+        
     if len(words) >= 3: return "TEXTO_LIVRE"
     
     return "DESCONHECIDO"
