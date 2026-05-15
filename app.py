@@ -144,8 +144,8 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
                 row_dict[col] = final_text
 
             except Exception as e:
-                print(f"[DEBUG IA] Falha ao processar coluna '{col}': {e}")
-                row_dict[col] = old_str 
+                # ⚡ AJUSTE: Não engolir mais erros fatais! Se a IA (anonymizer) colapsar, para tudo e avisa.
+                raise RuntimeError(f"Falha Crítica ao processar coluna '{col}'. Detalhe do Erro: {e}")
 
         processed.append(row_dict)
     return processed
@@ -158,7 +158,6 @@ if "todas_colunas_disponiveis" not in st.session_state: st.session_state.todas_c
 if "colunas_ignoradas" not in st.session_state: st.session_state.colunas_ignoradas = []
 if "colunas_perfiladas" not in st.session_state: st.session_state.colunas_perfiladas = {}
 if "colunas_selecionadas_finais" not in st.session_state: st.session_state.colunas_selecionadas_finais = []
-
 
 if "ultimo_progresso" not in st.session_state: st.session_state.ultimo_progresso = 0.0
 if "ultimo_status_msg" not in st.session_state: st.session_state.ultimo_status_msg = ""
@@ -173,7 +172,6 @@ with st.sidebar:
 
     aba_origem, aba_destino = st.tabs(["🔴 Origem", "🟢 Destino"])
     
-    # ⚡ Função ajustada para bloquear o preenchimento automático do navegador
     def render_db_form(prefix):
         return {
             "host": st.text_input("Host", value="localhost", key=f"{prefix}_host", autocomplete="off"),
@@ -235,7 +233,8 @@ with st.sidebar:
                 st.session_state.analise_concluida = True
                 st.success(f"✅ Encontradas {len(todas)} colunas. {len(perfis_detectados)} alvos mapeados.")
             except Exception as e:
-                st.error(f"Erro ao analisar banco: {e}")
+                # ⚡ AJUSTE: O erro de análise agora sobe em um balão de erro formatado
+                st.error(f"🚨 Falha na Fase de Análise!\nVerifique se o banco de origem está acessível.\nDetalhe do erro: {e}")
 
     if st.session_state.analise_concluida:
         st.markdown("### Selecione as Exceções")
@@ -252,7 +251,6 @@ with st.sidebar:
         start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
         if start_btn:
             st.session_state.colunas_selecionadas_finais = colunas_finais
-            # ⚡ NOVO: Reseta os dados visuais antes de um novo processamento
             st.session_state.ultimo_progresso = 0.0
             st.session_state.ultimo_status_msg = ""
             st.session_state.ultima_metrica = ""
@@ -282,7 +280,6 @@ if st.session_state.analise_concluida:
 
 debug_box = st.empty() 
 
-# ⚡ NOVO: Renderiza a barra e métricas SEMPRE lendo do session_state
 progress_bar = st.progress(st.session_state.ultimo_progresso)
 
 status = st.empty()
@@ -310,7 +307,6 @@ def run_pipeline():
         current_phase += 1
         msg = f"🔷 Fase {current_phase}/{phase_total} • {title} ({subtitle})"
         
-        # ⚡ NOVO: Salva no state e renderiza
         st.session_state.ultimo_status_msg = msg
         st.session_state.ultimo_status_tipo = "info"
         status.info(msg)
@@ -369,10 +365,12 @@ def run_pipeline():
                         futures = [executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols, perfis) for sub_chunk in sub_chunks]
                         rows = []
                         for original_chunk, f in zip(sub_chunks, futures):
-                            try: rows.extend(f.result() or original_chunk)
+                            try: 
+                                rows.extend(f.result() or original_chunk)
                             except Exception as e: 
-                                debug_box.error(f"🚨 Erro worker: {e}")
-                                rows.extend(original_chunk)
+                                # ⚡ AJUSTE: Trabalhadores (workers) agora gritam o erro para parar o pipeline,
+                                # em vez de inserir os dados sem anonimizar por debaixo dos panos.
+                                raise RuntimeError(f"Quebra em Processamento Paralelo na tabela '{t}': {e}")
                     else:
                         rows = process_chunk_parallel(rows, modo, anon_geo, target_cols, perfis) or rows
 
@@ -393,7 +391,6 @@ def run_pipeline():
                     
                     msg_metrica = f"### 📊 Progresso\n- 📂 Tabela: **{processed_tables}/{total_tables}**\n- 🧮 Registros: **{total_rows:,} / {total_estimated:,}**\n- ⚡ Vel: **{stable_speed:,.0f} linhas/s**"
                     
-                    # ⚡ NOVO: Salva os valores no session_state no meio do loop
                     st.session_state.ultima_metrica = msg_metrica
                     st.session_state.ultimo_progresso = total_progress
                     
@@ -403,7 +400,6 @@ def run_pipeline():
 
     db_utils.set_replication_mode(dst_engine, "origin")
     
-    # ⚡ NOVO: Finalização 100% gravada no state
     st.session_state.ultimo_progresso = 1.0
     progress_bar.progress(1.0)
     
@@ -413,7 +409,6 @@ def run_pipeline():
     status.success(msg_sucesso)
 
 if start_btn:
-    # ⚡ DEFESA 1: Prevenção de Autofill Teimoso
     if src_cfg["db"] == src_cfg["user"] or dst_cfg["db"] == dst_cfg["user"]:
         st.warning("⚠️ Atenção: O nome do banco de dados está idêntico ao nome de usuário. O seu navegador pode ter preenchido isso automaticamente por engano. Por favor, verifique os campos 'Banco' nas abas Origem e Destino.")
     elif not src_cfg["db"] or not dst_cfg["db"]:
@@ -425,7 +420,6 @@ if start_btn:
         except Exception as e:
             error_str = str(e).lower()
             
-            # ⚡ DEFESA 2: Tratamento Elegante do erro do pg_hba.conf
             if "pg_hba.conf rejects" in error_str:
                 debug_box.error(
                     "🚨 Acesso Negado pelo Banco de Dados!\n\n"
@@ -438,4 +432,5 @@ if start_btn:
                     "Verifique se você digitou o nome do Banco corretamente nas abas de conexão."
                 )
             else:
-                debug_box.error(f"🚨 Erro Fatal: {e}")
+                
+                debug_box.error(f"🚨 INTERRUPÇÃO DO PIPELINE:\n\n{e}")

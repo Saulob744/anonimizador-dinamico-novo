@@ -10,18 +10,22 @@ import os
 from functools import lru_cache
 from faker import Faker
 
+# =========================================================
+# CONFIGURAÇÕES GLOBAIS & LOGS
+# =========================================================
+# ⚡ AJUSTE: Nível alterado para ERROR. O sistema ficará mudo, 
+# exceto se houver um erro fatal que vá parar o pipeline.
+logging.basicConfig(level=logging.ERROR, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
 try:
     import spacy
     nlp = spacy.load("pt_core_news_lg")
 except OSError:
-    logging.error("Modelo SpaCy não encontrado! Rode: python -m spacy download pt_core_news_lg")
+    # Como a ausência do SpaCy não quebra o pipeline (ele tem fallback), 
+    # mantemos apenas como warning silencioso que não para a execução.
+    logger.warning("Modelo SpaCy não encontrado. Rodando em modo de contingência (apenas Regex).")
     nlp = None
-
-# =========================================================
-# CONFIGURAÇÕES GLOBAIS
-# =========================================================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 _MAPPING_CACHE = {}
 fake = Faker("pt_BR")
@@ -38,16 +42,16 @@ REGEX = {
     "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
     "CPF": re.compile(r"(?<!\d)(?:\d{3}[.\-\s]?\d{3}[.\-\s]?\d{3}[.\-\s]?\d{2}|\d{11})(?!\d)"),
     "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    "RG": re.compile(r"(?<![\d.,\-])(?:[A-Z]{2}[-\s]?)?\d{1,3}\.?\d{3}\.?\d{3}[-\s]?[0-9A-Z](?![\w.,])|(?<![\d.,\-])\d{5,11}(?![\d.,\-])", re.IGNORECASE),    # Telefone ficou mais rigoroso para não roubar CPFs e UUIDs
+    "RG": re.compile(r"(?<![\d.,\-])(?:[A-Z]{2}[-\s]?)?\d{1,3}\.?\d{3}\.?\d{3}[-\s]?[0-9A-Z](?![\w.,])|(?<![\d.,\-])\d{5,11}(?![\d.,\-])", re.IGNORECASE),
     "PHONE": re.compile(r"(?<!\d)(?:\+?55\s?)?(?:\(?\d{2}\)?[\s-]?)?\d{4,5}[-\s]\d{4}(?!\d)"),
 }
 
 NAME_REGEX = re.compile(
     r"(?<![a-zA-ZÀ-ÿ])"
     r"(?:"
-        r"(?:[A-ZÀ-Ÿ]{2,}\s+(?:DE\s+|DA\s+|DO\s+|DOS\s+|DAS\s+|E\s+)?)+[A-ZÀ-Ÿ]{2,}"
-        r"|"
-        r"(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,}\s+(?:de\s+|da\s+|do\s+|dos\s+|das\s+|e\s+)?)+[A-ZÀ-Ÿ][a-zà-ÿ]{1,}"
+    r"(?:[A-ZÀ-Ÿ]{2,}\s+(?:DE\s+|DA\s+|DO\s+|DOS\s+|DAS\s+|E\s+)?)+[A-ZÀ-Ÿ]{2,}"
+    r"|"
+    r"(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,}\s+(?:de\s+|da\s+|do\s+|dos\s+|das\s+|e\s+)?)+[A-ZÀ-Ÿ][a-zà-ÿ]{1,}"
     r")"
     r"(?![a-zA-ZÀ-ÿ])"
 )
@@ -80,6 +84,7 @@ def _ask_ollama_type(text: str, tipo_dado: str) -> bool:
             answer = response.json().get("response", "").strip().upper()
             return "SIM" in answer or "YES" in answer
     except Exception:
+        # Se a IA estiver offline ou der timeout, retorna False e segue a vida. Não quebra o pipeline.
         return False 
     return False
 
@@ -108,42 +113,48 @@ def classify_cell(text: str) -> str:
     return "DESCONHECIDO"
 
 def profile_column_type(col_name: str, values_sample: list) -> str:
-    """O Cérebro Centralizado. Tudo é decidido aqui."""
-    c = str(col_name).lower().strip()
-    
-    # 1. A BARREIRA (Blacklist estrita)
-    blacklist = ["cidade", "municipio", "bairro", "estado", "uf", "pais", "cep", "papel", "prefixo", "status", "situacao", "tipo", "cor", "marca", "modelo", "id", "uuid", "guid", "created_at", "updated_at"]
-    if c in blacklist or c.endswith("_id") or c.startswith("id_") or c == "id":
-        return "IGNORAR"
+    try:
+        c = str(col_name).lower().strip()
         
-    if any(k in c for k in ["lat", "lon", "gps", "coord", "geo", "loc"]): 
-        return "GPS_SINGLE"
-        
-    if "cpf" in c: return "CPF"
-    if "rg" in c: return "RG"
-    if "placa" in c: return "PLACA"
-    if "email" in c or "mail" in c: return "EMAIL"
-    if "renavam" in c: return "RENAVAM"
-    if "matricula" in c: return "MATRICULA"
-    if "telefone" in c or "celular" in c or "fone" in c: return "PHONE"
-    if any(k in c for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): return "NOME_SOLTO"
+        blacklist = ["cidade", "municipio", "bairro", "estado", "uf", "pais", "cep", "papel", "prefixo", "status", "situacao", "tipo", "cor", "marca", "modelo", "id", "uuid", "guid", "created_at", "updated_at"]
+        if c in blacklist or c.endswith("_id") or c.startswith("id_") or c == "id":
+            return "IGNORAR"
+            
+        if "pix" in c or "chave" in c:
+            return "TEXTO_LIVRE"
+            
+        if any(k in c for k in ["lat", "lon", "gps", "coord", "geo", "loc"]): 
+            return "GPS_SINGLE"
+            
+        if "cpf" in c: return "CPF"
+        if "rg" in c: return "RG"
+        if "placa" in c: return "PLACA"
+        if "email" in c or "mail" in c: return "EMAIL"
+        if "renavam" in c: return "RENAVAM"
+        if "matricula" in c: return "MATRICULA"
+        if "telefone" in c or "celular" in c or "fone" in c: return "PHONE"
+        if any(k in c for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): return "NOME_SOLTO"
 
+        valid_strings = [str(v) for v in values_sample if v is not None and str(v).strip() != ""]
+        if not valid_strings: return "IGNORAR"
+            
+        sample_to_test = random.sample(valid_strings, min(5, len(valid_strings)))
+        resultados = [classify_cell(text) for text in sample_to_test]
+        
+        from collections import Counter
+        votos = Counter(resultados)
+        hits_validos = {k: v for k, v in votos.items() if k not in ["IGNORAR", "DESCONHECIDO"]}
+        
+        if hits_validos:
+            if "TEXTO_LIVRE" in hits_validos: return "TEXTO_LIVRE"
+            return max(hits_validos, key=hits_validos.get)
+            
+        return "DESCONHECIDO"
 
-    valid_strings = [str(v) for v in values_sample if v is not None and str(v).strip() != ""]
-    if not valid_strings: return "IGNORAR"
-        
-    sample_to_test = random.sample(valid_strings, min(5, len(valid_strings)))
-    resultados = [classify_cell(text) for text in sample_to_test]
-    
-    from collections import Counter
-    votos = Counter(resultados)
-    hits_validos = {k: v for k, v in votos.items() if k not in ["IGNORAR", "DESCONHECIDO"]}
-    
-    if hits_validos:
-        if "TEXTO_LIVRE" in hits_validos: return "TEXTO_LIVRE"
-        return max(hits_validos, key=hits_validos.get)
-        
-    return "DESCONHECIDO"
+    except Exception as e:
+        # ⚡ AJUSTE: Erro fatal disparado APENAS se a lógica de profiling colapsar.
+        logger.critical(f"🚨 [ERRO FATAL] Colapso no Profiler na coluna '{col_name}': {e}")
+        raise # Interrompe o pipeline para o app.py capturar
 
 # =========================================================
 # O PENTE FINO
@@ -161,6 +172,11 @@ def _is_hallucination(ent_text: str) -> bool:
     if not any(c.isupper() for c in ent_text): return True
     if re.match(r"^([A-Z]\.){1,3}[A-Z]?$", ent_text.upper().strip()): return True
     
+    termos_proibidos = {"CPF", "RG", "CNPJ", "CEP", "DOC", "DOCUMENTO", "TEL", "CEL", "TELEFONE", "CELULAR", "PIX", "CHAVE", "PLACA", "DR", "DRA", "SR", "SRA"}
+    texto_norm = _normalize(ent_text).upper()
+    if texto_norm in termos_proibidos or any(texto_norm.startswith(t + " ") for t in termos_proibidos): 
+        return True
+
     locais_exatos = {"sao paulo", "rio de janeiro", "curitiba", "parana", "brasil", "minas gerais", "bahia", "santa catarina", "ceara", "pernambuco", "mato grosso", "goias", "amazonas", "espirito santo", "porto alegre", "belo horizonte", "salvador", "fortaleza", "recife", "brasilia", "campinas", "maringa", "londrina", "cascavel"}
     if _normalize(ent_text).lower() in locais_exatos: return True
 
@@ -223,18 +239,25 @@ def _get_fake(value: str, typ: str) -> str:
     return val
 
 def anonymize_value(col_name: str, val, anon_location: bool = True):
-    if val is None or not str(val).strip(): return val, None
-    text = str(val)
-    if len(text) < 3: return text, None
-    entities = _detect_all(text, anon_location)
-    result, last = [], 0
-    for s, e, v, t in entities:
-        result.append(text[last:s])
-        result.append(_get_fake(v, t))
-        last = e
-    result.append(text[last:])
-    new_v = "".join(result)
-    return new_v, ("TEXT" if new_v != text else None)
+    try:
+        if val is None or not str(val).strip(): return val, None
+        text = str(val)
+        if len(text) < 3: return text, None
+        
+        entities = _detect_all(text, anon_location)
+        result, last = [], 0
+        for s, e, v, t in entities:
+            result.append(text[last:s])
+            result.append(_get_fake(v, t))
+            last = e
+        result.append(text[last:])
+        new_v = "".join(result)
+        return new_v, ("TEXT" if new_v != text else None)
+
+    except Exception as e:
+        
+        logger.critical(f"🚨 [ERRO FATAL] Falha de processamento na coluna '{col_name}' com o valor: {str(val)[:50]}... Detalhe: {e}")
+        raise 
 
 def reset_memory():
     _MAPPING_CACHE.clear()
