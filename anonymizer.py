@@ -46,14 +46,11 @@ REGEX = {
     "PHONE": re.compile(r"(?<!\d)(?:\+?55\s?)?(?:\(?\d{2}\)?[\s-]?)?\d{4,5}[-\s]\d{4}(?!\d)"),
 }
 
+# ⚡ Expressão Regular Segura contra ReDoS (Sem loops infinitos)
 NAME_REGEX = re.compile(
-    r"(?<![a-zA-ZÀ-ÿ])"
-    r"(?:"
-    r"(?:[A-ZÀ-Ÿ]{2,}\s+(?:DE\s+|DA\s+|DO\s+|DOS\s+|DAS\s+|E\s+)?)+[A-ZÀ-Ÿ]{2,}"
-    r"|"
-    r"(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,}\s+(?:de\s+|da\s+|do\s+|dos\s+|das\s+|e\s+)?)+[A-ZÀ-Ÿ][a-zà-ÿ]{1,}"
-    r")"
-    r"(?![a-zA-ZÀ-ÿ])"
+    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})" # Primeiro nome (Capitalizado ou TODO MAIÚSCULO)
+    r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?" # Preposição opcional
+    r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})){1,5}\b" # 1 a 5 sobrenomes
 )
 
 PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senhora|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial|rua|avenida|trevo|cia)\s+", re.IGNORECASE)
