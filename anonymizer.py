@@ -46,9 +46,9 @@ REGEX = {
     "PHONE": re.compile(r"(?<!\d)(?:\+?55\s?)?(?:\(?\d{2}\)?[\s-]?)?\d{4,5}[-\s]\d{4}(?!\d)"),
 }
 
-# ⚡ Expressão Regular Segura contra ReDoS (Sem loops infinitos)
+
 NAME_REGEX = re.compile(
-    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})" # Primeiro nome (Capitalizado ou TODO MAIÚSCULO)
+    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})" # 
     r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?" # Preposição opcional
     r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})){1,5}\b" # 1 a 5 sobrenomes
 )
