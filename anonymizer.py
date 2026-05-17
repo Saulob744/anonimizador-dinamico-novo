@@ -9,12 +9,12 @@ import html
 import os
 from functools import lru_cache
 from faker import Faker
-
+from collections import Counter
 # =========================================================
 # CONFIGURAÇÕES GLOBAIS & LOGS
 # =========================================================
-# ⚡ AJUSTE: Nível alterado para ERROR. O sistema ficará mudo, 
-# exceto se houver um erro fatal que vá parar o pipeline.
+# ⚡ AJUSTE: Nível mantido em ERROR para silenciar ruídos, 
+# mas agora NENHUM erro derrubará o pipeline.
 logging.basicConfig(level=logging.ERROR, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -22,8 +22,7 @@ try:
     import spacy
     nlp = spacy.load("pt_core_news_lg")
 except OSError:
-    # Como a ausência do SpaCy não quebra o pipeline (ele tem fallback), 
-    # mantemos apenas como warning silencioso que não para a execução.
+    # Fallback caso o SpaCy não esteja instalado.
     logger.warning("Modelo SpaCy não encontrado. Rodando em modo de contingência (apenas Regex).")
     nlp = None
 
@@ -34,21 +33,26 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "llama3"
 
 # =========================================================
-# REGEX ESTRUTURAIS
+# REGEX ESTRUTURAIS (ULTRA-FLEXÍVEIS)
 # =========================================================
 REGEX = {
-    "COORD": re.compile(r"-?\d{1,2}\.\d+,\s*-?\d{1,3}\.\d+"),
-    "COORD_SINGLE": re.compile(r"^-?\d{1,3}\.\d{4,}$|^-\d{5,10}$"), 
+    # Aceita coordenadas com ponto, vírgula, separadas por vírgula, ponto e vírgula ou espaço
+    "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"), 
+    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
     "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
-    "CPF": re.compile(r"(?<!\d)(?:\d{3}[.\-\s]?\d{3}[.\-\s]?\d{3}[.\-\s]?\d{2}|\d{11})(?!\d)"),
-    "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    "RG": re.compile(r"(?<![\d.,\-])(?:[A-Z]{2}[-\s]?)?\d{1,3}\.?\d{3}\.?\d{3}[-\s]?[0-9A-Z](?![\w.,])|(?<![\d.,\-])\d{5,11}(?![\d.,\-])", re.IGNORECASE),
-    "PHONE": re.compile(r"(?<!\d)(?:\+?55\s?)?(?:\(?\d{2}\)?[\s-]?)?\d{4,5}[-\s]\d{4}(?!\d)"),
+    # CPF hiper maleável: 11 dígitos seguidos ou com qualquer combinação de pontos, traços e espaços
+    "CPF": re.compile(r"\b\d{3}[.\-\s]?\d{3}[.\-\s]?\d{3}[.\-\s]?\d{2}\b|\b\d{11}\b"),
+    # Placas antigas e Mercosul com ou sem traço/espaço
+    "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b|\b[A-Z]{3}[-\s]?\d{4}\b", re.IGNORECASE),
+    # RG flexível: aceita com UF na frente (SP-...), com pontos, ou uma tripa de números de 5 a 14 dígitos
+    "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]?)?\d{1,3}[.\-\s]?\d{3}[.\-\s]?\d{3}[-\s]?[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
+    # Telefone com/sem DDI, com/sem DDD, com/sem formatacao
+    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{4,5}[-\s]?\d{4}\b"),
 }
 
 
 NAME_REGEX = re.compile(
-    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})" # 
+    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})" # Primeiro nome
     r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?" # Preposição opcional
     r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})){1,5}\b" # 1 a 5 sobrenomes
 )
@@ -81,7 +85,7 @@ def _ask_ollama_type(text: str, tipo_dado: str) -> bool:
             answer = response.json().get("response", "").strip().upper()
             return "SIM" in answer or "YES" in answer
     except Exception:
-        # Se a IA estiver offline ou der timeout, retorna False e segue a vida. Não quebra o pipeline.
+        # 🛡️ ANTI-QUEBRA: Se a IA estiver offline ou der timeout, retorna False e segue a vida.
         return False 
     return False
 
@@ -112,64 +116,71 @@ def classify_cell(text: str) -> str:
 def profile_column_type(col_name: str, values_sample: list) -> str:
     try:
         c = str(col_name).lower().strip()
-        
-        
         c_words = set(c.replace("_", " ").replace("-", " ").split())
         
-        blacklist = {"cidade", "municipio", "bairro", "estado", "uf", "pais", "cep", "papel", "prefixo", "status", "situacao", "tipo", "cor", "marca", "modelo", "id", "uuid", "guid", "created_at", "updated_at"}
-        
-   
+        # 1. BLACKLIST (O que ignorar imediatamente)
+        blacklist = {
+            "cidade", "municipio", "bairro", "estado", "uf", "pais", "cep", 
+            "papel", "prefixo", "status", "situacao", "tipo", "cor", "marca", 
+            "modelo", "id", "uuid", "guid", "created_at", "updated_at"
+        }
         if c in blacklist or "id" in c_words or c.endswith("id"):
             return "IGNORAR"
             
-        if "pix" in c_words or "chave" in c_words:
-            return "TEXTO_LIVRE"
-            
+        # 2. HEURÍSTICA DE NOME DE COLUNA (Detecção rápida)
+        if any(k in c_words for k in ["pix", "chave"]): return "TEXTO_LIVRE"
+        if any(k in c_words for k in ["lat", "latitude", "lon", "longitude", "gps", "coord", "coordenada", "geo", "loc"]): return "GPS_SINGLE"
+        if any(k in c_words for k in ["telefone", "celular", "fone"]): return "PHONE"
+        if any(k in c_words for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): return "NOME_SOLTO"
         
-        if any(k in c_words for k in ["lat", "latitude", "lon", "longitude", "gps", "coord", "coordenada", "geo", "loc"]): 
-            return "GPS_SINGLE"
-            
         if "cpf" in c_words or "cpf" in c: return "CPF"
-        
-       
         if "rg" in c_words or c == "rg": return "RG"
-        
         if "placa" in c_words or "placa" in c: return "PLACA"
         if "email" in c_words or "mail" in c_words or "email" in c: return "EMAIL"
         if "renavam" in c_words or "renavam" in c: return "RENAVAM"
         if "matricula" in c_words or "matricula" in c: return "MATRICULA"
-        
-        # Telefones (evitando que "microfone" ative "fone")
-        if "telefone" in c_words or "celular" in c_words or "fone" in c_words: return "PHONE"
-        
-        # Nomes (evitando que "fenomeno" ative "nome")
-        if any(k in c_words for k in ["nome", "vitima", "autor", "condutor", "proprietario"]): return "NOME_SOLTO"
 
-        # === Se falhou em prever pelo nome, manda a IA olhar os valores ===
+        # 3. ANÁLISE DE AMOSTRA (Votação baseada em conteúdo)
         valid_strings = [str(v) for v in values_sample if v is not None and str(v).strip() != ""]
-        if not valid_strings: return "IGNORAR"
+        if not valid_strings: 
+            return "IGNORAR"
             
         sample_to_test = random.sample(valid_strings, min(5, len(valid_strings)))
         resultados = [classify_cell(text) for text in sample_to_test]
         
-        from collections import Counter
         votos = Counter(resultados)
         hits_validos = {k: v for k, v in votos.items() if k not in ["IGNORAR", "DESCONHECIDO"]}
         
         if hits_validos:
-            if "TEXTO_LIVRE" in hits_validos: return "TEXTO_LIVRE"
+            if "TEXTO_LIVRE" in hits_validos: 
+                return "TEXTO_LIVRE"
             return max(hits_validos, key=hits_validos.get)
             
+        # 4. SALVAGUARDA DA IA (Última linha de defesa para não deixar vazar)
+        amostra_str = " | ".join(sample_to_test)
+        prompt_salvacao = (
+            f"Você é um auditor rigoroso de LGPD. Analise esta amostra de dados: '{amostra_str}'. "
+            f"Existe ALGUM dado sensível aqui (como nomes de pessoas, CPFs, contas ou contatos)? "
+            f"Responda APENAS 'SIM' ou 'NAO'."
+        )
+        
+        try:
+            # Proxies vazios e timeout para não travar o pipeline se a IA demorar
+            resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt_salvacao, "stream": False}, timeout=20, proxies={"http": "", "https": ""})
+            if resp.status_code == 200:
+                answer = resp.json().get("response", "").strip().upper()
+                if "SIM" in answer or "YES" in answer:
+                    logger.warning(f"🚨 SALVAGUARDA ATIVADA: IA pegou dados sensíveis na coluna '{col_name}'. Forçando TEXTO_LIVRE.")
+                    return "TEXTO_LIVRE"
+        except Exception as e_ia:
+            logger.debug(f"Falha na IA de salvaguarda (Ignorado): {e_ia}")
+
         return "DESCONHECIDO"
 
     except Exception as e:
-        logger.critical(f"🚨 [ERRO FATAL] Colapso no Profiler na coluna '{col_name}': {e}")
-        raise
-
-    except Exception as e:
-        # ⚡ AJUSTE: Erro fatal disparado APENAS se a lógica de profiling colapsar.
-        logger.critical(f"🚨 [ERRO FATAL] Colapso no Profiler na coluna '{col_name}': {e}")
-        raise # Interrompe o pipeline para o app.py capturar
+        # 🛡️ ANTI-QUEBRA
+        logger.error(f"⚠️ [IGNORADO] Colapso no Profiler na coluna '{col_name}'. Motivo: {e}")
+        return "IGNORAR"
 
 # =========================================================
 # O PENTE FINO
@@ -248,6 +259,8 @@ def _get_fake(value: str, typ: str) -> str:
     elif typ == "PHONE": val = fake.phone_number()
     elif typ == "RENAVAM": val = fake.numerify('###########')
     elif typ == "MATRICULA": val = fake.numerify('######')
+    elif typ in ["COORD", "COORD_SINGLE", "GPS", "GPS_SINGLE"]: 
+        val = f"{fake.latitude()}, {fake.longitude()}"
     else: val = fake.word().upper()
 
     _MAPPING_CACHE[cache_key] = val
@@ -270,9 +283,10 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         return new_v, ("TEXT" if new_v != text else None)
 
     except Exception as e:
-        
-        logger.critical(f"🚨 [ERRO FATAL] Falha de processamento na coluna '{col_name}' com o valor: {str(val)[:50]}... Detalhe: {e}")
-        raise 
+        # 🛡️ ANTI-QUEBRA: Se der erro na manipulação da string, não levanta exceção.
+        # Ele avisa no log e retorna o valor original, garantindo que o banco receba o dado intacto.
+        logger.error(f"⚠️ [IGNORADO] Falha ao mascarar texto livre na coluna '{col_name}'. Mantendo original. Motivo: {e}")
+        return str(val), None 
 
 def reset_memory():
     _MAPPING_CACHE.clear()
