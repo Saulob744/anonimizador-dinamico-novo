@@ -36,8 +36,8 @@ REGEX = {
     "RG": re.compile(r"(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]|\b\d{5,14}\b", re.IGNORECASE),
     "PLATE": re.compile(r"[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}|[A-Z]{3}[-\s]?\d{4}", re.IGNORECASE),
     "PHONE": re.compile(r"(?:\+?55\s*)?(?:\(?\d{2,3}\)?[\s-]*)?\d{4,5}[-\s]*\d{4}"),
-    "GENERIC_CODE": re.compile(r'[A-Za-z0-9_/\.\-]{5,64}'),
     "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
+    "GENERIC_CODE": re.compile(r'[A-Za-z0-9_/\.\-]{5,64}'),
 }
 
 CONTEXT_NAME_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|atendente|consultor|gerente|responsavel|usuario|agente|vendedor|motorista|funcionario|titular|favorecido|com|por|para|de)\s*[:\-]?\s+([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){0,4})\b", re.IGNORECASE)
@@ -120,6 +120,14 @@ def _is_hallucination(ent_text: str, is_context: bool = False) -> bool:
 
 def _detect_all(text: str, anon_loc: bool):
     found = []
+    
+    # ⚡ NOVA REGRA DE PRIORIDADE: Força o IP e CPF a ganharem do GENERIC_CODE
+    PRIORITY = {
+        "EMAIL": 1, "IP": 1, "CPF": 1, "RG": 1, "PHONE": 1, 
+        "PLATE": 1, "COORD": 1, "COORD_SINGLE": 1, 
+        "PER": 2, "GENERIC_CODE": 99
+    }
+    
     for typ, pat in REGEX.items():
         if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: continue
         for match in pat.finditer(text):
@@ -139,8 +147,13 @@ def _detect_all(text: str, anon_loc: bool):
             if ent.label_ == "PER":
                 prefix_match = PREFIX_TRIMMER.search(ent.text)
                 offset = prefix_match.end() if prefix_match else 0
-                val_clean = ent.text[offset:].strip()
-                start = ent.start_char + offset
+                
+                # ⚡ CORREÇÃO MATEMÁTICA DO SPACY
+                val_raw = ent.text[offset:]
+                val_clean = val_raw.strip()
+                start_adj = val_raw.find(val_clean)
+                start = ent.start_char + offset + (start_adj if start_adj != -1 else 0)
+                
                 if not _is_hallucination(val_clean, is_context=False): 
                     found.append((start, start + len(val_clean), text[start : start + len(val_clean)], "PER"))
     else:
@@ -150,7 +163,9 @@ def _detect_all(text: str, anon_loc: bool):
             if not _is_hallucination(val_clean, is_context=False): 
                 found.append((match.start(), match.end(), val_clean, "PER"))
 
-    found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+    # Ordenação Blindada: Posição > Tamanho > Prioridade Definida
+    found.sort(key=lambda x: (x[0], -(x[1] - x[0]), PRIORITY.get(x[3], 50)))
+    
     clean, last = [], -1
     for s, e, v, t in found:
         if s >= last:
@@ -201,13 +216,11 @@ REGRA DE RESPOSTA:
         resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=15, proxies={"http": "", "https": ""})
         if resp.status_code == 200:
             resposta = resp.json().get("response", "").strip()
-            # Se a IA aprovou, mantém o que a máquina fez. Se não, usa a correção da IA.
             if "APROVADO" not in resposta.upper():
                 return resposta 
     except Exception as e:
         logger.error(f"Erro no Agente Revisor: {e}")
     
-    # Em caso de falha da IA, por segurança, retorna o texto do Pente Fino
     return texto_anonimizado
 
 # =========================================================
@@ -232,8 +245,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True, usar_agente_
         result.append(text[last:])
         texto_maquina = "".join(result)
         
-        # 2. Ação do Agente Revisor (Opcional, ativado apenas para frases)
-        # Só chamamos a IA se for uma frase longa E se o usuário ativou a Revisão IA
+        # 2. Ação do Agente Revisor
         if usar_agente_revisor and len(text.split()) >= 3:
             texto_final = _agente_revisor(text, texto_maquina)
         else:
