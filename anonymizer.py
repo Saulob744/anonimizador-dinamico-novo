@@ -213,7 +213,7 @@ REGRA DE RESPOSTA:
 - Se estiver com falhas (vazando dados ou sem sentido), CORRIJA o texto usando dados fictícios e responda APENAS com o texto corrigido. Sem explicações adicionais."""
 
     try:
-        resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=15, proxies={"http": "", "https": ""})
+        resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=45, proxies={"http": "", "https": ""})
         if resp.status_code == 200:
             resposta = resp.json().get("response", "").strip()
             if "APROVADO" not in resposta.upper():
