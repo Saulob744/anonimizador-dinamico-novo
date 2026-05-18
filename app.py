@@ -13,7 +13,7 @@ import pyodbc
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 import difflib
-import pandas as pd # <- ADICIONADO PARA O PREVIEW
+import pandas as pd
 
 import db_utils
 import anonymizer
@@ -124,7 +124,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
                     anon_chunks = []
                     
                     for chunk in chunks:
-                        new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo)
+                        new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo, usar_agente_revisor=True)
                         anon_chunks.append(str(new_val))
                     
                     final_text = " ".join(anon_chunks)
@@ -194,6 +194,10 @@ with st.sidebar:
     db_type = st.selectbox("Banco de Dados", ["postgresql", "mysql", "mssql"], disabled=st.session_state.is_running)
 
     aba_origem, aba_destino = st.tabs(["🔴 Origem", "🟢 Destino"])
+    # AGENTE IA
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🤖 Modo Agente IA")
+    usar_agente = st.sidebar.checkbox("Ativar Agente Revisor (Mais preciso, porém mais lento)", value=False)
     
     def render_db_form(prefix):
         return {
@@ -236,7 +240,7 @@ with st.sidebar:
                 st.session_state.lista_schemas = list(mapa.keys())
                 st.session_state.mapa_tabelas = mapa
                 st.session_state.db_mapeado = True
-                st.session_state.analise_concluida = False # Reseta a fase 2 se conectar de novo
+                st.session_state.analise_concluida = False 
                 st.success(f"✅ Sucesso! {len(mapa)} schemas mapeados.")
             except Exception as e:
                 st.error(f"Falha na conexão:\n{e}")

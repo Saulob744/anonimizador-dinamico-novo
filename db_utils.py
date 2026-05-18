@@ -284,10 +284,6 @@ def copy_schema(src_engine: Engine, dst_engine: Engine, schema: Optional[str] = 
                 logger.exception(f"⚠️ Falha ao criar tabela {schema or 'default'}.{table.name}: {e}")
                 
     logger.info("✅ Cópia de schema finalizada.")
-
-# ==================================================
-# STREAMING
-# ==================================================
 # ==================================================
 # STREAMING
 # ==================================================
@@ -318,8 +314,6 @@ def fetch_rows_streaming(
             logger.debug(f"Ordenando streaming pelas PKs: {[pk.name for pk in pks]}")
         else:
             # 3. FALLBACK: Sem PK, tenta usar todas as colunas disponíveis para garantir alguma estabilidade.
-            # O banco de dados pode não garantir a mesma ordem entre leituras diferentes se não houver um ORDER BY explícito.
-            # Ordenar por todas as colunas é o mais próximo que podemos chegar de uma ordem determinística.
             logger.warning(f"⚠️ A tabela {table} NÃO possui Primary Key! Tentando ordenação de contingência (todas as colunas).")
             
             fallback_cols = []
@@ -332,13 +326,13 @@ def fetch_rows_streaming(
                  stmt = stmt.order_by(*fallback_cols)
                  logger.debug(f"Ordenação de contingência aplicada usando {len(fallback_cols)} colunas compatíveis.")
             else:
-                 # Pior cenário absoluto: Uma tabela sem PK e só com tipos complexos (muito raro).
+                 # Pior cenário absoluto: Uma tabela sem PK e só com tipos complexos.
                  logger.error(f"❌ Impossível aplicar qualquer ordenação determinística na tabela {table}. A ordem das linhas extraídas será arbitrária (ordem natural do disco).")
 
     with engine.connect() as conn:
         logger.debug("Executando query de streaming...")
         
-        # execution_options(stream_results=True) é essencial para não carregar a tabela inteira na RAM do Python.
+        #para não carregar a tabela inteira na RAM do Python.
         result = conn.execution_options(stream_results=True).execute(stmt)
         
         chunks_yielded = 0
