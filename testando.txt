@@ -10,13 +10,19 @@ from functools import lru_cache
 from faker import Faker
 from collections import Counter
 
-logging.basicConfig(level=logging.ERROR, format='%(levelname)s: %(message)s')
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s'
+)
 logger = logging.getLogger(__name__)
 
+logger.debug("Iniciando carregamento do spaCy...")
 try:
     import spacy
     nlp = spacy.load("pt_core_news_lg")
-except OSError:
+    logger.debug("Modelo spaCy carregado com sucesso.")
+except OSError as e:
+    logger.warning(f"Não foi possível carregar o spaCy. Rodando sem ele. Erro: {e}")
     nlp = None
 
 _MAPPING_CACHE = {}
@@ -41,19 +47,41 @@ REGEX = {
 }
 
 CONTEXT_NAME_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|atendente|consultor|gerente|responsavel|usuario|agente|vendedor|motorista|funcionario|titular|favorecido|com|por|para|de)\s*[:\-]?\s+([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){0,4})\b", re.IGNORECASE)
-NAME_REGEX = re.compile(r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}|[A-ZÀ-Ÿ]{2,20})){1,5}\b")
+NAME_REGEX = re.compile(r"^[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}(?:\s+(?:de|da|do|dos|das|e))?(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}){1,5}$", re.IGNORECASE)
 PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senhora|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial|rua|avenida|trevo|cia|agente|vendedor|motorista|funcionario)\s+", re.IGNORECASE)
 
 # =========================================================
 # AGENTE DE TRIAGEM 
 # =========================================================
+def _is_texto_livre(texto: str, palavras: list) -> bool:
+    """Inteligência para distinguir nomes compostos longos de frases descritivas."""
+    if len(palavras) < 2: return False
+    # Mais de 7 palavras dificilmente é um único nome próprio, provável ser frase
+    if len(palavras) > 7: return True 
+    
+    # Se tem pontuação típica de frase, é texto livre
+    if re.search(r'[,;!?()"]', texto): return True
+    
+    # Conectivos e verbos comuns em frases que não aparecem em nomes
+    stop_words_frase = {"que", "com", "por", "para", "como", "quando", "onde", "estava", "foi", "disse", "relatou", "o", "a", "os", "as", "um", "uma", "ele", "ela", "suspeito", "vitima", "local"}
+    palavras_lower = [p.lower() for p in palavras]
+    
+    # Se houver qualquer palavra indicativa de frase, não é nome solto
+    if any(p in stop_words_frase for p in palavras_lower): return True
+    
+    return False
+
 def classify_cell(text: str) -> str:
     text = text.strip()
     words = text.split()
     if not text or len(text) < 3: return "IGNORAR"
     text_lower = text.lower()
+    
     if re.search(r'\b(rua|av|avenida|praça|rodovia|br-\d{3}|cep|logradouro|quadra|loteamento|bairro|complemento|andar)\b', text_lower): return "ENDERECO"
-    if len(words) >= 3 or len(text) > 40: return "TEXTO_LIVRE"
+    
+    # Verifica se é frase/relato ANTES de aplicar regex soltas
+    if _is_texto_livre(text, words): return "TEXTO_LIVRE"
+    
     if REGEX["COORD"].search(text) or REGEX["COORD_SINGLE"].search(text): return "GPS"
     if REGEX["EMAIL"].search(text): return "EMAIL"
     if REGEX["CPF"].search(text): return "CPF"
@@ -61,14 +89,25 @@ def classify_cell(text: str) -> str:
     if REGEX["PLATE"].search(text): return "PLACA"
     if REGEX["IP"].search(text): return "IP"
     if REGEX["PHONE"].search(text): return "PHONE"
+    
+    # Se não caiu em nada até agora, e não é texto livre, parece um nome?
+    # Condição: 2 a 6 palavras, maioria começando com maiúscula (ou sendo de/da/do)
+    if 2 <= len(words) <= 6:
+        maiusculas = sum(1 for w in words if w[0].isupper() or w.lower() in ['de', 'da', 'do', 'dos', 'das', 'e'])
+        if maiusculas == len(words):
+            return "NOME_SOLTO"
+            
     if REGEX["GENERIC_CODE"].search(text) and any(c.isdigit() for c in text): return "GENERIC_CODE"
+    
     return "INCONCLUSIVO"
 
 def profile_column_type(col_name: str, values_sample: list) -> str:
+    logger.debug(f"Perfilando coluna: '{col_name}' com {len(values_sample)} amostras.")
     try:
         c = str(col_name).lower().strip()
-        blacklist = {"created_at", "updated_at", "deleted_at", "timestamp", "data_criacao"}
-        if c in blacklist: return "IGNORAR"
+        blacklist = {"created_at", "updated_at", "deleted_at", "timestamp", "data_criacao", "id"}
+        if c in blacklist or c.endswith("_id") or c == "id": 
+            return "IGNORAR"
 
         valid_strings = [str(v) for v in values_sample if v is not None and str(v).strip() != ""]
         if not valid_strings: return "IGNORAR"
@@ -78,25 +117,45 @@ def profile_column_type(col_name: str, values_sample: list) -> str:
         votos = Counter(resultados)
         hits_validos = {k: v for k, v in votos.items() if k not in ["IGNORAR", "INCONCLUSIVO"]}
         
+        logger.debug(f"Votos para '{col_name}': {votos}")
+
         if hits_validos:
             if "TEXTO_LIVRE" in hits_validos: return "TEXTO_LIVRE"
-            return max(hits_validos, key=hits_validos.get)
+            best_hit = max(hits_validos, key=hits_validos.get)
+            return best_hit
             
+        # OLLAMA ENTRA EM AÇÃO DE FORMA MAIS INTELIGENTE AGORA
         amostra_str = " | ".join(sample_to_test)
         prompt_salvacao = (
-            f"Analise esta amostra de banco de dados: '{amostra_str}'. "
-            f"Escolha APENAS UMA opção predominante:\n- ENDERECO\n- CODIGO_SENSIVEL\n- DADO_PESSOAL\n- SEGURO"
+            f"Analise esta amostra de dados reais de uma tabela de banco de dados: '{amostra_str}'.\n"
+            f"Sua tarefa é classificar o tipo de dado predominante. Responda APENAS com UMA das opções abaixo, sem explicações:\n"
+            f"- NOME_PESSOA (se contiver nomes de pessoas/indivíduos)\n"
+            f"- TEXTO_LIVRE (se forem relatos, observações, descrições longas)\n"
+            f"- ENDERECO (se forem cidades, ruas, estados, CEPs)\n"
+            f"- CODIGO_SENSIVEL (se forem documentos, senhas, placas, chaves)\n"
+            f"- IGNORAR (se for apenas números genéricos, datas, valores, ids, booleanos)"
         )
+        
+        logger.debug(f"Pedindo ajuda ao Ollama para a coluna '{col_name}'.")
         try:
-            resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt_salvacao, "stream": False}, timeout=40, proxies={"http": "", "https": ""})
+            resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt_salvacao, "stream": False}, timeout=40)
             if resp.status_code == 200:
                 answer = resp.json().get("response", "").strip().upper()
-                if "SEGURO" in answer or "ENDERECO" in answer: return "IGNORAR"
+                logger.debug(f"Resposta bruta do Ollama: {answer}")
+                
+                # Mapeamento estrito corrigido
+                if "NOME_PESSOA" in answer: return "NOME_SOLTO"
+                elif "TEXTO_LIVRE" in answer: return "TEXTO_LIVRE"
                 elif "CODIGO_SENSIVEL" in answer: return "GENERIC_CODE"
-                elif "DADO_PESSOAL" in answer: return "TEXTO_LIVRE"
-        except Exception: pass
+                elif "ENDERECO" in answer or "IGNORAR" in answer: return "IGNORAR"
+                
+        except Exception as e: 
+            logger.exception("Falha de comunicação com Ollama.")
+            
         return "DESCONHECIDO"
-    except Exception: return "IGNORAR"
+    except Exception: 
+        logger.exception(f"Erro ao perfilar '{col_name}'")
+        return "IGNORAR"
 
 # =========================================================
 # AGENTE EXECUTOR
@@ -111,7 +170,6 @@ def _is_hallucination(ent_text: str, is_context: bool = False) -> bool:
     if not ent_text or len(ent_text) <= 2: return True
     if any(c.isdigit() for c in ent_text) and any(c in ['.', ',', '-'] for c in ent_text): return True
     if not is_context and not any(c.isupper() for c in ent_text): return True
-    if re.match(r"^([A-Z]\.){1,3}[A-Z]?$", ent_text.upper().strip()): return True
     
     termos_proibidos = {"CPF", "RG", "CNPJ", "CEP", "DOC", "DOCUMENTO", "TEL", "CEL", "TELEFONE", "CELULAR", "PIX", "CHAVE", "PLACA", "DR", "DRA", "SR", "SRA", "RUA", "AVENIDA", "AV", "SUPORTE", "VENDAS", "FINANCEIRO", "RISCO", "MAINFRAME", "FATURAMENTO", "ARQUITETURA", "SOC", "TEAM", "DEV", "GERENTE", "PLANTAO", "CONTATO", "FALE", "CONOSCO", "OUVIDORIA", "APP", "MOBILE", "UX", "UI", "DESIGN", "TESTES", "APRESENTOU", "COMPORTAMENTO", "SISTEMA", "RELATORIO", "PROJETO", "MÓDULO", "API", "GATEWAY", "NUVEM", "PORTAL", "CIDADÃO", "DASHBOARD", "CORE", "BANCÁRIO"}
     texto_norm = _normalize(ent_text).upper()
@@ -120,13 +178,7 @@ def _is_hallucination(ent_text: str, is_context: bool = False) -> bool:
 
 def _detect_all(text: str, anon_loc: bool):
     found = []
-    
-    # ⚡ NOVA REGRA DE PRIORIDADE: Força o IP e CPF a ganharem do GENERIC_CODE
-    PRIORITY = {
-        "EMAIL": 1, "IP": 1, "CPF": 1, "RG": 1, "PHONE": 1, 
-        "PLATE": 1, "COORD": 1, "COORD_SINGLE": 1, 
-        "PER": 2, "GENERIC_CODE": 99
-    }
+    PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "RG": 1, "PHONE": 1, "PLATE": 1, "COORD": 1, "COORD_SINGLE": 1, "PER": 2, "GENERIC_CODE": 99 }
     
     for typ, pat in REGEX.items():
         if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: continue
@@ -147,23 +199,13 @@ def _detect_all(text: str, anon_loc: bool):
             if ent.label_ == "PER":
                 prefix_match = PREFIX_TRIMMER.search(ent.text)
                 offset = prefix_match.end() if prefix_match else 0
-                
-                # ⚡ CORREÇÃO MATEMÁTICA DO SPACY
                 val_raw = ent.text[offset:]
                 val_clean = val_raw.strip()
                 start_adj = val_raw.find(val_clean)
                 start = ent.start_char + offset + (start_adj if start_adj != -1 else 0)
-                
                 if not _is_hallucination(val_clean, is_context=False): 
                     found.append((start, start + len(val_clean), text[start : start + len(val_clean)], "PER"))
-    else:
-        for match in NAME_REGEX.finditer(text):
-            val = match.group().strip()
-            val_clean = re.sub(r'\s+', ' ', val)
-            if not _is_hallucination(val_clean, is_context=False): 
-                found.append((match.start(), match.end(), val_clean, "PER"))
-
-    # Ordenação Blindada: Posição > Tamanho > Prioridade Definida
+    
     found.sort(key=lambda x: (x[0], -(x[1] - x[0]), PRIORITY.get(x[3], 50)))
     
     clean, last = [], -1
@@ -195,11 +237,7 @@ def _get_fake(value: str, typ: str) -> str:
     _MAPPING_CACHE[cache_key] = val
     return val
 
-# =========================================================
-# 🤖 O NOVO AGENTE REVISOR
-# =========================================================
 def _agente_revisor(texto_original: str, texto_anonimizado: str) -> str:
-    """O Agente de IA valida e corrige o trabalho do Pente Fino se necessário."""
     prompt = f"""Você é um Agente de Segurança de Dados rigoroso.
 Texto Original: "{texto_original}"
 Texto Modificado pela máquina: "{texto_anonimizado}"
@@ -211,34 +249,26 @@ SUA MISSÃO:
 REGRA DE RESPOSTA:
 - Se o Texto Modificado estiver seguro e fizer sentido, responda APENAS com a palavra: APROVADO
 - Se estiver com falhas (vazando dados ou sem sentido), CORRIJA o texto usando dados fictícios e responda APENAS com o texto corrigido. Sem explicações adicionais."""
-
     try:
-        resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=45, proxies={"http": "", "https": ""})
+        resp = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}, timeout=45)
         if resp.status_code == 200:
             resposta = resp.json().get("response", "").strip()
             if "APROVADO" not in resposta.upper():
                 return resposta 
     except Exception as e:
-        logger.error(f"Erro no Agente Revisor: {e}")
-    
+        logger.error(f"Erro no Agente Revisor Ollama: {e}")
     return texto_anonimizado
 
-# =========================================================
-# ORQUESTRAÇÃO FINAL
-# =========================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True, usar_agente_revisor: bool = False):
     try:
         if val is None or not str(val).strip(): return val, None
         text = str(val)
         if len(text) < 2: return text, None
         
-        # 1. Ação do Executor (Máquina)
         entities = _detect_all(text, anon_location)
         if not entities: return text, None
         
         result, last = [], 0
-        text_altered = False
-        
         for s, e, v, t in entities:
             if s < last: continue
             result.append(text[last:s])
@@ -247,7 +277,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True, usar_agente_
         result.append(text[last:])
         texto_maquina = "".join(result)
         
-        # 2. Ação do Agente Revisor
         if usar_agente_revisor and len(text.split()) >= 3:
             texto_final = _agente_revisor(text, texto_maquina)
         else:
@@ -255,11 +284,13 @@ def anonymize_value(col_name: str, val, anon_location: bool = True, usar_agente_
 
         return texto_final, ("TEXT" if texto_final != text else None)
     except Exception as e:
-        logger.error(f"⚠️ Erro ao aplicar mascara na coluna '{col_name}': {e}")
+        logger.exception(f"Erro ao processar campo: {e}")
         return str(val), None 
 
 def reset_memory():
-    _MAPPING_CACHE.clear()///// 
+    _MAPPING_CACHE.clear() 
+
+///
 import streamlit as st
 import re
 import random
@@ -281,10 +312,17 @@ import db_utils
 import anonymizer
 
 # ==================================================
-# CONFIGURAÇÕES INICIAIS
+# CONFIGURAÇÕES INICIAIS E DEBUG
 # ==================================================
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*resume_download.*")
+
+# Configuração do Logger principal para rastreio no terminal
+logging.basicConfig(
+    level=logging.DEBUG, 
+    format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 importlib.reload(db_utils)
 importlib.reload(anonymizer)
@@ -311,15 +349,12 @@ def apply_gps_jitter(coord_str):
         else:
             c = int(coord_str)
             return str(c + random.randint(-300, 300)) 
-    except ValueError:
+    except ValueError as e:
+        logger.warning(f"Falha ao aplicar jitter em coordenada '{coord_str}': {e}")
         return coord_str
 
-def split_text_into_chunks(text, max_tokens=300):
-    words = text.split()
-    if len(words) <= max_tokens: return [text]
-    return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
-
 def build_url(db_type, user, password, host, port, db):
+    logger.debug(f"Construindo URL de conexão para o banco tipo: {db_type}, host: {host}, db: {db}")
     if db_type == "mssql":
         driver = [d for d in pyodbc.drivers() if "SQL Server" in d][-1]
         if host and "localdb" in host.lower():
@@ -332,7 +367,7 @@ def build_url(db_type, user, password, host, port, db):
 # ==================================================
 # PROCESSAMENTO CENTRAL BLINDADO
 # ==================================================
-def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=None):
+def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=None, usar_agente=False):
     if modo != "🛡️ Anonimização Total" or not rows: return rows
     if col_profiles is None: col_profiles = {}
 
@@ -372,26 +407,29 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
                     row_dict[col] = str(anonymizer._get_fake(old_str, faker_key))
 
                 else:
-                    # TEXTO LIVRE E DESCONHECIDOS (PENTE FINO COM IA)
+                    # ==========================================================
+                    # TEXTO LIVRE E DESCONHECIDOS (PENTE FINO PRESERVADO)
+                    # ==========================================================
                     vault = {}
                     def hide(match):
-                        token = f"__SHLD{len(vault)}__"
+                        token = f"◈{len(vault)}◈"
                         vault[token] = match.group(0)
-                        return f" {token} "
+                        return token
 
+                    # Esconde HTML e entidades HTML antes de processar
                     safe_text = html_regex.sub(hide, old_str)
-                    safe_text = re.sub(r'\s+', ' ', safe_text).strip()
                     
-                    chunks = split_text_into_chunks(safe_text)
-                    anon_chunks = []
+                    # Chama a função de anonimização do backend (anonymizer.py)
+                    final_text, _ = anonymizer.anonymize_value(
+                        col_name=col, 
+                        val=safe_text, 
+                        anon_location=anon_geo, 
+                        usar_agente_revisor=usar_agente
+                    )
                     
-                    for chunk in chunks:
-                        new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo, usar_agente_revisor=True)
-                        anon_chunks.append(str(new_val))
-                    
-                    final_text = " ".join(anon_chunks)
+                    # Restaura os blocos HTML/XML originais para não quebrar a estrutura
                     for token, original in vault.items():
-                        final_text = final_text.replace(f" {token} ", original).replace(token, original)
+                        final_text = final_text.replace(token, original)
 
                     row_dict[col] = final_text
 
@@ -420,7 +458,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns, col_profiles=No
 
             except Exception as e:
                 # REDE DE SEGURANÇA FINAL
-                print(f"⚠️ [IGNORADO] Erro severo na coluna '{col}'. Dado original mantido. Motivo: {e}")
+                logger.exception(f"Erro severo no processamento da coluna '{col}'. Dado original mantido.")
                 row_dict[col] = old
 
         processed.append(row_dict)
@@ -478,6 +516,10 @@ with st.sidebar:
     anon_geo = st.toggle("Mascara De GPS", value=True, disabled=st.session_state.is_running)
     ignorar_duplicatas = st.toggle("🔄 Ignorar Duplicatas", value=True, disabled=st.session_state.is_running)
     super_proc = st.toggle("🚀 Multi CPU", value=False, disabled=st.session_state.is_running)
+    
+    # === NOVO: TOGGLE DE DEBUG ===
+    debug_mode = st.toggle("🐛 Modo Debug", value=False, help="Mostra logs extras e preview leve de dados", disabled=st.session_state.is_running)
+    
     n_cores = st.slider("CPU", 1, db_utils.get_cpu_info(), db_utils.get_cpu_info(), disabled=st.session_state.is_running) if super_proc else 1
 
     st.divider()
@@ -488,6 +530,7 @@ with st.sidebar:
     btn_conectar = st.button("🔌 1. Conectar e Mapear", use_container_width=True, disabled=st.session_state.is_running)
     
     if btn_conectar:
+        logger.info("Iniciando Fase 1: Conectar e Mapear...")
         with st.spinner("Conectando e mapeando banco de origem..."):
             try:
                 src_engine = db_utils.connect(build_url(db_type, **src_cfg))
@@ -503,8 +546,10 @@ with st.sidebar:
                 st.session_state.mapa_tabelas = mapa
                 st.session_state.db_mapeado = True
                 st.session_state.analise_concluida = False 
+                logger.info(f"Mapeamento concluído com sucesso. Schemas encontrados: {len(mapa)}")
                 st.success(f"✅ Sucesso! {len(mapa)} schemas mapeados.")
             except Exception as e:
+                logger.exception("Falha na conexão ao banco de origem.")
                 st.error(f"Falha na conexão:\n{e}")
 
     # ==========================
@@ -531,6 +576,7 @@ with st.sidebar:
         btn_analisar = st.button("🧠 2. Analisar Dados e IA", type="primary", use_container_width=True, disabled=not tabelas_selecionadas or st.session_state.is_running)
         
         if btn_analisar and tabelas_selecionadas:
+            logger.info("Iniciando Fase 2: Análise de Dados e IA...")
             with st.spinner("Analisando estrutura e perfilando com IA..."):
                 try:
                     src_engine = db_utils.connect(build_url(db_type, **src_cfg))
@@ -539,6 +585,7 @@ with st.sidebar:
                     amostra_crua_global = [] 
                     
                     for table in tabelas_selecionadas:
+                        logger.debug(f"Amostrando dados da tabela '{table}'...")
                         chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema_selecionado, 100)
                         primeiro_lote = next(chunk_gen, [])
                         
@@ -557,13 +604,15 @@ with st.sidebar:
                     
                     st.session_state.todas_colunas_disponiveis = sorted(list(todas_set))
                     st.session_state.colunas_perfiladas = perfis_detectados
-                    st.session_state.amostra_crua = amostra_crua_global[:5] # Limita a 5 linhas pro preview
+                    st.session_state.amostra_crua = amostra_crua_global[:5] 
                     st.session_state.schema_alvo = schema_selecionado
                     st.session_state.tabelas_alvo = tabelas_selecionadas
                     
                     st.session_state.analise_concluida = True
+                    logger.info("Perfilamento por IA concluído com sucesso.")
                     st.success("✅ Perfilamento IA concluído!")
                 except Exception as e:
+                    logger.exception("Falha na Fase de Análise e Perfilamento.")
                     st.error(f"🚨 Falha na Fase de Análise!\nDetalhe do erro: {e}")
 
     # ==========================
@@ -613,41 +662,51 @@ if st.session_state.analise_concluida:
                 st.markdown(f"- **{c}**: <span style='color:{cor}; font-weight:bold;'>[{tipo}]</span>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # === NOVO: DEMONSTRATIVO VISUAL (PREVIEW) ===
-    st.markdown("### 🧪 Demonstrativo de Transformação")
-    st.caption(f"Simulação gerada para o schema **{st.session_state.schema_alvo}** e tabelas selecionadas.")
-    
     colunas_alvo_final = [c for c in st.session_state.todas_colunas_disponiveis if c not in st.session_state.colunas_ignoradas]
 
     if st.session_state.amostra_crua:
+        st.markdown("### 🧪 Demonstrativo de Transformação")
+        st.caption(f"Simulação gerada para o schema **{st.session_state.schema_alvo}** e tabelas selecionadas.")
+        
         try:
-            df_antes = pd.DataFrame(st.session_state.amostra_crua)
-            
             # Gera a simulação processando a amostra crua
             amostra_anonimizada = process_chunk_parallel(
                 rows=st.session_state.amostra_crua,
                 modo=modo,
                 anon_geo=anon_geo,
                 target_columns=colunas_alvo_final,
-                col_profiles=st.session_state.colunas_perfiladas
+                col_profiles=st.session_state.colunas_perfiladas,
+                usar_agente=usar_agente
             )
-            df_depois = pd.DataFrame(amostra_anonimizada)
             
             aba_antes, aba_depois = st.tabs(["🔴 Dados Originais (Cru)", "🟢 Dados Mascarados (Simulação)"])
-            with aba_antes: st.dataframe(df_antes, use_container_width=True)
-            with aba_depois: st.dataframe(df_depois, use_container_width=True)
+            
+            if debug_mode:
+                with aba_antes: 
+                    st.json(st.session_state.amostra_crua) 
+                with aba_depois: 
+                    st.json(amostra_anonimizada)
+            else:
+                df_antes = pd.DataFrame(st.session_state.amostra_crua)
+                df_depois = pd.DataFrame(amostra_anonimizada)
+                with aba_antes: 
+                    st.dataframe(df_antes, use_container_width=True)
+                with aba_depois: 
+                    st.dataframe(df_depois, use_container_width=True)
                 
         except Exception as e:
+            logger.exception("Falha ao renderizar a simulação.")
             st.warning(f"⚠️ Não foi possível renderizar a simulação. Motivo: {e}")
     else:
         st.info("Nenhuma amostra disponível para esta seleção.")
-        
+            
     st.divider()
     
     # O GRANDE BOTÃO DE INÍCIO
     iniciar_pipeline = st.button("🚀 3. INICIAR PROCESSAMENTO NO BANCO", type="primary", use_container_width=True, disabled=st.session_state.is_running)
     
     if iniciar_pipeline:
+        logger.info("Botão de pipeline acionado!")
         st.session_state.colunas_selecionadas_finais = colunas_alvo_final
         st.session_state.ultimo_progresso = 0.0
         st.session_state.ultimo_status_msg = ""
@@ -669,6 +728,7 @@ if st.session_state.ultima_metrica:
     metric_placeholder.markdown(st.session_state.ultima_metrica)
 
 def run_pipeline():
+    logger.info("=== INICIANDO PIPELINE DE DADOS ===")
     proc = psutil.Process(os.getpid())
     t0_global = time.time()
     current_phase = 0
@@ -681,6 +741,7 @@ def run_pipeline():
         nonlocal current_phase
         current_phase += 1
         msg = f"🔷 Fase {current_phase}/{phase_total} • {title} ({subtitle})"
+        logger.info(f"Fase alterada: {title} ({subtitle})")
         st.session_state.ultimo_status_msg = msg
         st.session_state.ultimo_status_tipo = "info"
         status.info(msg)
@@ -693,7 +754,9 @@ def run_pipeline():
     # 1. FASE DE CONEXÃO
     # ==========================
     set_phase("Conectando bancos", "estabelecendo conexões")
+    logger.debug("Criando engine origem.")
     src_engine = db_utils.connect(build_url(db_type, **src_cfg))
+    logger.debug("Criando engine destino.")
     dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
     db_utils.set_replication_mode(dst_engine, "replica")
 
@@ -701,16 +764,18 @@ def run_pipeline():
     # 2. FASE DE MAPEAMENTO/CÓPIA ESTRUTURA
     # ==========================
     set_phase("Mapeando estruturas", "schemas e tabelas")
-    if modo == "🛡️ Anonimização Total": anonymizer.reset_memory() 
+    if modo == "🛡️ Anonimização Total": 
+        logger.debug("Limpando cache de memória do anonymizer.")
+        anonymizer.reset_memory() 
 
     s = st.session_state.schema_alvo
     tables = st.session_state.tabelas_alvo
     work_list, total_estimated, total_tables = [], 0, 0
 
-    # Copia a estrutura apenas do Schema selecionado
+    logger.info(f"Copiando schema {s} para o destino...")
     db_utils.copy_schema(src_engine, dst_engine, s)
     
-    # Avalia a ordem correta das tabelas selecionadas
+    logger.debug(f"Construindo grafo de dependências para as tabelas: {tables}")
     ordered = db_utils.build_dependency_graph(src_engine, tables, s)
     
     for t in ordered:
@@ -718,8 +783,10 @@ def run_pipeline():
         work_list.append((s, t, count))
         total_estimated += count
         total_tables += 1
+        logger.debug(f"Tabela mapeada para processamento: {t} (Estimativa: {count} linhas)")
 
     if total_estimated == 0:
+        logger.warning("Nenhuma linha encontrada nas tabelas selecionadas para processamento.")
         debug_box.warning("⚠️ Nenhuma linha encontrada nas tabelas selecionadas!")
         return
 
@@ -727,6 +794,7 @@ def run_pipeline():
     # 3. FASE DE LIMPEZA
     # ==========================
     set_phase("Preparando destino", "limpeza")
+    logger.info("Limpando tabelas de destino para recebimento de dados...")
     for s, t, _ in reversed(work_list): 
         db_utils.truncate_table(dst_engine, t, s)
 
@@ -740,6 +808,7 @@ def run_pipeline():
     with ProcessPoolExecutor(max_workers=n_cores) as executor:
         for s, t, t_count in work_list:
             processed_tables += 1
+            logger.info(f"Processando tabela [{processed_tables}/{total_tables}]: {t}")
             info = db_utils.get_table_info(src_engine, t, s)
             
             pks = info.get("primary_keys", [])
@@ -752,6 +821,7 @@ def run_pipeline():
                 try:
                     chunk = next(chunk_generator)
                 except StopIteration:
+                    logger.debug(f"Fim da leitura da tabela {t}")
                     break
 
                 chunk_start = time.time()
@@ -762,12 +832,12 @@ def run_pipeline():
                     if n_cores > 1:
                         sub_sz = max(1, len(rows) // n_cores)
                         sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
-                        futures = [executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols, perfis) for sub_chunk in sub_chunks]
+                        futures = [executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols, perfis, usar_agente) for sub_chunk in sub_chunks]
                         rows = []
                         for original_chunk, f in zip(sub_chunks, futures):
                             rows.extend(f.result() or original_chunk)
                     else:
-                        rows = process_chunk_parallel(rows, modo, anon_geo, target_cols, perfis) or rows
+                        rows = process_chunk_parallel(rows, modo, anon_geo, target_cols, perfis, usar_agente) or rows
 
                 # [ETAPA: ESCRITA / INSERÇÃO]
                 if rows: 
@@ -811,12 +881,14 @@ def run_pipeline():
                     progress_bar.progress(total_progress)
                     last_ui_update = now
 
+    logger.info("Restaurando modo de replicação do destino para origin...")
     db_utils.set_replication_mode(dst_engine, "origin")
     
     st.session_state.ultimo_progresso = 1.0
     progress_bar.progress(1.0)
     
     msg_sucesso = f"✅ Pipeline concluído • {total_rows:,} linhas transferidas e mascaradas em {time.time() - t0_global:.2f}s"
+    logger.info(msg_sucesso)
     st.session_state.ultimo_status_msg = msg_sucesso
     st.session_state.ultimo_status_tipo = "success"
     status.success(msg_sucesso)
@@ -836,6 +908,8 @@ if iniciar_pipeline:
             st.balloons()
         except Exception as e:
             error_str = str(e).lower()
+            logger.exception("🚨 FALHA CRÍTICA NO PIPELINE 🚨")
+            
             if "pg_hba.conf rejects" in error_str:
                 debug_box.error("🚨 Acesso Negado pelo Banco de Dados! Usuário sem permissão.")
             elif "database" in error_str and "does not exist" in error_str:
@@ -844,4 +918,5 @@ if iniciar_pipeline:
                 debug_box.error(f"🚨 **FALHA NO PIPELINE** 🚨\n\n{e}\n\n```python\n{traceback.format_exc()}\n```")
         finally:
             st.session_state.is_running = False # Destrava a UI
+            logger.debug("Liberando UI e disparando rerun do Streamlit.")
             st.rerun() # Atualiza a tela para voltar ao estado clicável
