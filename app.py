@@ -12,17 +12,45 @@ import os
 import pyodbc
 from concurrent.futures import ProcessPoolExecutor
 import difflib
-
 import db_utils
 import anonymizer
+import json
+import threading
+
+# ==================================================
+# SISTEMA DE MEMÓRIA (RECOVER DA TELA)
+# ==================================================
+STATUS_FILE = "pipeline_progress.json"
+
+def save_progress(fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False):
+    """Salva o status atual no disco para sobreviver a bloqueios de tela ou refreshs."""
+    data = {
+        "fase": fase,
+        "tabelas_processadas": t_atual,
+        "tabelas_total": t_total,
+        "linhas_processadas": l_atual,
+        "linhas_total": l_total,
+        "velocidade": velocidade,
+        "tempo_decorrido": tempo,
+        "finalizado": finalizado
+    }
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+def load_progress():
+    """Lê o status do disco se o usuário voltar para a página."""
+    if os.path.exists(STATUS_FILE):
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 # ==================================================
 # CONFIGURAÇÕES INICIAIS
 # ==================================================
-logging.basicConfig(
-    level=logging.DEBUG, 
-    format='%(asctime)s - %(levelname)s - [APP]: %(message)s'
-)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [APP]: %(message)s')
 logger = logging.getLogger(__name__)
 
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -68,7 +96,7 @@ def build_url(db_type, user, password, host, port, db):
     return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
 
 # ==================================================
-# PROCESSAMENTO CENTRAL (RODA NAS CPUS SECUNDÁRIAS)
+# PROCESSAMENTO CENTRAL DAS LINHAS
 # ==================================================
 def process_chunk_parallel(rows, modo, anon_geo, target_columns):
     if modo != "🛡️ Anonimização Total" or not rows:
@@ -94,6 +122,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
             if uuid_regex.match(old_str) or not target_columns or col not in target_columns:
                 continue
 
+            # Jitter de Coluna Estruturada (Se a coluna inteira for um GPS)
             if anon_geo:
                 if m := gps_pair.match(old_str):
                     row_dict[col] = f"{apply_gps_jitter(m.group(1))}, {apply_gps_jitter(m.group(2))}"
@@ -151,7 +180,114 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
     return processed
 
 # ==================================================
-# ESTADO DA UI & MENU LATERAL
+# O TRABALHADOR FANTASMA (Roda no Sistema Operacional)
+# ==================================================
+def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols):
+    t0_global = time.time()
+    try:
+        save_progress("Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
+        src_engine = db_utils.connect(build_url(db_type, **src_cfg))
+        dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
+        db_utils.set_replication_mode(dst_engine, "replica")
+
+        save_progress("Mapeando estruturas...", 0, 0, 0, 0, 0, time.time() - t0_global)
+        
+        schemas = db_utils.get_user_schemas(src_engine)
+        allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
+        work_list = []
+        total_estimated, total_tables = 0, 0
+
+        for s in schemas:
+            db_utils.copy_schema(src_engine, dst_engine, s)
+            tables = [t for t in db_utils.get_tables(src_engine, s) if not allowed or t in allowed]
+            ordered = db_utils.build_dependency_graph(src_engine, tables, s)
+            for t in ordered:
+                count = db_utils.get_table_count(src_engine, t, s)
+                work_list.append((s, t, count))
+                total_estimated += count
+                total_tables += 1
+
+        if total_estimated == 0:
+            save_progress("Erro: Nenhuma linha encontrada", 0, 0, 0, 0, 0, 0, finalizado=True)
+            return
+
+        save_progress("Limpando destino (Truncate)...", 0, total_tables, 0, total_estimated, 0, time.time() - t0_global)
+        for s, t, _ in reversed(work_list):
+            db_utils.truncate_table(dst_engine, t, s)
+
+        save_progress("Iniciando Processamento...", 0, total_tables, 0, total_estimated, 0, time.time() - t0_global)
+        
+        total_rows, processed_tables, last_json_update = 0, 0, 0
+        weighted_speed_samples = []
+
+        with ProcessPoolExecutor(max_workers=n_cores) as executor:
+            for s, t, t_count in work_list:
+                processed_tables += 1
+
+                for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
+                    chunk_start = time.time()
+                    rows = [dict(r) for r in chunk]
+
+                    if modo == "🛡️ Anonimização Total":
+                        if n_cores > 1:
+                            sub_sz = max(1, len(rows) // n_cores)
+                            sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
+                            
+                            futures = [
+                                executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
+                                for sub_chunk in sub_chunks
+                            ]
+                            
+                            rows = []
+                            for original_chunk, f in zip(sub_chunks, futures):
+                                try: 
+                                    result = f.result()
+                                    rows.extend(result if result else original_chunk)
+                                except Exception as e: 
+                                    logger.error(f"🚨 CPU worker falhou. Erro: {e}")
+                                    rows.extend(original_chunk)
+                        else:
+                            try:
+                                res = process_chunk_parallel(rows, modo, anon_geo, target_cols)
+                                if res: rows = res
+                            except Exception as e:
+                                logger.error(f"🚨 Erro no Single Core. Erro: {e}")
+
+                    if rows:
+                        db_utils.insert_rows(dst_engine, t, s, rows)
+
+                    inserted_count = len(rows)
+                    total_rows += inserted_count
+
+                    chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
+                    weighted_speed_samples.append(chunk_speed)
+                    if len(weighted_speed_samples) > 30:
+                        weighted_speed_samples.pop(0)
+
+                    # Escreve o andamento no arquivo JSON a cada 1.5s
+                    now = time.time()
+                    if now - last_json_update > 1.5:
+                        elapsed = now - t0_global
+                        stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
+                        
+                        save_progress(
+                            fase=f"Processando: {t}",
+                            t_atual=processed_tables, t_total=total_tables,
+                            l_atual=total_rows, l_total=total_estimated,
+                            velocidade=stable_speed, tempo=elapsed, finalizado=False
+                        )
+                        last_json_update = now
+
+        db_utils.set_replication_mode(dst_engine, "origin")
+        save_progress("Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
+        logger.info("✅ Thread em background finalizada com sucesso!")
+
+    except Exception as e:
+        logger.error(f"🚨 Erro Fatal no Background: {e}", exc_info=True)
+        save_progress(f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
+
+# ==================================================
+# INTERFACE E MENU LATERAL
 # ==================================================
 if "analise_concluida" not in st.session_state:
     st.session_state.analise_concluida = False
@@ -221,148 +357,104 @@ with st.sidebar:
 
     if st.session_state.analise_concluida:
         st.markdown("### Selecione as Exceções")
-        st.info("⚠️ Todas as colunas textuais serão anonimizadas. Escolha abaixo as que devem ser IGNORADAS.")
+        st.info("⚠️ Todas as colunas textuais serão anonimizadas. Escolha as que devem ser IGNORADAS.")
         
         opcoes_validas = st.session_state.todas_colunas_disponiveis
         colunas_ignoradas = st.multiselect("Ignorar colunas:", options=opcoes_validas, default=[])
-        
         colunas_finais = [col for col in opcoes_validas if col not in colunas_ignoradas]
         
         start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
         if start_btn:
             st.session_state.colunas_selecionadas_finais = colunas_finais
-
 # ==================================================
-# PIPELINE
+# FRONTEND: MONITOR DE PROGRESSO
+# ==================================================
+# ==================================================
+# FRONTEND: MONITOR DE PROGRESSO
 # ==================================================
 st.title("🛡️ Pipeline De Proteção De Dados")
-debug_box = st.empty() 
-progress_bar = st.progress(0)
-status = st.empty()
-metric_placeholder = st.empty()
-
-def run_pipeline():
-    t0_global = time.time()
-    current_phase = 0
-    phase_total = 4
-    target_cols = st.session_state.colunas_selecionadas_finais
-
-    def set_phase(title, subtitle=""):
-        nonlocal current_phase
-        current_phase += 1
-        status.info(f"🔷 Fase {current_phase}/{phase_total} • {title}")
-        progress_bar.progress(min((current_phase - 1) / phase_total * 0.25, 0.25))
-
-    set_phase("Conectando bancos de dados", "estabelecendo conexões")
-    src_engine = db_utils.connect(build_url(db_type, **src_cfg))
-    dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
-    db_utils.set_replication_mode(dst_engine, "replica")
-
-    set_phase("Mapeando estruturas", "schemas e tabelas")
-    if modo == "🛡️ Anonimização Total" and not super_proc:
-        try:
-            anonymizer.get_gliner()
-            status.success("🧠 IA carregada no processo principal")
-        except Exception as e:
-            debug_box.error(f"🚨 Falha ao carregar IA: {e}")
-
-    schemas = db_utils.get_user_schemas(src_engine)
-    allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
-    work_list = []
-    total_estimated, total_tables = 0, 0
-
-    for s in schemas:
-        db_utils.copy_schema(src_engine, dst_engine, s)
-        tables = [t for t in db_utils.get_tables(src_engine, s) if not allowed or t in allowed]
-        ordered = db_utils.build_dependency_graph(src_engine, tables, s)
-        for t in ordered:
-            count = db_utils.get_table_count(src_engine, t, s)
-            work_list.append((s, t, count))
-            total_estimated += count
-            total_tables += 1
-
-    if total_estimated == 0:
-        debug_box.warning("⚠️ Nenhuma linha encontrada nas tabelas de origem!")
-        return
-
-    set_phase("Preparando destino", "limpeza de tabelas")
-    for s, t, _ in reversed(work_list):
-        db_utils.truncate_table(dst_engine, t, s)
-
-    set_phase("Executando pipeline", "processamento e carga")
-    total_rows, processed_tables, last_ui_update = 0, 0, 0
-    weighted_speed_samples = []
-
-    with ProcessPoolExecutor(max_workers=n_cores) as executor:
-        for s, t, t_count in work_list:
-            processed_tables += 1
-
-            for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
-                chunk_start = time.time()
-                rows = [dict(r) for r in chunk]
-                
-                logger.debug(f"Processando {len(rows)} linhas da tabela {t}...")
-
-                if modo == "🛡️ Anonimização Total":
-                    if n_cores > 1:
-                        sub_sz = max(1, len(rows) // n_cores)
-                        sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
-                        
-                        futures = [
-                            executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
-                            for sub_chunk in sub_chunks
-                        ]
-                        
-                        rows = []
-                        for original_chunk, f in zip(sub_chunks, futures):
-                            try: 
-                                result = f.result()
-                                rows.extend(result if result else original_chunk)
-                            except Exception as e: 
-                                logger.error(f"🚨 CPU worker falhou. Salvando os dados originais. Erro: {e}")
-                                rows.extend(original_chunk)
-                    else:
-                        try:
-                            res = process_chunk_parallel(rows, modo, anon_geo, target_cols)
-                            if res: rows = res
-                        except Exception as e:
-                            logger.error(f"🚨 Erro no processamento Single Core. Erro: {e}")
-
-                if rows:
-                    db_utils.insert_rows(dst_engine, t, s, rows)
-
-                inserted_count = len(rows)
-                total_rows += inserted_count
-
-                chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
-                weighted_speed_samples.append(chunk_speed)
-                if len(weighted_speed_samples) > 30:
-                    weighted_speed_samples.pop(0)
-
-                now = time.time()
-                if now - last_ui_update > 1:
-                    elapsed = now - t0_global
-                    stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
-                    total_progress = min(0.25 + ((total_rows / max(total_estimated, 1)) * 0.75), 1.0)
-                    
-                    metric_placeholder.markdown(f"""
-                    ### 📊 Progresso do Pipeline
-                    - 📂 Tabela: **{processed_tables}/{total_tables}**
-                    - 🧮 Registros: **{total_rows:,} / {total_estimated:,}**
-                    - ⚡ Velocidade real: **{stable_speed:,.0f} linhas/s**
-                    - ⏱️ Tempo: **{elapsed:.1f}s**
-                    - 🔥 CPU: **{psutil.cpu_percent(interval=0.1):.0f}%**
-                    """)
-                    progress_bar.progress(total_progress)
-                    last_ui_update = now
-
-    db_utils.set_replication_mode(dst_engine, "origin")
-    progress_bar.progress(1.0)
-    status.success(f"✅ Pipeline concluído com sucesso • {total_rows:,} linhas em {time.time() - t0_global:.2f}s")
 
 if start_btn:
-    try:
-        run_pipeline()
-        st.balloons()
-    except Exception as e:
-        debug_box.error(f"🚨 Erro Fatal no Pipeline: {e}")
+    save_progress("Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
+    target_cols = st.session_state.colunas_selecionadas_finais
+    
+    thread = threading.Thread(
+        target=run_pipeline_background, 
+        args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols)
+    )
+    thread.daemon = True 
+    thread.start()
+    
+    time.sleep(1) # Aguarda 1s para o JSON ser criado
+    st.rerun()    # Recarrega a página para entrar no modo Monitor
+
+# --- MONITOR FLUIDO EM TEMPO REAL ---
+estado_atual = load_progress()
+
+if estado_atual:
+    # Se ainda estiver rodando (finalizado == False)
+    if not estado_atual.get("finalizado", True):
+        st.info("🔄 Monitorando processo em background... (Você pode minimizar, bloquear a tela ou fechar a aba!)")
+        
+        # 1. BOTÃO DE EMERGÊNCIA
+        if st.button("🛑 Forçar Parada / Limpar Sessão", type="secondary"):
+            if os.path.exists(STATUS_FILE):
+                os.remove(STATUS_FILE)
+            st.rerun()
+            
+        # 2. DETECTOR DE MORTE DA THREAD (Zumbi)
+        # Se o arquivo não foi alterado nos últimos 15 segundos, a Thread morreu (ex: reiniciou o servidor)
+        tempo_sem_atualizar = time.time() - os.path.getmtime(STATUS_FILE)
+        if tempo_sem_atualizar > 15:
+            st.error("🚨 O processo em background parou de responder. Provavelmente o servidor foi reiniciado ou ocorreu um erro crítico. Clique em 'Forçar Parada' acima.")
+            st.stop() # Trava a tela aqui e não fica recarregando à toa
+                
+        # 3. EXTRAÇÃO DOS DADOS
+        linhas_proc = estado_atual.get("linhas_processadas", 0)
+        linhas_totais = estado_atual.get("linhas_total", 0)
+        velocidade = estado_atual.get("velocidade", 0)
+        
+        # 4. CÁLCULO DE TEMPO RESTANTE (ETA)
+        linhas_restantes = max(0, linhas_totais - linhas_proc)
+        if velocidade > 0:
+            segundos_restantes = linhas_restantes / velocidade
+            minutos, segundos = divmod(int(segundos_restantes), 60)
+            horas, minutos = divmod(minutos, 60)
+            tempo_restante_str = f"{horas}h {minutos}m {segundos}s" if horas > 0 else f"{minutos}m {segundos}s"
+        else:
+            tempo_restante_str = "Calculando..."
+            
+        # 5. ATUALIZAÇÃO VISUAL DA TELA
+        total_linhas_calc = max(linhas_totais, 1)
+        progresso = min(0.25 + ((linhas_proc / total_linhas_calc) * 0.75), 1.0) if linhas_proc > 0 else 0.1
+        
+        st.progress(progresso)
+        st.info(f"🔷 Fase atual: {estado_atual['fase']}")
+        
+        st.markdown(f"""
+        ### 📊 Progresso do Pipeline
+        - 📂 Tabelas concluídas: **{estado_atual['tabelas_processadas']} / {estado_atual['tabelas_total']}**
+        - 🧮 Registros processados: **{linhas_proc:,} / {linhas_totais:,}**
+        - 📉 **Faltam processar:** **<span style="color:#ff4444">{linhas_restantes:,} linhas</span>**
+        - ⚡ Velocidade média: **{velocidade:,.0f} linhas/s**
+        - ⏱️ Tempo decorrido: **{estado_atual['tempo_decorrido']:.1f}s**
+        - ⏳ **Tempo Restante (ETA):** **<span style="color:#ffcc00">{tempo_restante_str}</span>**
+        """, unsafe_allow_html=True)
+        
+        # 6. O LOOP DO STREAMLIT
+        time.sleep(1.5) # Espera um pouco e recarrega a tela suavemente para ler o JSON
+        st.rerun()
+
+    # Se já tiver terminado (finalizado == True)
+    else:
+        if "Erro" in estado_atual.get("fase", ""):
+            st.error(f"🚨 O processo parou devido a um erro fatal: {estado_atual['fase']}")
+        else:
+            st.progress(1.0)
+            st.success("✅ Pipeline concluído com sucesso!")
+            st.balloons()
+            
+        if st.button("Limpar e Iniciar Nova Sessão"):
+            if os.path.exists(STATUS_FILE):
+                os.remove(STATUS_FILE)
+            st.rerun()
