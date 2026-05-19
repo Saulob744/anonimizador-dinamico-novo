@@ -24,3 +24,5 @@ gliner>=0.2.0
 # Dependências comuns do gliner
 torch>=2.0
 transformers>=4.40
+
+psutil>=5.9
