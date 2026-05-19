@@ -14,46 +14,42 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 # ==================================================
-# LOGS
+# LOGS E CACHE
 # ==================================================
 logger = logging.getLogger(__name__)
-# DICA: Certifique-se de configurar o nível básico do logger no seu arquivo principal:
-# logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
-
 _TABLE_CACHE: Dict[str, Table] = {}
 
 # ==================================================
-# ENCODING / SANITIZAÇÃO
+# ENCODING / SANITIZAÇÃO (BLINDADO)
 # ==================================================
-def safe_decode(value):
+def safe_decode(value: Any) -> Any:
     """
-    Corrige problemas de encoding sem derrubar pipeline.
+    Corrige problemas de encoding e limpa caracteres assassinos de DBs (ex: Null Bytes).
     """
     if value is None:
         return None
-    # bytes -> utf8 -> latin1 -> replace
+        
     if isinstance(value, bytes):
         try:
-            return value.decode("utf-8")
+            # Tenta o padrão ouro
+            return value.decode("utf-8").replace('\x00', '')
         except UnicodeDecodeError:
-            logger.debug(f"Falha ao decodificar UTF-8 para o valor (bytes), tentando latin1.")
+            logger.debug("Falha ao decodificar UTF-8 (bytes), tentando latin1.")
             try:
-                return value.decode("latin1")
+                return value.decode("latin1").replace('\x00', '')
             except Exception:
-                logger.debug(f"Falha ao decodificar latin1, usando replace.")
-                return value.decode("utf-8", errors="replace")
+                logger.debug("Falha ao decodificar latin1, usando replace de emergência.")
+                return value.decode("utf-8", errors="replace").replace('\x00', '')
 
-    # strings problemáticas
     if isinstance(value, str):
+        # Remoção de Null Bytes (\x00) é crítica pois o PostgreSQL rejeita a string inteira
+        clean_val = value.replace('\x00', '')
         try:
-            value.encode("utf-8")
-            return value
+            clean_val.encode("utf-8")
+            return clean_val
         except UnicodeEncodeError:
-            logger.debug(f"Falha de encoding na string, aplicando replace.")
-            return value.encode(
-                "utf-8",
-                errors="replace"
-            ).decode("utf-8")
+            logger.debug("Falha de encoding na string, aplicando replace.")
+            return clean_val.encode("utf-8", errors="replace").decode("utf-8")
 
     return value
 
@@ -65,12 +61,10 @@ def get_cpu_info() -> int:
     logger.debug(f"CPU info: detectados {cores} cores.")
     return cores
 
-def calculate_safe_workers(
-    requested_cores: Optional[int] = None
-) -> int:
+def calculate_safe_workers(requested_cores: Optional[int] = None) -> int:
     total = get_cpu_info()
     if requested_cores:
-        safe_workers = min(requested_cores, total)
+        safe_workers = min(max(1, requested_cores), total)
     else:
         safe_workers = max(1, int(total * 0.75))
     
@@ -82,16 +76,14 @@ def calculate_safe_workers(
 # ==================================================
 def connect(url: str) -> Engine:
     parsed = make_url(url)
+    # Mascara a senha no log por segurança
+    safe_log_url = repr(parsed).replace(parsed.password, '***') if parsed.password else repr(parsed)
     logger.info(f"🔌 Iniciando conexão com o banco: {parsed.host} / {parsed.database}")
+    logger.debug(f"URL de Conexão (Mascarada): {safe_log_url}")
 
     if "odbc_connect" in url:
         logger.warning("⚠️ ODBC detectado → usando conexão direta")
-        return create_engine(
-            url,
-            pool_pre_ping=True,
-            pool_recycle=3600,
-            future=True
-        )
+        return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
     if not (db_name := parsed.database):
         logger.error("❌ Falha na conexão: URL fornecida não contém um banco de dados.")
@@ -101,45 +93,27 @@ def connect(url: str) -> Engine:
     logger.debug(f"Backend detectado: {backend}")
 
     admin_db = (
-        "postgres"
-        if backend == "postgresql"
-        else "master"
-        if backend == "mssql"
+        "postgres" if backend == "postgresql" 
+        else "master" if backend == "mssql" 
         else None
     )
     
-    # ==================================================
-    # CRIAÇÃO DE DATABASE
-    # =================================================
+    # --- CRIAÇÃO DE DATABASE AUTOMÁTICA ---
     if admin_db:
         logger.info(f"Verificando existência do banco '{db_name}' através do admin_db '{admin_db}'")
         server_url = parsed.set(database=admin_db)
         try:
-            engine_server = create_engine(
-                server_url,
-                isolation_level="AUTOCOMMIT",
-                future=True
-            )
+            engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
             create_queries = {
                 "postgresql": f'CREATE DATABASE "{db_name}"',
                 "mysql": f"CREATE DATABASE IF NOT EXISTS `{db_name}`",
-                "mssql": f"""
-                    IF NOT EXISTS (
-                        SELECT name
-                        FROM sys.databases
-                        WHERE name = '{db_name}'
-                    )
-                    EXEC('CREATE DATABASE [{db_name}]')
-                    """
+                "mssql": f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}') EXEC('CREATE DATABASE [{db_name}]')"
             }
+            
             with engine_server.connect() as conn:
                 if backend == "postgresql":
                     exists = conn.execute(
-                        text("""
-                            SELECT 1
-                            FROM pg_database
-                            WHERE datname = :name
-                        """),
+                        text("SELECT 1 FROM pg_database WHERE datname = :name"), 
                         {"name": db_name}
                     ).scalar()
 
@@ -151,29 +125,27 @@ def connect(url: str) -> Engine:
                         logger.debug(f"✅ Banco '{db_name}' já existe.")
                         
                 elif backend in create_queries:
-                    logger.debug(f"⚙️ Executando query de criação para {backend}...")
+                    logger.debug(f"⚙️ Executando verificação/criação ({backend})...")
                     conn.execute(text(create_queries[backend]))
                     logger.info(f"✅ Verificação/Criação do banco '{db_name}' concluída.")
 
         except sa.exc.OperationalError as e:
-            logger.warning(f"⚠️ Sem acesso ao banco admin para criar/verificar '{db_name}'. Erro: {e}")
+            logger.warning(f"⚠️ Sem acesso de rede ao banco admin para criar '{db_name}'. O banco destino precisa existir. Erro: {e}")
         except sa.exc.ProgrammingError as e:
-            logger.warning(f"⚠️ Sem permissão CREATE DATABASE para '{db_name}'. Erro: {e}")
+            logger.warning(f"⚠️ Sem permissão CREATE DATABASE para '{db_name}'. Assumindo que já existe. Erro: {e}")
         except Exception as e:
-            logger.exception(f"❌ Erro inesperado ao criar/verificar DB '{db_name}': {e}")
+            logger.exception(f"❌ Erro inesperado ao interagir com DB Admin: {e}")
         finally:
             if "engine_server" in locals():
                 engine_server.dispose()
-                logger.debug("Engine server (admin) descartado.")
+                logger.debug("Engine server (admin) liberada.")
 
-    # ==================================================
-    # ENGINE PRINCIPAL
-    # ==================================================
+    # --- ENGINE PRINCIPAL ---
     connect_args = {}
     if backend == "postgresql":
         connect_args["client_encoding"] = "utf8"
         
-    logger.debug("Criando engine principal...")
+    logger.debug("Construindo engine principal da aplicação...")
     engine = create_engine(
         url,
         pool_pre_ping=True,
@@ -181,7 +153,7 @@ def connect(url: str) -> Engine:
         future=True,
         connect_args=connect_args
     )
-    logger.info("✅ Engine principal criada com sucesso.")
+    logger.info("✅ Engine principal conectada com sucesso.")
     return engine
 
 # ==================================================
@@ -204,7 +176,6 @@ def format_table_name(engine: Engine, schema: Optional[str], table: str) -> str:
 def table_exists(engine: Engine, schema: Optional[str], table: str) -> bool:
     logger.debug(f"Inspecionando se tabela {schema or 'default'}.{table} existe...")
     exists = inspect(engine).has_table(table, schema=schema)
-    logger.debug(f"Tabela {table} existe? {exists}")
     return exists
 
 def get_tables(engine: Engine, schema: Optional[str] = None) -> List[str]:
@@ -214,7 +185,6 @@ def get_tables(engine: Engine, schema: Optional[str] = None) -> List[str]:
     return tables
 
 def get_table_info(engine: Engine, table: str, schema: Optional[str] = None) -> Dict[str, Any]:
-    logger.debug(f"Obtendo informações da tabela {schema or 'default'}.{table}...")
     insp = inspect(engine)
     return {
         "columns": insp.get_columns(table, schema=schema),
@@ -228,64 +198,60 @@ def get_table_count(engine: Engine, table: str, schema: Optional[str] = None) ->
         tbl = Table(table, MetaData(), autoload_with=engine, schema=schema)
         with engine.connect() as conn:
             count = conn.execute(sa.select(sa.func.count()).select_from(tbl)).scalar() or 0
-            logger.debug(f"COUNT calculado para {table}: {count}")
+            logger.debug(f"COUNT obtido: {count}")
             return count
     except Exception as e:
-        logger.exception(f"⚠️ Erro ao calcular COUNT para {schema or 'default'}.{table}. Retornando fallback (1000). Erro: {e}")
-        return 1000
+        logger.warning(f"⚠️ Erro ao calcular COUNT. Retornando fallback arbitrário (10000). Erro: {e}")
+        return 10000
 
 def get_user_schemas(engine: Engine) -> List[str]:
-    logger.debug("Buscando schemas do usuário...")
+    logger.debug("Buscando schemas de usuário disponíveis...")
     db_type = get_db_type(engine)
     insp = inspect(engine)
     ignored = (
         {"information_schema", "pg_catalog", "pg_toast"}
-        if db_type == "postgresql"
-        else {"information_schema"}
+        if db_type == "postgresql" else {"information_schema"}
     )
-    schemas = sorted([
-        s for s in insp.get_schema_names()
-        if s not in ignored and not s.startswith("pg_")
-    ])
-    logger.debug(f"Schemas encontrados: {schemas}")
+    schemas = sorted([s for s in insp.get_schema_names() if s not in ignored and not s.startswith("pg_")])
+    logger.debug(f"Schemas validados: {schemas}")
     return schemas
 
 # ==================================================
 # SCHEMA
 # ==================================================
 def copy_schema(src_engine: Engine, dst_engine: Engine, schema: Optional[str] = None):
-    logger.info(f"🔄 Iniciando cópia do schema '{schema or 'default'}'...")
+    logger.info(f"🔄 Iniciando cópia estrutural do schema '{schema or 'default'}'...")
     
     if schema and get_db_type(dst_engine) == "postgresql":
         try:
-            logger.debug(f"Tentando criar schema '{schema}' no destino...")
             with dst_engine.begin() as conn:
                 conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         except Exception as e:
-            logger.warning(f"⚠️ Sem permissão para criar schema '{schema}': {e}")
+            logger.warning(f"⚠️ Sem permissão/Falha ao criar schema '{schema}'. Prosseguindo... Erro: {e}")
             
     meta = MetaData()
-    logger.debug(f"Refletindo tabelas da origem...")
+    logger.debug("Refletindo tabelas da origem...")
     with src_engine.connect() as conn:
         meta.reflect(bind=conn, schema=schema, resolve_fks=False)
         
     tables_to_copy = meta.sorted_tables
-    logger.info(f"Total de tabelas a serem copiadas: {len(tables_to_copy)}")
+    logger.info(f"Tabelas mapeadas para replicação: {len(tables_to_copy)}")
     
     with dst_engine.begin() as conn:
         for table in tables_to_copy:
             try:
-                logger.debug(f"Criando tabela {table.name}...")
                 table.schema = schema
                 for col in table.columns:
-                    col.server_default = None
+                    col.server_default = None # Evita conflito de sequências/defaults dependentes
                 table.create(bind=conn, checkfirst=True)
+                logger.debug(f"Estrutura da tabela {table.name} criada/verificada.")
             except Exception as e:
-                logger.exception(f"⚠️ Falha ao criar tabela {schema or 'default'}.{table.name}: {e}")
+                logger.exception(f"⚠️ Falha ao refletir estrutura da tabela {schema or 'default'}.{table.name}: {e}")
                 
-    logger.info("✅ Cópia de schema finalizada.")
+    logger.info("✅ Cópia de estrutura finalizada.")
+
 # ==================================================
-# STREAMING
+# STREAMING SEGURO
 # ==================================================
 def fetch_rows_streaming(
     engine: Engine,
@@ -293,92 +259,81 @@ def fetch_rows_streaming(
     schema: Optional[str] = None,
     chunk_size: int = 1000,
     order_by: Optional[str] = None
-) -> Generator:
+) -> Generator[List[Dict[str, Any]], None, None]:
     
-    logger.info(f"📥 Iniciando fetch streaming da tabela {schema or 'default'}.{table} (chunk: {chunk_size})")
+    logger.info(f"📥 Iniciando streaming via fetchmany na tabela {schema or 'default'}.{table} (Lotes de {chunk_size})")
     meta = MetaData()
     tbl = Table(table, meta, autoload_with=engine, schema=schema)
     stmt = sa.select(tbl)
 
-    # 1. ORDENAÇÃO MANUAL (Prioridade Máxima se informada)
+    # Lógica de Ordenação Estrita
     if order_by:
         stmt = stmt.order_by(sa.text(order_by))
-        logger.debug(f"Ordenando streaming explicitamente por: {order_by}")
-        
-    # 2. ORDENAÇÃO AUTOMÁTICA (Buscando Chave Primária ou Fallback)
+        logger.debug(f"Ordenação manual aplicada: {order_by}")
     else:
-        pks = [c for c in tbl.primary_key.columns]
-        
+        pks = list(tbl.primary_key.columns)
         if pks:
             stmt = stmt.order_by(*pks)
-            logger.debug(f"Ordenando streaming pelas PKs: {[pk.name for pk in pks]}")
+            logger.debug(f"Ordenando pelas Chaves Primárias: {[pk.name for pk in pks]}")
         else:
-            # 3. FALLBACK: Sem PK, tenta usar todas as colunas disponíveis para garantir alguma estabilidade.
-            logger.warning(f"⚠️ A tabela {table} NÃO possui Primary Key! Tentando ordenação de contingência (todas as colunas).")
-            
+            logger.warning(f"⚠️ Tabela {table} sem Primary Key. Tentando ordenação de contingência por colunas escalares.")
             fallback_cols = []
             for col in tbl.columns:
-                # Evita ordenar por colunas gigantes ou tipos binários/JSON que a maioria dos bancos rejeita no ORDER BY
-                if not isinstance(col.type, (sa.LargeBinary, sa.JSON, sa.ARRAY, getattr(sa, 'JSONB', sa.String))):
-                   fallback_cols.append(col)
+                # Ignora tipos complexos que crasham ordenação
+                if not isinstance(col.type, (sa.LargeBinary, sa.JSON, sa.ARRAY)):
+                   # Evita Postgres JSONB string representation bugs
+                   if not str(col.type).upper().startswith("JSON"):
+                       fallback_cols.append(col)
                    
             if fallback_cols:
                  stmt = stmt.order_by(*fallback_cols)
-                 logger.debug(f"Ordenação de contingência aplicada usando {len(fallback_cols)} colunas compatíveis.")
+                 logger.debug(f"Contingência: Ordenando por {len(fallback_cols)} colunas compatíveis.")
             else:
-                 # Pior cenário absoluto: Uma tabela sem PK e só com tipos complexos.
-                 logger.error(f"❌ Impossível aplicar qualquer ordenação determinística na tabela {table}. A ordem das linhas extraídas será arbitrária (ordem natural do disco).")
+                 logger.error(f"❌ Impossível ordenar a tabela {table} (Apenas tipos complexos). Lendo em ordem de disco natural (Pode causar duplicidade em interrupções).")
 
     with engine.connect() as conn:
-        logger.debug("Executando query de streaming...")
-        
-        #para não carregar a tabela inteira na RAM do Python.
+        logger.debug("Disparando Query Streamada (Server-side cursor simulado)...")
         result = conn.execution_options(stream_results=True).execute(stmt)
         
-        chunks_yielded = 0
-        total_rows = 0
+        chunks_yielded, total_rows = 0, 0
         
         while rows := result.mappings().fetchmany(chunk_size):
             safe_rows = []
             for row in rows:
-                fixed = {}
-                for k, v in row.items():
-                    fixed[k] = safe_decode(v)
+                fixed = {k: safe_decode(v) for k, v in row.items()}
                 safe_rows.append(fixed)
             
             chunks_yielded += 1
             total_rows += len(safe_rows)
-            logger.debug(f"Yielding chunk #{chunks_yielded} com {len(safe_rows)} linhas. (Total até agora: {total_rows})")
+            logger.debug(f"Processado Chunk #{chunks_yielded} -> {len(safe_rows)} linhas (Total Acumulado: {total_rows}).")
             yield safe_rows
             
-    logger.info(f"✅ Streaming finalizado para {table}. Total lido: {total_rows} linhas.")
+    logger.info(f"✅ Streaming total concluído para {table}. Registros: {total_rows}.")
 
 # ==================================================
 # SANITIZAÇÃO
 # ==================================================
 def _sanitize_row_data(table: Table, rows: List[Dict]) -> List[Dict]:
-    logger.debug(f"Sanitizando {len(rows)} linhas para a tabela {table.name}...")
+    """Garante que as strings não quebrem o limite de varchar da coluna do destino."""
     safe_rows = []
-    
     for row in rows:
         new_row = {}
         for col in table.columns:
             val = row.get(col.name)
-            val = safe_decode(val)
             
-            # Limita tamanho
+            # Checagem de Estouro de Limite (Evita DataError)
             if isinstance(val, str) and getattr(col.type, "length", None):
                 if len(val) > col.type.length:
-                    logger.debug(f"Truncando valor da coluna '{col.name}' (tamanho {len(val)} excede {col.type.length})")
-                val = val[:col.type.length]
-                
+                    logger.debug(f"Aviso de Truncagem: Coluna '{col.name}' limite={col.type.length}, recebido={len(val)}. Cortando string.")
+                    val = val[:col.type.length]
+                    
             new_row[col.name] = val
         safe_rows.append(new_row)
         
     return safe_rows
 
 # ==================================================
-# INSERT
+# INSERT RESILIENTE
 # ==================================================
 def insert_rows(
     engine: Engine,
@@ -389,37 +344,38 @@ def insert_rows(
     ignore_conflicts: bool = False
 ):
     if not rows:
-        logger.debug("Nenhuma linha fornecida para inserção. Pulando.")
+        logger.debug("Lote vazio repassado para inserção. Ignorando.")
         return
 
-    logger.info(f"📤 Inserindo {len(rows)} linhas em {schema or 'default'}.{table_name}")
-
     key = f"{engine.url}_{schema or 'default'}_{table_name}"
+    
+    # Gestão de Cache de MetaData para otimização
     if key not in _TABLE_CACHE:
-        logger.debug(f"Tabela {table_name} não está no cache. Refletindo meta dados...")
-        _TABLE_CACHE[key] = Table(
-            table_name,
-            MetaData(),
-            autoload_with=engine,
-            schema=schema
-        )
+        logger.debug(f"Mapeando metadata destino de {table_name} na memória...")
+        _TABLE_CACHE[key] = Table(table_name, MetaData(), autoload_with=engine, schema=schema)
 
     table = _TABLE_CACHE[key]
     db_type = engine.dialect.name
 
     for attempt in range(max_retries):
-        logger.debug(f"Tentativa de inserção {attempt + 1}/{max_retries}...")
         try:
             safe_rows = _sanitize_row_data(table, rows)
+            if not safe_rows: return
             
             with engine.begin() as conn:
+                # Estratégias de Conflito Baseada no Dialeto
                 if ignore_conflicts:
                     if db_type == "postgresql":
                         stmt = pg_insert(table).values(safe_rows).on_conflict_do_nothing()
                     elif db_type == "mysql":
-                        stmt = mysql_insert(table).values(safe_rows).on_duplicate_key_update(
-                            **{c.name: c for c in mysql_insert(table).inserted}
-                        )
+                        # MySQL On Duplicate exige saber o que atualizar, ou usar dummy update.
+                        # Para emular DO NOTHING de forma segura com Bulk Insert:
+                        insert_stmt = mysql_insert(table).values(safe_rows)
+                        update_dict = {c.name: c for c in insert_stmt.inserted if c.name != table.primary_key.columns.keys()[0]} if table.primary_key else {c.name: c for c in insert_stmt.inserted}
+                        if update_dict:
+                            stmt = insert_stmt.on_duplicate_key_update(**update_dict)
+                        else:
+                            stmt = table.insert().values(safe_rows) # Fallback se não der pra mapear
                     elif db_type == "sqlite":
                         stmt = sqlite_insert(table).values(safe_rows).on_conflict_do_nothing()
                     else:
@@ -427,44 +383,38 @@ def insert_rows(
                 else:
                     stmt = table.insert().values(safe_rows)
 
-                logger.debug("Executando statement de insert no banco...")
                 conn.execute(stmt)
 
-            logger.info(f"✅ Inserção concluída com sucesso em {table_name}.")
+            logger.info(f"✅ Inserção de {len(rows)} linhas concluída com sucesso em {table_name}.")
             return
 
         except sa.exc.IntegrityError as e:
             if ignore_conflicts:
-                logger.warning(f"⚠️ Conflito ignorado em {table_name}. Erro: {e}")
+                logger.warning(f"⚠️ Conflito de integridade ignorado com sucesso em {table_name}.")
                 return
-                
-            logger.exception(f"⚠️ Erro de Integridade na tentativa {attempt + 1} em {table_name}")
-            
-            # Se for a última tentativa, interrompe o pipeline e não deixa o erro passar silencioso
+            logger.exception(f"⚠️ Erro de Integridade [Tentativa {attempt + 1}/{max_retries}] em {table_name}")
             if attempt == max_retries - 1:
-                logger.error(f"❌ Falha definitiva de integridade em {table_name}.")
                 raise e 
-            time.sleep(1)
+            time.sleep(1.5)
 
         except Exception as e:
-            logger.exception(f"⚠️ Erro desconhecido na tentativa {attempt + 1} em {table_name}")
-            if rows:
-                logger.warning(f"🔎 Linha exemplo que causou erro: {str(rows[0])[:500]}")
-                
-            # Se for a última tentativa, levanta a exceção para que o orquestrador saiba que o lote falhou
+            logger.exception(f"⚠️ Erro de execução [Tentativa {attempt + 1}/{max_retries}] em {table_name}")
+            # Em caso de erro fatal, remove a tabela do cache pois a estrutura no DB pode ter sido alterada
+            _TABLE_CACHE.pop(key, None) 
+            
             if attempt == max_retries - 1:
-                logger.error(f"❌ Falha definitiva ao inserir {len(rows)} linhas em {table_name} após {max_retries} tentativas.")
+                logger.error(f"❌ Falha crítica ao inserir dados após {max_retries} tentativas. Abortando lote.")
                 raise e 
-            time.sleep(1)
+            time.sleep(1.5)
 
 # ==================================================
 # TRUNCATE
 # ==================================================
 def truncate_table(engine: Engine, table_name: str, schema: Optional[str] = None):
-    logger.info(f"🧹 Iniciando TRUNCATE para a tabela {schema or 'default'}.{table_name}...")
+    logger.info(f"🧹 Disparando TRUNCATE para a tabela {schema or 'default'}.{table_name}...")
 
     if not table_exists(engine, schema, table_name):
-        logger.warning(f"⚠️ Tabela {table_name} não existe para fazer TRUNCATE. Pulando.")
+        logger.warning(f"⚠️ Tabela {table_name} inexistente para TRUNCATE. Operação ignorada.")
         return
 
     table_ref = format_table_name(engine, schema, table_name)
@@ -472,36 +422,35 @@ def truncate_table(engine: Engine, table_name: str, schema: Optional[str] = None
     with engine.begin() as conn:
         try:
             if get_db_type(engine) == "postgresql":
-                logger.debug(f"Executando TRUNCATE CASCADE no PostgreSQL...")
                 conn.execute(text(f"TRUNCATE TABLE {table_ref} CASCADE"))
+                logger.debug("Executado TRUNCATE CASCADE exclusivo para Postgres.")
             else:
-                logger.debug(f"Executando TRUNCATE padrão...")
                 conn.execute(text(f"TRUNCATE TABLE {table_ref}"))
+                logger.debug("Executado TRUNCATE padrão ANSI.")
                 
-            logger.info(f"✅ TRUNCATE concluído em {table_ref}.")
+            logger.info(f"✅ Tabela {table_ref} truncada com sucesso.")
 
         except Exception as e:
-            logger.exception(f"⚠️ Falha no TRUNCATE de {table_ref}. Tentando fallback via DELETE...")
+            logger.warning(f"⚠️ TRUNCATE falhou para {table_ref}. Possível erro de FK. Tentando DELETE absoluto... Erro original: {e}")
             try:
                 conn.execute(text(f"DELETE FROM {table_ref}"))
-                logger.info(f"✅ Fallback (DELETE FROM) executado com sucesso em {table_ref}.")
+                logger.info(f"✅ Executado DELETE total como fallback em {table_ref}.")
             except Exception as delete_e:
-                logger.exception(f"❌ Falha definitiva no DELETE de {table_ref}")
+                logger.exception(f"❌ Impossível limpar a tabela {table_ref} (Nem TRUNCATE nem DELETE funcionaram).")
 
 # ==================================================
-# DEPENDÊNCIAS
+# DEPENDÊNCIAS DE INTEGRIDADE (GRAFO TOPOLÓGICO)
 # ==================================================
 def build_dependency_graph(engine: Engine, tables: List[str], schema: Optional[str] = None) -> List[str]:
-    logger.info(f"🏗️ Construindo grafo de dependências para {len(tables)} tabelas...")
+    logger.info(f"🏗️ Mapeando grafo topológico de dependências entre {len(tables)} tabelas...")
     insp = inspect(engine)
     deps = defaultdict(set)
     in_degree = {t: 0 for t in tables}
 
     for table in tables:
-        logger.debug(f"Inspecionando FKs da tabela {table}...")
         for fk in insp.get_foreign_keys(table, schema=schema):
             ref = fk.get("referred_table")
-            if ref in tables and ref != table:
+            if ref in tables and ref != table: # Evita auto-referência direta no grau
                 deps[ref].add(table)
                 in_degree[table] += 1
 
@@ -516,18 +465,19 @@ def build_dependency_graph(engine: Engine, tables: List[str], schema: Optional[s
             if in_degree[d] == 0:
                 queue.append(d)
 
+    # Concatena tabelas que caíram em referência circular / isoladas na base
     final_order = ordered + [t for t in tables if t not in ordered]
-    logger.debug(f"Ordem de dependência gerada: {final_order}")
+    logger.debug(f"Grafo de Inserção gerado: {' -> '.join(final_order)}")
     return final_order
 
 # ==================================================
-# REPLICATION MODE
+# REPLICATION ROLE
 # ==================================================
 def set_replication_mode(engine: Engine, mode: str = "replica"):
-    logger.info(f"⚙️ Configurando replication mode para '{mode}'...")
+    logger.info(f"⚙️ Ajustando 'session_replication_role' para '{mode}'...")
     
     if get_db_type(engine) != "postgresql":
-        logger.debug("Banco não é PostgreSQL. Replication mode ignorado.")
+        logger.debug("Dialeto não é Postgres. Ação ignorada com sucesso.")
         return
 
     try:
@@ -536,16 +486,12 @@ def set_replication_mode(engine: Engine, mode: str = "replica"):
                 text("SET session_replication_role = :mode"),
                 {"mode": mode}
             )
-            logger.info(f"✅ session_replication_role alterado para: {mode}")
+            logger.info(f"✅ Replication Role validada no estado: {mode.upper()}")
 
     except sa.exc.DBAPIError as e:
         error_msg = str(e).lower()
-        if (
-            "permission denied" in error_msg
-            or "insufficientprivilege" in error_msg
-            or "session_replication_role" in error_msg
-        ):
-            logger.warning("⚠️ Sem privilégio SUPERUSER. Continuando sem replication_role.")
+        if any(term in error_msg for term in ["permission denied", "insufficientprivilege", "session_replication_role"]):
+            logger.warning("⚠️ Usuário do Banco não possui privilégio SUPERUSER para desativar triggers/FKs temporalmente. O pipeline prosseguirá normalmente, mas gatilhos serão acionados.")
         else:
-            logger.exception("❌ Erro ao tentar aplicar session_replication_role.")
+            logger.exception("❌ Erro sistêmico ao definir o role de replicação.")
             raise
