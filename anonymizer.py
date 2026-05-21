@@ -312,7 +312,12 @@ def _get_fake(value: str, typ: str) -> str:
     cache_key = f"{typ}:{norm_val}"
     if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
 
-    fake.seed_instance(int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16))
+    try:
+        seed_hex = hashlib.sha256(norm_val.encode()).hexdigest()[:8]
+        seed_int = int(seed_hex, 16) if seed_hex.strip() else random.randint(1, 99999)
+        fake.seed_instance(seed_int)
+    except Exception:
+        fake.seed_instance(random.randint(1, 99999))
     
     if typ in ["PER", "NOME_SOLTO"]: val = fake.name().upper()
     elif typ == "CPF": val = fake.cpf()
