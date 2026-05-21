@@ -402,9 +402,12 @@ if estado_atual:
         
         
         tempo_sem_atualizar = time.time() - os.path.getmtime(STATUS_FILE)
-        if tempo_sem_atualizar > 15:
-            st.error("🚨 O processo em background parou de responder. Provavelmente o servidor foi reiniciado ou ocorreu um erro crítico. Clique em 'Forçar Parada' acima.")
-            st.stop() 
+        
+        if tempo_sem_atualizar > 600: 
+            st.error("🚨 O processo não responde há mais de 10 minutos. Clique em 'Forçar Parada' acima.")
+            st.stop()
+        elif tempo_sem_atualizar > 15:
+            st.warning("⏳ A IA está processando um lote pesado de textos. Os dados abaixo estão congelados temporariamente, mas o processo continua rodando...") 
                 
         # 3. EXTRAÇÃO DOS DADOS
         linhas_proc = estado_atual.get("linhas_processadas", 0)

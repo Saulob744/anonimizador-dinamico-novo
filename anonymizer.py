@@ -26,6 +26,10 @@ except OSError:
 _MAPPING_CACHE = {}
 _COLUMN_POLICIES = {} 
 _OLLAMA_CACHE = {} 
+_NEGATIVE_PATTERN_CACHE = set()
+
+def _get_skeleton(text: str) -> str:
+    return re.sub(r'\d+', '[NUM]', text.upper())
 _DYNAMIC_SAMPLES = {} 
 
 fake = Faker("pt_BR")
@@ -62,8 +66,15 @@ NAME_FALLBACK_REGEX = re.compile(
 # 1. MOTOR DE COMUNICAÇÃO COM A IA
 # =========================================================
 def _ask_ollama_sim_nao(pergunta: str, cache_key: str) -> bool:
-   
+    
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
+    
+    termo_avaliado = cache_key.split(":")[-1] 
+    esqueleto = _get_skeleton(termo_avaliado)
+    
+    if esqueleto in _NEGATIVE_PATTERN_CACHE:
+        logger.debug(f"🛑 Bloqueado por Padrão: {termo_avaliado} ({esqueleto})")
+        return False
     
     prompt = f"{pergunta} Responda APENAS 'SIM' ou 'NAO', sem explicações ou pontuação."
     logger.debug(f"🧠 IA Julgando: {pergunta}")
@@ -74,6 +85,10 @@ def _ask_ollama_sim_nao(pergunta: str, cache_key: str) -> bool:
         if resp.status_code == 200:
             is_valid = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_valid 
+            
+            if not is_valid:
+                _NEGATIVE_PATTERN_CACHE.add(esqueleto)
+                
             return is_valid
     except Exception as e:
         logger.warning(f"Timeout/Erro no Ollama. Falha segura ativada. Erro: {e}")
@@ -205,7 +220,6 @@ def _clean_extracted_name(name_text: str) -> str:
     for w in words:
         w_clean = w.strip(".,;:!?()\"'")
         if not w_clean: continue
-        if w_clean.islower() and w_clean not in preposicoes: break
         valid_words.append(w)
     return " ".join(valid_words).strip(".,;:!?()\"' ")
 
@@ -224,13 +238,27 @@ def _detect_all(text: str, anon_loc: bool):
                 if not _is_valid_entity_ollama(val, "GENERIC_CODE"): continue
             found.append((match.start(), match.end(), val, typ))
 
+    # DENTRO DA FUNÇÃO _detect_all
     for match in CONTEXT_NAME_REGEX.finditer(text_analise):
         val = match.group(2).strip()
         val_clean = _clean_extracted_name(val)
+        
         if val_clean and not _is_hallucination_basic(val_clean):
-            if _is_valid_entity_ollama(val_clean, "PER"):
-                start = match.start(2) + val.find(val_clean)
-                found.append((start, start + len(val_clean), text[start:start + len(val_clean)], "PER"))
+            
+           
+            words = val_clean.split()
+            while len(words) >= 1:
+                candidate = " ".join(words)
+                
+                if len(words) == 1 and candidate.lower() in ["de", "da", "do", "dos", "das", "e"]:
+                    break
+                
+                if _is_valid_entity_ollama(candidate, "PER"):
+                    start = match.start(2) + val.find(candidate)
+                    texto_original = text[start:start + len(candidate)]
+                    found.append((start, start + len(candidate), texto_original, "PER"))
+                    break
+                words.pop()
 
     if nlp:
         doc = nlp(text_analise)
