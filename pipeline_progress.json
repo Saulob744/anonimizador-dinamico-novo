@@ -1,1 +1,1 @@
-{"fase": "Processando: ocorrencias", "tabelas_processadas": 1, "tabelas_total": 8, "linhas_processadas": 10, "linhas_total": 57, "velocidade": 0.20861771124629538, "tempo_decorrido": 48.696221590042114, "finalizado": false}
+{"fase": "Concluído", "tabelas_processadas": 8, "tabelas_total": 8, "linhas_processadas": 57, "linhas_total": 57, "velocidade": 0, "tempo_decorrido": 311.66300654411316, "finalizado": true}
