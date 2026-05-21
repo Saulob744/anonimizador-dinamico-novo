@@ -23,9 +23,7 @@ _TABLE_CACHE: Dict[str, Table] = {}
 # ENCODING / SANITIZAÇÃO (BLINDADO)
 # ==================================================
 def safe_decode(value: Any) -> Any:
-    """
-    Corrige problemas de encoding e limpa caracteres assassinos de DBs (ex: Null Bytes).
-    """
+  
     if value is None:
         return None
         
@@ -42,7 +40,7 @@ def safe_decode(value: Any) -> Any:
                 return value.decode("utf-8", errors="replace").replace('\x00', '')
 
     if isinstance(value, str):
-        # Remoção de Null Bytes (\x00) é crítica pois o PostgreSQL rejeita a string inteira
+       
         clean_val = value.replace('\x00', '')
         try:
             clean_val.encode("utf-8")
@@ -76,7 +74,7 @@ def calculate_safe_workers(requested_cores: Optional[int] = None) -> int:
 # ==================================================
 def connect(url: str) -> Engine:
     parsed = make_url(url)
-    # Mascara a senha no log por segurança
+   
     safe_log_url = repr(parsed).replace(parsed.password, '***') if parsed.password else repr(parsed)
     logger.info(f"🔌 Iniciando conexão com o banco: {parsed.host} / {parsed.database}")
     logger.debug(f"URL de Conexão (Mascarada): {safe_log_url}")
@@ -242,7 +240,7 @@ def copy_schema(src_engine: Engine, dst_engine: Engine, schema: Optional[str] = 
             try:
                 table.schema = schema
                 for col in table.columns:
-                    col.server_default = None # Evita conflito de sequências/defaults dependentes
+                    col.server_default = None 
                 table.create(bind=conn, checkfirst=True)
                 logger.debug(f"Estrutura da tabela {table.name} criada/verificada.")
             except Exception as e:
@@ -279,9 +277,9 @@ def fetch_rows_streaming(
             logger.warning(f"⚠️ Tabela {table} sem Primary Key. Tentando ordenação de contingência por colunas escalares.")
             fallback_cols = []
             for col in tbl.columns:
-                # Ignora tipos complexos que crasham ordenação
+                
                 if not isinstance(col.type, (sa.LargeBinary, sa.JSON, sa.ARRAY)):
-                   # Evita Postgres JSONB string representation bugs
+                   
                    if not str(col.type).upper().startswith("JSON"):
                        fallback_cols.append(col)
                    
@@ -314,14 +312,14 @@ def fetch_rows_streaming(
 # SANITIZAÇÃO
 # ==================================================
 def _sanitize_row_data(table: Table, rows: List[Dict]) -> List[Dict]:
-    """Garante que as strings não quebrem o limite de varchar da coluna do destino."""
+
     safe_rows = []
     for row in rows:
         new_row = {}
         for col in table.columns:
             val = row.get(col.name)
             
-            # Checagem de Estouro de Limite (Evita DataError)
+           
             if isinstance(val, str) and getattr(col.type, "length", None):
                 if len(val) > col.type.length:
                     logger.debug(f"Aviso de Truncagem: Coluna '{col.name}' limite={col.type.length}, recebido={len(val)}. Cortando string.")
@@ -349,7 +347,7 @@ def insert_rows(
 
     key = f"{engine.url}_{schema or 'default'}_{table_name}"
     
-    # Gestão de Cache de MetaData para otimização
+   
     if key not in _TABLE_CACHE:
         logger.debug(f"Mapeando metadata destino de {table_name} na memória...")
         _TABLE_CACHE[key] = Table(table_name, MetaData(), autoload_with=engine, schema=schema)
@@ -363,19 +361,18 @@ def insert_rows(
             if not safe_rows: return
             
             with engine.begin() as conn:
-                # Estratégias de Conflito Baseada no Dialeto
+              
                 if ignore_conflicts:
                     if db_type == "postgresql":
                         stmt = pg_insert(table).values(safe_rows).on_conflict_do_nothing()
                     elif db_type == "mysql":
-                        # MySQL On Duplicate exige saber o que atualizar, ou usar dummy update.
-                        # Para emular DO NOTHING de forma segura com Bulk Insert:
+                      
                         insert_stmt = mysql_insert(table).values(safe_rows)
                         update_dict = {c.name: c for c in insert_stmt.inserted if c.name != table.primary_key.columns.keys()[0]} if table.primary_key else {c.name: c for c in insert_stmt.inserted}
                         if update_dict:
                             stmt = insert_stmt.on_duplicate_key_update(**update_dict)
                         else:
-                            stmt = table.insert().values(safe_rows) # Fallback se não der pra mapear
+                            stmt = table.insert().values(safe_rows) 
                     elif db_type == "sqlite":
                         stmt = sqlite_insert(table).values(safe_rows).on_conflict_do_nothing()
                     else:
@@ -399,7 +396,7 @@ def insert_rows(
 
         except Exception as e:
             logger.exception(f"⚠️ Erro de execução [Tentativa {attempt + 1}/{max_retries}] em {table_name}")
-            # Em caso de erro fatal, remove a tabela do cache pois a estrutura no DB pode ter sido alterada
+           
             _TABLE_CACHE.pop(key, None) 
             
             if attempt == max_retries - 1:
@@ -439,7 +436,7 @@ def truncate_table(engine: Engine, table_name: str, schema: Optional[str] = None
                 logger.exception(f"❌ Impossível limpar a tabela {table_ref} (Nem TRUNCATE nem DELETE funcionaram).")
 
 # ==================================================
-# DEPENDÊNCIAS DE INTEGRIDADE (GRAFO TOPOLÓGICO)
+# DEPENDÊNCIAS DE INTEGRIDADE 
 # ==================================================
 def build_dependency_graph(engine: Engine, tables: List[str], schema: Optional[str] = None) -> List[str]:
     logger.info(f"🏗️ Mapeando grafo topológico de dependências entre {len(tables)} tabelas...")
@@ -450,7 +447,7 @@ def build_dependency_graph(engine: Engine, tables: List[str], schema: Optional[s
     for table in tables:
         for fk in insp.get_foreign_keys(table, schema=schema):
             ref = fk.get("referred_table")
-            if ref in tables and ref != table: # Evita auto-referência direta no grau
+            if ref in tables and ref != table: 
                 deps[ref].add(table)
                 in_degree[table] += 1
 
@@ -465,7 +462,7 @@ def build_dependency_graph(engine: Engine, tables: List[str], schema: Optional[s
             if in_degree[d] == 0:
                 queue.append(d)
 
-    # Concatena tabelas que caíram em referência circular / isoladas na base
+    
     final_order = ordered + [t for t in tables if t not in ordered]
     logger.debug(f"Grafo de Inserção gerado: {' -> '.join(final_order)}")
     return final_order

@@ -18,12 +18,12 @@ import json
 import threading
 
 # ==================================================
-# SISTEMA DE MEMÓRIA (RECOVER DA TELA)
+# SISTEMA DE MEMÓRIA
 # ==================================================
 STATUS_FILE = "pipeline_progress.json"
 
 def save_progress(fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False):
-    """Salva o status atual no disco para sobreviver a bloqueios de tela ou refreshs."""
+   
     data = {
         "fase": fase,
         "tabelas_processadas": t_atual,
@@ -38,7 +38,7 @@ def save_progress(fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, f
         json.dump(data, f, ensure_ascii=False)
 
 def load_progress():
-    """Lê o status do disco se o usuário voltar para a página."""
+   
     if os.path.exists(STATUS_FILE):
         try:
             with open(STATUS_FILE, "r", encoding="utf-8") as f:
@@ -122,7 +122,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
             if uuid_regex.match(old_str) or not target_columns or col not in target_columns:
                 continue
 
-            # Jitter de Coluna Estruturada (Se a coluna inteira for um GPS)
+          
             if anon_geo:
                 if m := gps_pair.match(old_str):
                     row_dict[col] = f"{apply_gps_jitter(m.group(1))}, {apply_gps_jitter(m.group(2))}"
@@ -180,7 +180,7 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
     return processed
 
 # ==================================================
-# O TRABALHADOR FANTASMA (Roda no Sistema Operacional)
+# O TRABALHADOR FANTASMA
 # ==================================================
 def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols):
     t0_global = time.time()
@@ -264,9 +264,9 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                     if len(weighted_speed_samples) > 30:
                         weighted_speed_samples.pop(0)
 
-                    # Escreve o andamento no arquivo JSON a cada 1.5s
+                    
                     now = time.time()
-                    if now - last_json_update > 1.5:
+                    if now - last_json_update > 2.5:
                         elapsed = now - t0_global
                         stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
                         
@@ -369,9 +369,6 @@ with st.sidebar:
 # ==================================================
 # FRONTEND: MONITOR DE PROGRESSO
 # ==================================================
-# ==================================================
-# FRONTEND: MONITOR DE PROGRESSO
-# ==================================================
 st.title("🛡️ Pipeline De Proteção De Dados")
 
 if start_btn:
@@ -385,14 +382,14 @@ if start_btn:
     thread.daemon = True 
     thread.start()
     
-    time.sleep(1) # Aguarda 1s para o JSON ser criado
-    st.rerun()    # Recarrega a página para entrar no modo Monitor
+    time.sleep(2.5) 
+    st.rerun()   
 
 # --- MONITOR FLUIDO EM TEMPO REAL ---
 estado_atual = load_progress()
 
 if estado_atual:
-    # Se ainda estiver rodando (finalizado == False)
+    
     if not estado_atual.get("finalizado", True):
         st.info("🔄 Monitorando processo em background... (Você pode minimizar, bloquear a tela ou fechar a aba!)")
         
@@ -402,12 +399,12 @@ if estado_atual:
                 os.remove(STATUS_FILE)
             st.rerun()
             
-        # 2. DETECTOR DE MORTE DA THREAD (Zumbi)
-        # Se o arquivo não foi alterado nos últimos 15 segundos, a Thread morreu (ex: reiniciou o servidor)
+        
+        
         tempo_sem_atualizar = time.time() - os.path.getmtime(STATUS_FILE)
         if tempo_sem_atualizar > 15:
             st.error("🚨 O processo em background parou de responder. Provavelmente o servidor foi reiniciado ou ocorreu um erro crítico. Clique em 'Forçar Parada' acima.")
-            st.stop() # Trava a tela aqui e não fica recarregando à toa
+            st.stop() 
                 
         # 3. EXTRAÇÃO DOS DADOS
         linhas_proc = estado_atual.get("linhas_processadas", 0)
@@ -441,11 +438,11 @@ if estado_atual:
         - ⏳ **Tempo Restante (ETA):** **<span style="color:#ffcc00">{tempo_restante_str}</span>**
         """, unsafe_allow_html=True)
         
-        # 6. O LOOP DO STREAMLIT
-        time.sleep(1.5) # Espera um pouco e recarrega a tela suavemente para ler o JSON
+        
+        time.sleep(1.5) 
         st.rerun()
 
-    # Se já tiver terminado (finalizado == True)
+   
     else:
         if "Erro" in estado_atual.get("fase", ""):
             st.error(f"🚨 O processo parou devido a um erro fatal: {estado_atual['fase']}")

@@ -8,7 +8,6 @@ import requests
 import html
 from functools import lru_cache
 from faker import Faker
-from collections import Counter
 
 # =========================================================
 # CONFIGURAÇÃO
@@ -54,24 +53,37 @@ CONTEXT_NAME_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|atenden
 PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senhora|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial|rua|avenida|trevo|cia|agente|vendedor|motorista|funcionario)\s+", re.IGNORECASE)
 
 NAME_FALLBACK_REGEX = re.compile(
-    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"                
-    r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?"   
-    r"\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"               
-    r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,}))*\b(?!\:)"        
+    r"\b[A-ZÀ-Ÿ][a-zà-ÿ]+" 
+    r"(?:\s+(?:de|da|do|dos|das|e))?"       
+    r"(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]+){1,5}\b"      
 )
 
 # =========================================================
-# 1. O JUIZ BINÁRIO (OLLAMA SIM/NÃO INDIVIDUAL)
+# 1. MOTOR DE COMUNICAÇÃO COM A IA
 # =========================================================
+def _ask_ollama_sim_nao(pergunta: str, cache_key: str) -> bool:
+   
+    if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
+    
+    prompt = f"{pergunta} Responda APENAS 'SIM' ou 'NAO', sem explicações ou pontuação."
+    logger.debug(f"🧠 IA Julgando: {pergunta}")
+    
+    try:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=30, proxies={"http": "", "https": ""})
+        if resp.status_code == 200:
+            is_valid = "SIM" in resp.json().get("response", "").strip().upper()
+            _OLLAMA_CACHE[cache_key] = is_valid 
+            return is_valid
+    except Exception as e:
+        logger.warning(f"Timeout/Erro no Ollama. Falha segura ativada. Erro: {e}")
+        
+    return False
+
 def _is_valid_entity_ollama(text: str, tag: str) -> bool:
-    """O Ollama atua como juiz para textos suspeitos, avaliando SIM ou NÃO."""
+  
     if len(text.strip()) < 3: return False
     
-    # Memória RAM para não julgar a mesma palavra duas vezes
-    cache_key = f"{tag}:{text.upper()}"
-    if cache_key in _OLLAMA_CACHE:
-        return _OLLAMA_CACHE[cache_key]
-        
     if tag == "PER":
         pergunta = f"A expressão '{text}' é o NOME PRÓPRIO de uma pessoa humana real?"
     elif tag == "GENERIC_CODE":
@@ -79,82 +91,84 @@ def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     else:
         return True 
 
-    prompt = f"{pergunta}\nResponda APENAS com a palavra 'SIM' ou 'NAO', sem pontuação e sem explicação."
-    
-    logger.debug(f"🧠 IA Julgando [{tag}] -> '{text}'...")
-    try:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=8, proxies={"http": "", "https": ""})
-        
-        if resp.status_code == 200:
-            answer = resp.json().get("response", "").strip().upper()
-            is_valid = "SIM" in answer
-            _OLLAMA_CACHE[cache_key] = is_valid 
-            logger.debug(f"Veredito: {is_valid}")
-            return is_valid
-    except Exception as e:
-        logger.warning(f"Timeout no Ollama para '{text}'. Erro: {e}")
-        
-    return False
+    return _ask_ollama_sim_nao(pergunta, f"{tag}:{text.upper()}")
 
 # =========================================================
-# 2. PERFILAMENTO E AMOSTRAGEM DE COLUNA
+# 2. INTELIGÊNCIA DE PERFILAMENTO DA COLUNA 
 # =========================================================
-def _classify_single_value(text: str) -> str:
-    text = str(text).strip()
-    words = text.split()
+def _smart_title(text: str) -> str:
+  
+    if not text: return text
+    letras = sum(1 for c in text if c.isalpha())
+    if letras == 0: return text
+    maiusculas = sum(1 for c in text if c.isupper())
     
-    if not text or len(text) < 3: return "IGNORAR"
-    if len(words) >= 3 or len(text) > 40: return "TEXTO_LIVRE"
-        
-    for typ, pat in REGEX.items():
-        if pat.match(text): return typ
-            
-    if any(c.isalpha() for c in text) and any(c.isdigit() for c in text) and len(text) >= 6:
-        return "GENERIC_CODE"
-        
-    return "DESCONHECIDO"
+    if (maiusculas / letras > 0.5) or text.islower():
+        excecoes = {"de", "da", "do", "dos", "das", "e"}
+        partes = re.split(r'(\W+)', text.lower()) 
+        for i in range(len(partes)):
+            if partes[i].isalpha() and partes[i] not in excecoes:
+                partes[i] = partes[i].capitalize()
+        return "".join(partes)
+    return text
 
-def _ollama_fallback_check(amostra: list) -> str:
-    prompt = (
-        f"Analise esta amostra de dados: {amostra}\n"
-        f"Existe a presença de dados sensíveis ou informações pessoais (nomes próprios, documentos, contatos, chaves, senhas)?\n"
-        f"Responda APENAS com a palavra 'SIM' ou 'NAO'."
-    )
-    logger.debug(f"🧠 Acionando Ollama Fallback para amostra indecisa de coluna: {amostra[:3]}")
-    try:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=5, proxies={"http": "", "https": ""})
-        if resp.status_code == 200:
-            if "SIM" in resp.json().get("response", "").strip().upper(): return "TEXTO_LIVRE" 
-    except Exception as e:
+def _classify_column_by_samples(col_name: str, samples: list) -> str:
+
+    valid_samples = [str(s).strip() for s in samples if str(s).strip()]
+    if not valid_samples: return "IGNORAR"
+    
+   
+    amostra_base = valid_samples[0]
+    amostra_conjunta = " | ".join(valid_samples[:3])
+    
+    # 1. TEXTO LIVRE DIRETO 
+    if len(amostra_base) > 50 or len(amostra_base.split()) > 4:
         return "TEXTO_LIVRE"
-    return "IGNORAR" 
 
+ 
+    for typ, pat in REGEX.items():
+        if pat.search(amostra_base):
+           
+            if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra_base):
+                continue
+                
+            
+            if typ in ["EMAIL", "IP", "COORD", "COORD_SINGLE"]:
+                return typ
+                
+           
+            pergunta = f"Os dados '{amostra_conjunta}' se parecem com o tipo de dado {typ}?"
+            if _ask_ollama_sim_nao(pergunta, f"COL_{typ}:{amostra_conjunta}"):
+                return typ
+            else:
+                continue 
+
+    texto_formatado = _smart_title(amostra_base)
+    parece_nome = False
+    
+    if NAME_FALLBACK_REGEX.search(texto_formatado):
+        parece_nome = True
+    elif nlp and any(ent.label_ == "PER" for ent in nlp(texto_formatado).ents):
+        parece_nome = True
+        
+    if parece_nome:
+        pergunta = f"Os dados '{amostra_conjunta}' parecem ser NOMES PRÓPRIOS de pessoas?"
+        if _ask_ollama_sim_nao(pergunta, f"COL_PER:{amostra_conjunta}"):
+            return "NOME_SOLTO"
+
+    # 4. O FALLBACK (Pergunta final)
+    pergunta = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém informações pessoais sensíveis que precisam ser mascaradas?"
+    if _ask_ollama_sim_nao(pergunta, f"COL_SENSITIVE:{col_name}:{amostra_conjunta}"):
+        return "TEXTO_LIVRE" 
+        
+    return "IGNORAR" 
 def define_column_policy(col_name: str, sample_values: list) -> str:
     if col_name in _COLUMN_POLICIES: return _COLUMN_POLICIES[col_name]
-        
-    valid_samples = [str(v).strip() for v in sample_values if v is not None and str(v).strip() != ""]
-    if not valid_samples:
-        _COLUMN_POLICIES[col_name] = "IGNORAR"
-        return "IGNORAR"
-
-    # Usa 30 amostras para votação robusta
-    amostras_teste = random.sample(valid_samples, min(30, len(valid_samples)))
-    resultados = [_classify_single_value(v) for v in amostras_teste]
-    votos = Counter(resultados)
     
-    logger.debug(f"📊 Votação da coluna '{col_name}': {votos}")
+    logger.info(f"🔍 Avaliando política da coluna '{col_name}'...")
+    politica = _classify_column_by_samples(col_name, sample_values)
     
-    votos_claros = {k: v for k, v in votos.items() if k not in ["DESCONHECIDO", "IGNORAR"]}
-    
-    if votos_claros:
-        if "TEXTO_LIVRE" in votos_claros: politica = "TEXTO_LIVRE"
-        else: politica = max(votos_claros, key=votos_claros.get)
-    else:
-        politica = _ollama_fallback_check(amostras_teste)
-        
-    logger.info(f"✅ Política Definida para '{col_name}': {politica}")
+    logger.info(f"✅ Política Definida Mestre para '{col_name}': {politica}")
     _COLUMN_POLICIES[col_name] = politica
     return politica
 
@@ -167,7 +181,6 @@ def _normalize(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).upper().strip()
 
 def _is_hallucination_basic(ent_text: str) -> bool:
-    """Bloqueio pesado contra falsos positivos (ex: PGTO EFETUADO)"""
     ent_text = ent_text.strip(".,;:-\n '\"")
     if not ent_text or len(ent_text) <= 2: return True
     if any(c.isdigit() for c in ent_text) and any(c in ['.', ',', '-'] for c in ent_text): return True
@@ -185,42 +198,52 @@ def _is_hallucination_basic(ent_text: str) -> bool:
     if texto_norm in termos_proibidos or any(texto_norm.startswith(t + " ") for t in termos_proibidos): return True
     return False
 
+def _clean_extracted_name(name_text: str) -> str:
+    words = name_text.split()
+    valid_words = []
+    preposicoes = {"de", "da", "do", "dos", "das", "e"}
+    for w in words:
+        w_clean = w.strip(".,;:!?()\"'")
+        if not w_clean: continue
+        if w_clean.islower() and w_clean not in preposicoes: break
+        valid_words.append(w)
+    return " ".join(valid_words).strip(".,;:!?()\"' ")
+
 def _detect_all(text: str, anon_loc: bool):
     found = []
     PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "CHASSI": 1, "RG": 2, "PHONE": 2, "PLATE": 2, "COORD": 3, "COORD_SINGLE": 3, "PER": 4, "GENERIC_CODE": 99 }
     
+    text_analise = _smart_title(text)
+    
     for typ, pat in REGEX.items():
-        if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: 
-            continue
-            
+        if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: continue
         for match in pat.finditer(text):
             val = match.group()
-            
             if typ == "GENERIC_CODE":
-                if not any(c.isdigit() for c in val) or len(val) < 6: 
-                    continue
-                if not _is_valid_entity_ollama(val, "GENERIC_CODE"):
-                    continue
-                    
+                if not any(c.isdigit() for c in val) or len(val) < 6: continue
+                if not _is_valid_entity_ollama(val, "GENERIC_CODE"): continue
             found.append((match.start(), match.end(), val, typ))
 
-    for match in CONTEXT_NAME_REGEX.finditer(text):
+    for match in CONTEXT_NAME_REGEX.finditer(text_analise):
         val = match.group(2).strip()
-        if not _is_hallucination_basic(val):
-            if _is_valid_entity_ollama(val, "PER"):
-                found.append((match.start(2), match.end(2), text[match.start(2):match.end(2)], "PER"))
+        val_clean = _clean_extracted_name(val)
+        if val_clean and not _is_hallucination_basic(val_clean):
+            if _is_valid_entity_ollama(val_clean, "PER"):
+                start = match.start(2) + val.find(val_clean)
+                found.append((start, start + len(val_clean), text[start:start + len(val_clean)], "PER"))
 
     if nlp:
-        is_bad_casing = sum(1 for c in text if c.isupper()) > len(text) * 0.5 or text.islower()
-        doc = nlp(text.title() if is_bad_casing else text)
+        doc = nlp(text_analise)
         for ent in doc.ents:
             if ent.label_ == "PER":
                 if any(token.pos_ in ["VERB", "PRON", "PUNCT", "SYM"] for token in ent): continue
                 prefix_match = PREFIX_TRIMMER.search(ent.text)
                 offset = prefix_match.end() if prefix_match else 0
                 val_raw = ent.text[offset:]
-                val_clean = val_raw.strip()
-                start_adj = val_raw.find(val_clean)
+                val_clean = _clean_extracted_name(val_raw)
+                if not val_clean: continue
+                
+                start_adj = ent.text[offset:].find(val_clean)
                 start = ent.start_char + offset + (start_adj if start_adj != -1 else 0)
                 texto_original = text[start : start + len(val_clean)] 
                 
@@ -228,11 +251,14 @@ def _detect_all(text: str, anon_loc: bool):
                     if _is_valid_entity_ollama(texto_original, "PER"):
                         found.append((start, start + len(val_clean), texto_original, "PER"))
 
-    for match in NAME_FALLBACK_REGEX.finditer(text):
+    for match in NAME_FALLBACK_REGEX.finditer(text_analise):
         val = match.group().strip()
-        if not _is_hallucination_basic(val):
-            if _is_valid_entity_ollama(val, "PER"):
-                found.append((match.start(), match.end(), val, "PER"))
+        val_clean = _clean_extracted_name(val)
+        if val_clean and not _is_hallucination_basic(val_clean):
+            if _is_valid_entity_ollama(val_clean, "PER"):
+                start = match.start() + val.find(val_clean)
+                texto_original = text[start:start + len(val_clean)]
+                found.append((start, start + len(val_clean), texto_original, "PER"))
 
     found.sort(key=lambda x: (x[0], -(x[1] - x[0]), PRIORITY.get(x[3], 50)))
     clean, last = [], -1
@@ -288,30 +314,31 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         if len(text) < 3: 
             return text, None
             
-        # --- PERFILAMENTO ---
+        # --- PERFILAMENTO INTELIGENTE ---
         if col_name not in _COLUMN_POLICIES:
-            if col_name not in _DYNAMIC_SAMPLES:
-                _DYNAMIC_SAMPLES[col_name] = []
-            
-            _DYNAMIC_SAMPLES[col_name].append(text)
-            
-            # Testa a amostra após 30 linhas
-            if len(_DYNAMIC_SAMPLES[col_name]) >= 30 or len(text) > 50:
-                define_column_policy(col_name, _DYNAMIC_SAMPLES[col_name])
-            else:
-                politica = "TEXTO_LIVRE" 
+          
+            politica = define_column_policy(col_name, [text])
         else:
             politica = _COLUMN_POLICIES[col_name]
 
         # --- ROTEAMENTO EXECUTOR ---
-        if politica == "IGNORAR":
+        politica_execucao = politica
+
+        
+        if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
+            if len(text) > 50 or len(text.split()) > 4:
+      
+                if not NAME_FALLBACK_REGEX.fullmatch(_smart_title(text)):
+                    politica_execucao = "TEXTO_LIVRE"
+
+        if politica_execucao == "IGNORAR":
             return text, None
             
-        if politica in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE", "NOME_SOLTO"]:
-            fake_val = _get_fake(text, politica)
+        if politica_execucao in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE", "NOME_SOLTO", "COORD", "COORD_SINGLE"]:
+            fake_val = _get_fake(text, politica_execucao)
             return fake_val, ("TEXT" if fake_val != text else None)
             
-        if politica == "TEXTO_LIVRE":
+        if politica_execucao == "TEXTO_LIVRE":
             entities = _detect_all(text, anon_location)
             if not entities: 
                 return text, None
