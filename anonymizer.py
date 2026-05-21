@@ -81,7 +81,7 @@ def _ask_ollama_sim_nao(pergunta: str, cache_key: str) -> bool:
     
     try:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=30, proxies={"http": "", "https": ""})
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=40, proxies={"http": "", "https": ""})
         if resp.status_code == 200:
             is_valid = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_valid 
@@ -357,10 +357,18 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         # --- ROTEAMENTO EXECUTOR ---
         politica_execucao = politica
 
-        
         if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
-            if len(text) > 50 or len(text.split()) > 4:
-      
+            e_texto_longo = len(text) > 50 or len(text.split()) > 4
+            
+            tem_estrutura_frase = False
+            if not e_texto_longo and nlp:
+                doc = nlp(_smart_title(text))
+                tem_per = any(ent.label_ == "PER" for ent in doc.ents)
+                tem_action = any(token.pos_ in ["VERB", "ADJ", "AUX"] for token in doc)
+                if tem_per and tem_action:
+                    tem_estrutura_frase = True
+
+            if e_texto_longo or tem_estrutura_frase:
                 if not NAME_FALLBACK_REGEX.fullmatch(_smart_title(text)):
                     politica_execucao = "TEXTO_LIVRE"
 
