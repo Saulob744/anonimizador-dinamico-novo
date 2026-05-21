@@ -128,64 +128,72 @@ def _smart_title(text: str) -> str:
     return text
 
 def _classify_column_by_samples(col_name: str, samples: list) -> str:
-
     valid_samples = [str(s).strip() for s in samples if str(s).strip()]
-    if not valid_samples: return "IGNORAR"
-    
-   
+    if not valid_samples:
+        return "IGNORAR"
+
     amostra_base = valid_samples[0]
     amostra_conjunta = " | ".join(valid_samples[:3])
-    
-    # 1. TEXTO LIVRE DIRETO 
+
     if len(amostra_base) > 50 or len(amostra_base.split()) > 4:
         return "TEXTO_LIVRE"
 
- 
     for typ, pat in REGEX.items():
-        if pat.search(amostra_base):
-           
-            if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra_base):
-                continue
-                
-            
-            if typ in ["EMAIL", "IP", "COORD", "COORD_SINGLE"]:
-                return typ
-                
-           
-            pergunta = f"Os dados '{amostra_conjunta}' se parecem com o tipo de dado {typ}?"
-            if _ask_ollama_sim_nao(pergunta, f"COL_{typ}:{amostra_conjunta}"):
-                return typ
-            else:
-                continue 
+        if not pat.search(amostra_base):
+            continue
+
+        if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra_base):
+            continue
+
+        if typ == "GENERIC_CODE":
+            pergunta = (
+                f"A expressão '{amostra_base}' parece ser um código "
+                f"de identificação, chassi ou credencial sensível?"
+            )
+
+            if _ask_ollama_sim_nao(
+                pergunta,
+                f"COL_GENERIC_CODE:{amostra_base}"
+            ):
+                return "GENERIC_CODE"
+
+            continue
+
+        return typ
 
     texto_formatado = _smart_title(amostra_base)
     parece_nome = False
-    
+
     if NAME_FALLBACK_REGEX.search(texto_formatado):
         parece_nome = True
     elif nlp and any(ent.label_ == "PER" for ent in nlp(texto_formatado).ents):
         parece_nome = True
-        
+
     if parece_nome:
-        pergunta = f"Os dados '{amostra_conjunta}' parecem ser NOMES PRÓPRIOS de pessoas?"
-        if _ask_ollama_sim_nao(pergunta, f"COL_PER:{amostra_conjunta}"):
+        pergunta = (
+            f"Os dados '{amostra_conjunta}' parecem ser "
+            f"NOMES PRÓPRIOS de pessoas?"
+        )
+
+        if _ask_ollama_sim_nao(
+            pergunta,
+            f"COL_PER:{amostra_conjunta}"
+        ):
             return "NOME_SOLTO"
 
-    # 4. O FALLBACK (Pergunta final)
-    pergunta = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém informações pessoais sensíveis que precisam ser mascaradas?"
-    if _ask_ollama_sim_nao(pergunta, f"COL_SENSITIVE:{col_name}:{amostra_conjunta}"):
-        return "TEXTO_LIVRE" 
-        
-    return "IGNORAR" 
-def define_column_policy(col_name: str, sample_values: list) -> str:
-    if col_name in _COLUMN_POLICIES: return _COLUMN_POLICIES[col_name]
-    
-    logger.info(f"🔍 Avaliando política da coluna '{col_name}'...")
-    politica = _classify_column_by_samples(col_name, sample_values)
-    
-    logger.info(f"✅ Política Definida Mestre para '{col_name}': {politica}")
-    _COLUMN_POLICIES[col_name] = politica
-    return politica
+    pergunta = (
+        f"A coluna '{col_name}' com os dados "
+        f"'{amostra_conjunta}' contém informações pessoais "
+        f"sensíveis que precisam ser mascaradas?"
+    )
+
+    if _ask_ollama_sim_nao(
+        pergunta,
+        f"COL_SENSITIVE:{col_name}:{amostra_conjunta}"
+    ):
+        return "TEXTO_LIVRE"
+
+    return "IGNORAR"
 
 # =========================================================
 # 3. MOTOR DE TEXTO LIVRE (Frases)
