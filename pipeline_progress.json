@@ -1,1 +1,1 @@
-{"fase": "Processando: tb_pagamentos", "tabelas_processadas": 2, "tabelas_total": 5, "linhas_processadas": 1400, "linhas_total": 8500, "velocidade": 8.805633337044409, "tempo_decorrido": 1789.8359978199005, "finalizado": false}
+{"fase": "Processando: sys_audit_trail", "tabelas_processadas": 4, "tabelas_total": 5, "linhas_processadas": 4700, "linhas_total": 8500, "velocidade": 2.713671824495607, "tempo_decorrido": 9539.459002494812, "finalizado": false}
