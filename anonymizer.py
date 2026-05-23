@@ -46,8 +46,6 @@ REGEX = {
     "PHONE": re.compile(r"\b(?:\+?55\s*)?(?:\(?\d{2,3}\)?[\s-]*)?\d{4,5}[-\s]*\d{4}\b"),
     "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
     "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE), 
-    # REGRA MAIS RÍGIDA: Um código genérico sensível agora exige PELO MENOS um número.
-    # Isso evita que palavras normais como "EXTORSAO" ou "ASSALTO" sejam consideradas códigos.
     "GENERIC_CODE": re.compile(r'\b(?=.*\d)[A-Za-z0-9_/\.\-]{6,64}\b'),
 }
 
@@ -84,7 +82,6 @@ def _regex_classify_column(samples: list) -> str:
         matched_structural = False
         for typ, pat in REGEX.items():
             if pat.search(val):
-                # Dupla checagem para garantir que palavras não passem como códigos
                 if typ == "GENERIC_CODE" and not any(c.isdigit() for c in val):
                     continue
                 
@@ -116,9 +113,12 @@ def _ollama_classify_column(col_name: str, samples: list) -> str:
 
     amostra_str = " | ".join(amostras_limpas[:10])
 
+    # -------------------------------------------------------------
+    # PROMPT 
+    # -------------------------------------------------------------
     prompt = f"""
-Você é especialista em LGPD e modelagem de dados.
-Analise o nome da coluna e os valores reais.
+Você é um auditor rigoroso de LGPD e segurança da informação.
+Sua missão é classificar a coluna abaixo com base no nome e amostras.
 
 COLUNA:
 {col_name}
@@ -126,23 +126,20 @@ COLUNA:
 AMOSTRAS:
 {amostra_str}
 
-Escolha APENAS UMA das tags:
-CPF, RG, EMAIL, PHONE, PLATE, CHASSI, IP, GENERIC_CODE, NOME_SOLTO, TEXTO_LIVRE, IGNORAR
+REGRAS CRÍTICAS:
+1. IGNORAR -> Escolha esta tag PRIMEIRO se o dado NÃO FOR PESSOAL ou SENSÍVEL. Exemplos: modelos de veículos (ex: Gol, Civic, Corolla), marcas, cores, endereços genéricos, nomes de cidades, tipos de crime, profissões, categorias, status, datas ou descrições de objetos.
+2. CPF -> Exclusivo para CPF brasileiro
+3. RG -> Exclusivo para identidade civil
+4. EMAIL -> Exclusivo para e-mails
+5. PHONE -> Exclusivo para números de telefone
+6. PLATE -> Exclusivo para placas veiculares
+7. CHASSI -> Exclusivo para código VIN/Chassi
+8. IP -> Exclusivo para endereços IP
+9. GENERIC_CODE -> Exclusivo para credenciais, senhas, tokens de acesso ou hashes
+10. NOME_SOLTO -> Exclusivo para nomes próprios de seres humanos
+11. TEXTO_LIVRE -> Parágrafos longos, relatos ou observações detalhadas
 
-Regras:
-CPF -> CPF brasileiro
-RG -> identidade civil
-EMAIL -> email
-PHONE -> telefone
-PLATE -> placa veicular
-CHASSI -> VIN/chassi
-IP -> endereço IP
-GENERIC_CODE -> token, hash, senha, identificador
-NOME_SOLTO -> nomes de pessoas
-TEXTO_LIVRE -> observações, descrições, relatos
-IGNORAR -> endereço, cidade, bairro, marca, modelo, profissão, status, datas, categorias, tipos de crime
-
-Responda SOMENTE com a tag.
+Escolha APENAS UMA tag da lista acima. Responda SOMENTE com o nome da tag, sem pontuação ou texto adicional.
 """
 
     logger.info(f"🧠 [ANALISADOR DE COLUNA] IA avaliando '{col_name}' (Regex falhou)")
@@ -195,7 +192,6 @@ def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     cache_key = f"{tag}:{text.upper()}"
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
         
-    
     if tag in ["PER", "NOME_SOLTO"]:
         prompt = f"A expressão '{text}' parece ser o nome próprio de uma pessoa física humana? Responda APENAS 'SIM' ou 'NAO'."
     else:
@@ -252,12 +248,10 @@ def _detect_all(text: str, anon_loc: bool):
             
         for match in pat.finditer(text):
             val = match.group()
-            # Removido o Ollama daqui para códigos. Regex resolve de forma rápida.
             if typ == "GENERIC_CODE" and (not any(c.isdigit() for c in val) or len(val) < 6):
                 continue
             found.append((match.start(), match.end(), val, typ))
 
-    
     for match in CONTEXT_NAME_REGEX.finditer(text):
         val = match.group(2).strip()
         if not _is_hallucination_basic(val):
@@ -356,16 +350,13 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         if politica_execucao == "IGNORAR":
             return text, None
             
-        # VALIDAÇÃO EXCLUSIVA DE NOMES
         if politica_execucao == "NOME_SOLTO":
-            # Pergunta para a IA. Se ela barrar, mantemos o texto original intacto.
             if _is_valid_entity_ollama(text, "NOME_SOLTO"):
                 fake_val = _get_fake(text, "NOME_SOLTO")
                 return fake_val, ("TEXT" if fake_val != text else None)
             else:
                 return text, None
 
-        
         if politica_execucao in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
             fake_val = _get_fake(text, politica_execucao)
             return fake_val, ("TEXT" if fake_val != text else None)
