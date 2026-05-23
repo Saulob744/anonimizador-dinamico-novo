@@ -69,14 +69,14 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
 
     col_lower = col_name.lower().strip()
 
-    # --- 1. ESCUDO DE COORDENADAS (Peso de Metadado Direto) ---
+    
     termos_coord = ['latitude', 'longitude', 'lat', 'lon', 'coordenada', 'gps', 'geom']
-    # Checa se a coluna é exatamente um dos termos ou contém _lat, _lon etc.
+    
     if any(col_lower == t for t in termos_coord) or any(f"_{t}" in col_lower for t in termos_coord) or any(f"{t}_" in col_lower for t in termos_coord):
         logger.info(f"📍 [BALANÇA] Coluna '{col_name}' blindada via nome -> COORD")
         return "COORD"
 
-    # --- 2. ESCUDO DE IGNORAR (Peso de Metadado Direto) ---
+  
     termos_ignorar = [
         'modelo', 'marca', 'cor', 'cidade', 'bairro', 'estado', 'pais', 'uf',
         'status', 'data', 'hora', 'delito', 'crime', 'profissao', 'religiao',
@@ -86,7 +86,7 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
         logger.info(f"🛡️ [BALANÇA] Coluna '{col_name}' blindada via nome -> IGNORAR")
         return "IGNORAR"
 
-    # --- 3. PESO ESTRUTURAL (Regex nas Amostras) ---
+   
     total = len(amostras_limpas)
     scores = {key: 0 for key in REGEX.keys()}
     scores["NOME_SOLTO"] = 0
@@ -320,12 +320,11 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 
         politica_execucao = politica
 
-       
         if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
             if len(text) > 50 or len(text.split()) > 4:
                 politica_execucao = "TEXTO_LIVRE"
 
-     
+ 
         if politica_execucao == "IGNORAR":
             return text, None
             
@@ -336,7 +335,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             else:
                 return text, None
 
-     
+      
         if politica_execucao in ["COORD", "COORD_SINGLE"]:
             if anon_location:
                 fake_val = _get_fake(text, politica_execucao)
@@ -363,7 +362,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             texto_final = "".join(result)
             return texto_final, ("TEXT" if texto_final != text else None)
 
- 
+       
         return text, None
 
     except Exception as e:
