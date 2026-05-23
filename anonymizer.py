@@ -43,10 +43,10 @@ REGEX = {
     "CPF": re.compile(r"\b\d{3}[.\-\s]*\d{3}[.\-\s]*\d{3}[.\-\s]*\d{2}\b|\b\d{11}\b"),
     "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
     "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b|\b[A-Z]{3}[-\s]?\d{4}\b", re.IGNORECASE),
-    "PHONE": re.compile(r"\b(?:\+?55\s*)?(?:\(?\d{2,3}\)?[\s-]*)?\d{4,5}[-\s]*\d{4}\b"),
+    "PHONE": re.compile(r"\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{4,5}[\s-]?\d{4}\b"),
     "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
     "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE), 
-    "GENERIC_CODE": re.compile(r'\b(?=.*\d)[A-Za-z0-9_/\.\-]{6,64}\b'),
+    "GENERIC_CODE": re.compile(r'\b(?:(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_/\.\-]{6,64}|\d{6,64})\b'),
 }
 
 CONTEXT_NAME_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|atendente|consultor|gerente|responsavel|usuario|agente|vendedor|motorista|funcionario|titular|favorecido)\s*[:\-]?\s+([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){0,4})\b", re.IGNORECASE)
@@ -59,132 +59,115 @@ NAME_FALLBACK_REGEX = re.compile(
     r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,}))*\b(?!\:)"        
 )
 
-
 # =========================================================
-# 1. CLASSIFICADORES DE COLUNA (REGEX E IA)
+# 1. MOTOR DE BALANÇA E CONSENSO
 # =========================================================
-
-def _regex_classify_column(samples: list) -> str:
+def _calculate_column_score(col_name: str, samples: list) -> str:
     amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
     if not amostras_limpas:
         return "IGNORAR"
 
-    total_amostras = len(amostras_limpas)
-    match_counts = {key: 0 for key in REGEX.keys()}
-    match_counts["NOME_SOLTO"] = 0
-    texto_livre_count = 0
+    col_lower = col_name.lower().strip()
+
+    # --- 1. ESCUDO DE COORDENADAS (Peso de Metadado Direto) ---
+    termos_coord = ['latitude', 'longitude', 'lat', 'lon', 'coordenada', 'gps', 'geom']
+    # Checa se a coluna é exatamente um dos termos ou contém _lat, _lon etc.
+    if any(col_lower == t for t in termos_coord) or any(f"_{t}" in col_lower for t in termos_coord) or any(f"{t}_" in col_lower for t in termos_coord):
+        logger.info(f"📍 [BALANÇA] Coluna '{col_name}' blindada via nome -> COORD")
+        return "COORD"
+
+    # --- 2. ESCUDO DE IGNORAR (Peso de Metadado Direto) ---
+    termos_ignorar = [
+        'modelo', 'marca', 'cor', 'cidade', 'bairro', 'estado', 'pais', 'uf',
+        'status', 'data', 'hora', 'delito', 'crime', 'profissao', 'religiao',
+        'logradouro', 'endereco', 'rua', 'avenida', 'cep', 'tipo', 'obs_tecnica', 'sexo'
+    ]
+    if any(termo in col_lower for termo in termos_ignorar):
+        logger.info(f"🛡️ [BALANÇA] Coluna '{col_name}' blindada via nome -> IGNORAR")
+        return "IGNORAR"
+
+    # --- 3. PESO ESTRUTURAL (Regex nas Amostras) ---
+    total = len(amostras_limpas)
+    scores = {key: 0 for key in REGEX.keys()}
+    scores["NOME_SOLTO"] = 0
+    scores["TEXTO_LIVRE"] = 0
 
     for val in amostras_limpas:
         if len(val) > 50 or len(val.split()) > 4:
-            texto_livre_count += 1
+            scores["TEXTO_LIVRE"] += 1
             continue
 
-        matched_structural = False
+        matched = False
         for typ, pat in REGEX.items():
             if pat.search(val):
-                if typ == "GENERIC_CODE" and not any(c.isdigit() for c in val):
-                    continue
-                
-                match_counts[typ] += 1
-                matched_structural = True
+                scores[typ] += 1
+                matched = True
                 break 
 
-        if not matched_structural:
+        if not matched:
             if NAME_FALLBACK_REGEX.search(val) or CONTEXT_NAME_REGEX.search(val):
-                match_counts["NOME_SOLTO"] += 1
+                scores["NOME_SOLTO"] += 1
 
     threshold = 0.5 
-
-    if (texto_livre_count / total_amostras) >= threshold:
+    
+    if (scores["TEXTO_LIVRE"] / total) >= threshold:
         return "TEXTO_LIVRE"
 
-    for typ, count in match_counts.items():
-        if (count / total_amostras) >= threshold:
+    for typ, count in scores.items():
+        if typ != "TEXTO_LIVRE" and (count / total) >= threshold:
             return typ
 
     return None
 
-
-def _ollama_classify_column(col_name: str, samples: list) -> str:
+def _ask_llm_if_sensitive(col_name: str, samples: list) -> str:
     amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
-    
-    if not amostras_limpas:
-        return "IGNORAR"
+    if not amostras_limpas: return "IGNORAR"
 
     amostra_str = " | ".join(amostras_limpas[:10])
 
-    # -------------------------------------------------------------
-    # PROMPT 
-    # -------------------------------------------------------------
     prompt = f"""
-Você é um auditor rigoroso de LGPD e segurança da informação.
-Sua missão é classificar a coluna abaixo com base no nome e amostras.
+Você é um auditor de LGPD de alta precisão. 
+Sua tarefa é analisar a coluna '{col_name}' e as amostras: {amostra_str}
 
-COLUNA:
-{col_name}
+PERGUNTA:
+Esses dados contêm informações PESSOAIS, SENSÍVEIS ou de IDENTIFICAÇÃO DIRETA (como nomes próprios de seres humanos, documentos, placas de veículos, dados bancários, senhas ou relatos de pessoas)?
 
-AMOSTRAS:
-{amostra_str}
+REGRA DE REJEIÇÃO:
+Tipos de crime, nomes de endereços (ruas/bairros/cidades), status de processos, categorias de sistemas ou modelos/marcas de carros (ex: Corolla, HB20, Gol, Civic) NÃO SÃO DADOS SENSÍVEIS PESSOAIS.
 
-REGRAS CRÍTICAS:
-1. IGNORAR -> Escolha esta tag PRIMEIRO se o dado NÃO FOR PESSOAL ou SENSÍVEL. Exemplos: modelos de veículos (ex: Gol, Civic, Corolla), marcas, cores, endereços genéricos, nomes de cidades, tipos de crime, profissões, categorias, status, datas ou descrições de objetos.
-2. CPF -> Exclusivo para CPF brasileiro
-3. RG -> Exclusivo para identidade civil
-4. EMAIL -> Exclusivo para e-mails
-5. PHONE -> Exclusivo para números de telefone
-6. PLATE -> Exclusivo para placas veiculares
-7. CHASSI -> Exclusivo para código VIN/Chassi
-8. IP -> Exclusivo para endereços IP
-9. GENERIC_CODE -> Exclusivo para credenciais, senhas, tokens de acesso ou hashes
-10. NOME_SOLTO -> Exclusivo para nomes próprios de seres humanos
-11. TEXTO_LIVRE -> Parágrafos longos, relatos ou observações detalhadas
-
-Escolha APENAS UMA tag da lista acima. Responda SOMENTE com o nome da tag, sem pontuação ou texto adicional.
+Responda APENAS com a palavra 'SIM' ou 'NAO'. Não justifique.
 """
-
-    logger.info(f"🧠 [ANALISADOR DE COLUNA] IA avaliando '{col_name}' (Regex falhou)")
+    logger.info(f"🧠 [FALLBACK IA] Balança indecisa. Avaliando sensibilidade da coluna '{col_name}'...")
 
     try:
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0.0, "num_predict": 10}
-        }
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=15, proxies={"http": "", "https": ""})
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=12, proxies={"http": "", "https": ""})
 
         if resp.status_code == 200:
             ans = resp.json().get("response", "").strip().upper()
-            tags_validas = {
-                "IGNORAR", "NOME_SOLTO", "CPF", "RG", "EMAIL", "PHONE", 
-                "PLATE", "CHASSI", "IP", "GENERIC_CODE", "TEXTO_LIVRE"
-            }
-            for tag in tags_validas:
-                if tag in ans:
-                    return tag
-
+            if "SIM" in ans:
+                return "TEXTO_LIVRE"
+            else:
+                return "IGNORAR"
     except Exception as e:
-        logger.warning(f"Erro classificando coluna '{col_name}' com Ollama: {e}")
+        logger.warning(f"Erro no fallback da IA para '{col_name}': {e}")
 
-    return "TEXTO_LIVRE" 
-
+    return "TEXTO_LIVRE"
 
 def define_column_policy(col_name: str, sample_values: list) -> str:
     if col_name in _COLUMN_POLICIES: 
         return _COLUMN_POLICIES[col_name]
         
-    politica = _regex_classify_column(sample_values)
-    
+    politica = _calculate_column_score(col_name, sample_values)
     if not politica:
-        politica = _ollama_classify_column(col_name, sample_values)
+        politica = _ask_llm_if_sensitive(col_name, sample_values)
     
     logger.info(f"✅ Política Definida Mestre para '{col_name}': {politica}")
     _COLUMN_POLICIES[col_name] = politica
     return politica
 
-
 # =========================================================
-# 2. JUIZ DE ENTIDADES (Apenas para nomes)
+# 2. JUIZ DE ENTIDADES & TEXTO LIVRE
 # =========================================================
 def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     if len(text.strip()) < 3: return False
@@ -193,7 +176,7 @@ def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
         
     if tag in ["PER", "NOME_SOLTO"]:
-        prompt = f"A expressão '{text}' parece ser o nome próprio de uma pessoa física humana? Responda APENAS 'SIM' ou 'NAO'."
+        prompt = f"A expressão '{text}' é o nome próprio de uma pessoa física humana? Regra: Nomes de ruas, bairros ou cidades são 'NAO'. Responda APENAS 'SIM' ou 'NAO'."
     else:
         return True 
     
@@ -209,9 +192,6 @@ def _is_valid_entity_ollama(text: str, tag: str) -> bool:
         
     return False
 
-# =========================================================
-# 3. MOTOR DE TEXTO LIVRE (Frases e Relatos)
-# =========================================================
 @lru_cache(maxsize=100000)
 def _normalize(text: str) -> str:
     if not text: return ""
@@ -290,9 +270,6 @@ def _detect_all(text: str, anon_loc: bool):
             last = e
     return clean
 
-# =========================================================
-# 4. GERAÇÃO DE FAKES E GPS JITTER
-# =========================================================
 def apply_gps_jitter(coord_str):
     try:
         c = float(coord_str.replace(',', '.'))
@@ -326,7 +303,7 @@ def _get_fake(value: str, typ: str) -> str:
     return val
 
 # =========================================================
-# 5. ORQUESTRAÇÃO FINAL
+# 4. ORQUESTRAÇÃO DE ANONIMIZAÇÃO
 # =========================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True):
     try:
@@ -343,16 +320,26 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 
         politica_execucao = politica
 
+       
         if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
             if len(text) > 50 or len(text.split()) > 4:
                 politica_execucao = "TEXTO_LIVRE"
 
+     
         if politica_execucao == "IGNORAR":
             return text, None
             
         if politica_execucao == "NOME_SOLTO":
             if _is_valid_entity_ollama(text, "NOME_SOLTO"):
                 fake_val = _get_fake(text, "NOME_SOLTO")
+                return fake_val, ("TEXT" if fake_val != text else None)
+            else:
+                return text, None
+
+     
+        if politica_execucao in ["COORD", "COORD_SINGLE"]:
+            if anon_location:
+                fake_val = _get_fake(text, politica_execucao)
                 return fake_val, ("TEXT" if fake_val != text else None)
             else:
                 return text, None
@@ -375,6 +362,9 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             result.append(text[last:])
             texto_final = "".join(result)
             return texto_final, ("TEXT" if texto_final != text else None)
+
+ 
+        return text, None
 
     except Exception as e:
         logger.error(f"⚠️ Erro ao aplicar mascara na coluna '{col_name}': {e}", exc_info=True)
