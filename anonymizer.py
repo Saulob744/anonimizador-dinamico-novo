@@ -1,207 +1,396 @@
-import re, random, string, unicodedata, hashlib, logging
+import re
+import random
+import string
+import unicodedata
+import hashlib
+import logging
+import requests
+import html
+from functools import lru_cache
 from faker import Faker
-from gliner import GLiNER
 
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================================================
-# CONFIGURAÇÕES GERAIS
-# ==================================================
+try:
+    import spacy
+    nlp = spacy.load("pt_core_news_lg")
+    logger.debug("spaCy carregado com sucesso.")
+except OSError:
+    logger.warning("spaCy não encontrado. A detecção dependerá apenas de Regex.")
+    nlp = None
+
+_MAPPING_CACHE = {}
+_COLUMN_POLICIES = {} 
+_OLLAMA_CACHE = {} 
+_DYNAMIC_SAMPLES = {} 
+
 fake = Faker("pt_BR")
-_gliner_model = None
 
-GLINER_LABELS = [
-    "person", "first name", "suspect", "victim", "employee",
-    "email", "phone number", "address", "organization", "location"
-]
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_MODEL = "llama3:latest"
 
-def get_gliner():
-    global _gliner_model
-    if _gliner_model is None:
-        logger.info("Carregando modelo GLiNER na memória...")
-        _gliner_model = GLiNER.from_pretrained("urchade/gliner_base")
-    return _gliner_model
-
-# ==================================================
-# MOTORES DE BUSCA
-# ==================================================
+# =========================================================
+# REGEX ESTRUTURAIS
+# =========================================================
 REGEX = {
-    "CPF": re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
-    "EMAIL": re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b"),
-    "PHONE": re.compile(r"\b(?:\+?55\s?)?(?:\(?\d{2}\)?\s?)?(?:9\d{4}|\d{4})-?\d{4}\b"),
-    "PLATE": re.compile(r"\b[A-Z]{3}-?\d[A-Z0-9]\d{2}\b", re.IGNORECASE),
-    "CEP": re.compile(r"\b\d{5}-?\d{3}\b"),
-    "COORDS": re.compile(r"-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+"),
-    "CODE": re.compile(r"\b(?=[A-Za-z-]*\d)(?=[0-9-]*[A-Za-z])[A-Za-z0-9-]{5,}\b")
+    "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"), 
+    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
+    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
+    "CPF": re.compile(r"\b\d{3}[.\-\s]*\d{3}[.\-\s]*\d{3}[.\-\s]*\d{2}\b|\b\d{11}\b"),
+    "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
+    "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b|\b[A-Z]{3}[-\s]?\d{4}\b", re.IGNORECASE),
+    "PHONE": re.compile(r"\b(?:\+?55\s*)?(?:\(?\d{2,3}\)?[\s-]*)?\d{4,5}[-\s]*\d{4}\b"),
+    "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
+    "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE), 
+    # REGRA MAIS RÍGIDA: Um código genérico sensível agora exige PELO MENOS um número.
+    # Isso evita que palavras normais como "EXTORSAO" ou "ASSALTO" sejam consideradas códigos.
+    "GENERIC_CODE": re.compile(r'\b(?=.*\d)[A-Za-z0-9_/\.\-]{6,64}\b'),
 }
 
-# 🚀 NOVO: Regex para validar se a string é um UUID legítimo (8-4-4-4-12)
-UUID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+CONTEXT_NAME_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|atendente|consultor|gerente|responsavel|usuario|agente|vendedor|motorista|funcionario|titular|favorecido)\s*[:\-]?\s+([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){0,4})\b", re.IGNORECASE)
+PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senhora|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial|rua|avenida|trevo|cia|agente|vendedor|motorista|funcionario)\s+", re.IGNORECASE)
 
-NAME_REGEX = re.compile(r"\b([A-ZÀ-Ü][A-ZÀ-Üa-zà-ü']+(?:\s+(?:D\.|DA|DE|DO|DAS|DOS|[A-ZÀ-Ü][A-Za-zà-ü']+)){1,4})\b")
+NAME_FALLBACK_REGEX = re.compile(
+    r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"                
+    r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?"   
+    r"\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"               
+    r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,}))*\b(?!\:)"        
+)
 
-_nomes = "Maria|João|Joao|Ana|José|Jose|Carlos|Paulo|Lucas|Marcos|Luiz|Fernanda|Julia|Pedro|Carol|Jorge|Antonio|Francisco|Aline|Bruna|Camila|Rafael|Gabriel|Rodrigo|Thiago|Bruno|Amanda|Jessica|Letícia|Leticia|Diego|Marcelo|Gustavo|Guilherme|Felipe|Larissa|Vitória|Vitoria|Renato|Eduardo|Leonardo|Victor|Vitor|Matheus|Mateus"
-COMMON_NAMES = re.compile(rf"\b({_nomes})\b", re.IGNORECASE)
 
-PURE_COORD_PATTERN = re.compile(r"^-?\d{1,3}\.\d+,\s*-?\d{1,3}\.\d+$")
+# =========================================================
+# 1. CLASSIFICADORES DE COLUNA (REGEX E IA)
+# =========================================================
 
-# ==================================================
-# FUNÇÕES CORE
-# ==================================================
-def _normalize(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text)
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", "".join(c for c in text if not unicodedata.combining(c)))).upper().strip()
+def _regex_classify_column(samples: list) -> str:
+    amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
+    if not amostras_limpas:
+        return "IGNORAR"
 
-def _canonical(value: str) -> str:
-    v = re.sub(r"\b([A-Z])\.", r"\1", _normalize(value))
-    return " ".join([p for p in v.split() if len(p) > 1])
+    total_amostras = len(amostras_limpas)
+    match_counts = {key: 0 for key in REGEX.keys()}
+    match_counts["NOME_SOLTO"] = 0
+    texto_livre_count = 0
 
-def _fingerprint(value: str) -> str:
-    return hashlib.sha256(" ".join(sorted([p for p in _canonical(value).split() if len(p) > 2])).encode()).hexdigest()
+    for val in amostras_limpas:
+        if len(val) > 50 or len(val.split()) > 4:
+            texto_livre_count += 1
+            continue
 
-# ==================================================
-# GERADOR DETERMINÍSTICO
-# ==================================================
-def _get_fake(value: str, typ: str) -> str:
-    seed = int(hashlib.sha256((_fingerprint(value) + typ).encode()).hexdigest()[:8], 16)
-    fake.seed_instance(seed)
-    random.seed(seed)
+        matched_structural = False
+        for typ, pat in REGEX.items():
+            if pat.search(val):
+                # Dupla checagem para garantir que palavras não passem como códigos
+                if typ == "GENERIC_CODE" and not any(c.isdigit() for c in val):
+                    continue
+                
+                match_counts[typ] += 1
+                matched_structural = True
+                break 
 
-    # 🚀 TRATAMENTO PARA UUID: Gera um UUID válido para não quebrar o banco
-    if typ == "UUID": return fake.uuid4()
+        if not matched_structural:
+            if NAME_FALLBACK_REGEX.search(val) or CONTEXT_NAME_REGEX.search(val):
+                match_counts["NOME_SOLTO"] += 1
+
+    threshold = 0.5 
+
+    if (texto_livre_count / total_amostras) >= threshold:
+        return "TEXTO_LIVRE"
+
+    for typ, count in match_counts.items():
+        if (count / total_amostras) >= threshold:
+            return typ
+
+    return None
+
+
+def _ollama_classify_column(col_name: str, samples: list) -> str:
+    amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
     
-    if typ == "PER": return fake.name().upper()
-    if typ == "CPF": return fake.cpf()
-    if typ == "EMAIL": return fake.email()
-    if typ == "PHONE": return fake.phone_number()
-    if typ == "PLATE": return fake.license_plate().upper()
-    if typ == "CEP": return fake.postcode()
-    if typ == "ORG": return fake.company()
-    
-    if typ == "CODE":
-        return "".join(random.choices(string.ascii_uppercase + string.digits, k=max(5, len(value))))
+    if not amostras_limpas:
+        return "IGNORAR"
 
-    if typ == "LOC":
-        base = _normalize(value).split()[0] if value.split() else "LOC"
-        return f"{base}_REGIAO_{random.randint(1, 100)}"
-        
-    if typ == "COORDS":
-        try:
-            lat, lon = map(float, value.split(","))
-            return f"{round(lat + random.uniform(-0.05, 0.05), 4)}, {round(lon + random.uniform(-0.05, 0.05), 4)}"
-        except: return "-0.0000, -0.0000"
-            
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    amostra_str = " | ".join(amostras_limpas[:10])
 
-# ==================================================
-# DETECÇÃO E CLASSIFICAÇÃO
-# ==================================================
-def _resolve_type(raw_type: str) -> str:
-    t = raw_type.lower()
-    if any(k in t for k in ["person", "name", "suspect", "victim", "employee"]): return "PER"
-    if "email" in t: return "EMAIL"
-    if "phone" in t: return "PHONE"
-    if "organization" in t: return "ORG"
-    if any(k in t for k in ["location", "address"]): return "LOC"
-    return "UNK"
+    prompt = f"""
+Você é especialista em LGPD e modelagem de dados.
+Analise o nome da coluna e os valores reais.
 
-def _detect_gliner(text: str):
-    if len(text) < 10 or " " not in text: return []
+COLUNA:
+{col_name}
+
+AMOSTRAS:
+{amostra_str}
+
+Escolha APENAS UMA das tags:
+CPF, RG, EMAIL, PHONE, PLATE, CHASSI, IP, GENERIC_CODE, NOME_SOLTO, TEXTO_LIVRE, IGNORAR
+
+Regras:
+CPF -> CPF brasileiro
+RG -> identidade civil
+EMAIL -> email
+PHONE -> telefone
+PLATE -> placa veicular
+CHASSI -> VIN/chassi
+IP -> endereço IP
+GENERIC_CODE -> token, hash, senha, identificador
+NOME_SOLTO -> nomes de pessoas
+TEXTO_LIVRE -> observações, descrições, relatos
+IGNORAR -> endereço, cidade, bairro, marca, modelo, profissão, status, datas, categorias, tipos de crime
+
+Responda SOMENTE com a tag.
+"""
+
+    logger.info(f"🧠 [ANALISADOR DE COLUNA] IA avaliando '{col_name}' (Regex falhou)")
+
     try:
-        preds = get_gliner().predict_entities(text, GLINER_LABELS, threshold=0.30)
-        return [ (e["start"], e["end"], e["text"], _resolve_type(e["label"])) for e in preds ]
-    except Exception:
-        return []
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.0, "num_predict": 10}
+        }
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=15, proxies={"http": "", "https": ""})
 
-def _detect_all(text: str):
+        if resp.status_code == 200:
+            ans = resp.json().get("response", "").strip().upper()
+            tags_validas = {
+                "IGNORAR", "NOME_SOLTO", "CPF", "RG", "EMAIL", "PHONE", 
+                "PLATE", "CHASSI", "IP", "GENERIC_CODE", "TEXTO_LIVRE"
+            }
+            for tag in tags_validas:
+                if tag in ans:
+                    return tag
+
+    except Exception as e:
+        logger.warning(f"Erro classificando coluna '{col_name}' com Ollama: {e}")
+
+    return "TEXTO_LIVRE" 
+
+
+def define_column_policy(col_name: str, sample_values: list) -> str:
+    if col_name in _COLUMN_POLICIES: 
+        return _COLUMN_POLICIES[col_name]
+        
+    politica = _regex_classify_column(sample_values)
+    
+    if not politica:
+        politica = _ollama_classify_column(col_name, sample_values)
+    
+    logger.info(f"✅ Política Definida Mestre para '{col_name}': {politica}")
+    _COLUMN_POLICIES[col_name] = politica
+    return politica
+
+
+# =========================================================
+# 2. JUIZ DE ENTIDADES (Apenas para nomes)
+# =========================================================
+def _is_valid_entity_ollama(text: str, tag: str) -> bool:
+    if len(text.strip()) < 3: return False
+    
+    cache_key = f"{tag}:{text.upper()}"
+    if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
+        
+    
+    if tag in ["PER", "NOME_SOLTO"]:
+        prompt = f"A expressão '{text}' parece ser o nome próprio de uma pessoa física humana? Responda APENAS 'SIM' ou 'NAO'."
+    else:
+        return True 
+    
+    try:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=8, proxies={"http": "", "https": ""})
+        if resp.status_code == 200:
+            is_valid = "SIM" in resp.json().get("response", "").strip().upper()
+            _OLLAMA_CACHE[cache_key] = is_valid 
+            return is_valid
+    except Exception as e:
+        logger.warning(f"Timeout no Ollama para '{text}'. Erro: {e}")
+        
+    return False
+
+# =========================================================
+# 3. MOTOR DE TEXTO LIVRE (Frases e Relatos)
+# =========================================================
+@lru_cache(maxsize=100000)
+def _normalize(text: str) -> str:
+    if not text: return ""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).upper().strip()
+
+def _is_hallucination_basic(ent_text: str) -> bool:
+    ent_text = ent_text.strip(".,;:-\n '\"")
+    if not ent_text or len(ent_text) <= 2: return True
+    if any(c.isdigit() for c in ent_text) and any(c in ['.', ',', '-'] for c in ent_text): return True
+    
+    termos_proibidos = {
+        "CPF", "RG", "CNPJ", "CEP", "DOC", "DOCUMENTO", "TEL", "CEL", "TELEFONE", 
+        "CELULAR", "PIX", "CHAVE", "PLACA", "DR", "DRA", "SR", "SRA", "SISTEMA", 
+        "RELATORIO", "PROJETO", "PGTO", "PAGAMENTO", "EFETUADO", "TRANSFERENCIA", 
+        "ESTORNO", "DEVOLUCAO", "VALOR", "TARIFA", "TAXA", "VIATURA", "VEICULO",
+        "CARRO", "MOTO", "MODELO", "MARCA", "CHEVROLET", "FIAT", "VOLKSWAGEN", 
+        "FORD", "HONDA", "TOYOTA", "HYUNDAI", "RENAULT", "NISSAN", "JEEP", "PEUGEOT",
+        "ASSALTO", "ROUBO", "FURTO", "CRIME", "DELITO", "OCORRENCIA", "BO", "TRAFICO", "EXTORSAO"
+    }
+    texto_norm = _normalize(ent_text)
+    partes = texto_norm.split()
+    
+    if all(p in termos_proibidos for p in partes): return True
+    if texto_norm in termos_proibidos or any(texto_norm.startswith(t + " ") for t in termos_proibidos): return True
+    return False
+
+def _detect_all(text: str, anon_loc: bool):
     found = []
-    for typ, pattern in REGEX.items():
-        for m in pattern.finditer(text): found.append((m.start(), m.end(), m.group(), typ))
+    PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "CHASSI": 1, "RG": 2, "PHONE": 2, "PLATE": 2, "COORD": 3, "COORD_SINGLE": 3, "PER": 4, "GENERIC_CODE": 99 }
+    
+    for typ, pat in REGEX.items():
+        if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: 
+            continue
+            
+        for match in pat.finditer(text):
+            val = match.group()
+            # Removido o Ollama daqui para códigos. Regex resolve de forma rápida.
+            if typ == "GENERIC_CODE" and (not any(c.isdigit() for c in val) or len(val) < 6):
+                continue
+            found.append((match.start(), match.end(), val, typ))
 
-    for m in NAME_REGEX.finditer(text):
-        raw = m.group()
-        words = _canonical(raw).split()
-        if len(words) >= 2 and not any(w.isdigit() for w in words):
-            found.append((m.start(), m.end(), raw, "PER"))
+    
+    for match in CONTEXT_NAME_REGEX.finditer(text):
+        val = match.group(2).strip()
+        if not _is_hallucination_basic(val):
+            if _is_valid_entity_ollama(val, "PER"):
+                found.append((match.start(2), match.end(2), text[match.start(2):match.end(2)], "PER"))
 
-    for m in COMMON_NAMES.finditer(text):
-        found.append((m.start(), m.end(), m.group(), "PER"))
+    if nlp:
+        is_bad_casing = sum(1 for c in text if c.isupper()) > len(text) * 0.5 or text.islower()
+        doc = nlp(text.title() if is_bad_casing else text)
+        for ent in doc.ents:
+            if ent.label_ == "PER":
+                if any(token.pos_ in ["VERB", "PRON", "PUNCT", "SYM"] for token in ent): continue
+                prefix_match = PREFIX_TRIMMER.search(ent.text)
+                offset = prefix_match.end() if prefix_match else 0
+                val_raw = ent.text[offset:]
+                val_clean = val_raw.strip()
+                start_adj = val_raw.find(val_clean)
+                start = ent.start_char + offset + (start_adj if start_adj != -1 else 0)
+                texto_original = text[start : start + len(val_clean)] 
+                
+                if not _is_hallucination_basic(texto_original): 
+                    if _is_valid_entity_ollama(texto_original, "PER"):
+                        found.append((start, start + len(val_clean), texto_original, "PER"))
 
-    found.extend(_detect_gliner(text))
+    for match in NAME_FALLBACK_REGEX.finditer(text):
+        val = match.group().strip()
+        if not _is_hallucination_basic(val):
+            if _is_valid_entity_ollama(val, "PER"):
+                found.append((match.start(), match.end(), val, "PER"))
 
-    clean_found, last_end = [], -1
-    for s, e, v, typ in sorted(found, key=lambda x: (x[0], -(x[1]-x[0]))):
-        if s >= last_end:
-            clean_found.append((s, e, v, typ))
-            last_end = e
-    return clean_found
+    found.sort(key=lambda x: (x[0], -(x[1] - x[0]), PRIORITY.get(x[3], 50)))
+    clean, last = [], -1
+    for s, e, v, t in found:
+        if s >= last:
+            clean.append((s, e, text[s:e], t))
+            last = e
+    return clean
+
+# =========================================================
+# 4. GERAÇÃO DE FAKES E GPS JITTER
+# =========================================================
+def apply_gps_jitter(coord_str):
+    try:
+        c = float(coord_str.replace(',', '.'))
+        return f"{c + random.uniform(-0.003, 0.003):.6f}"
+    except ValueError:
+        return coord_str
+
+def _get_fake(value: str, typ: str) -> str:
+    clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
+    norm_val = _normalize(clean_value)
+    cache_key = f"{typ}:{norm_val}"
+    if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
+
+    fake.seed_instance(int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16))
+    
+    if typ in ["PER", "NOME_SOLTO"]: val = fake.name().upper()
+    elif typ == "CPF": val = fake.cpf()
+    elif typ == "RG": val = fake.numerify('##.###.###-#') 
+    elif typ in ["PLATE", "PLACA"]: val = fake.license_plate().upper()
+    elif typ == "EMAIL": val = fake.email().lower()
+    elif typ == "PHONE": val = fake.phone_number()
+    elif typ == "IP": val = fake.ipv4()
+    elif typ == "CHASSI": val = "".join(random.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
+    elif typ in ["COORD", "COORD_SINGLE"]: 
+        val = re.sub(r"-?\d{1,3}[.,]\d+", lambda m: apply_gps_jitter(m.group(0)), value)
+    elif typ == "GENERIC_CODE": 
+        val = "".join([random.choice(string.digits) if c.isdigit() else (random.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
+    else: val = fake.word().upper()
+
+    _MAPPING_CACHE[cache_key] = val
+    return val
+
+# =========================================================
+# 5. ORQUESTRAÇÃO FINAL
+# =========================================================
+def anonymize_value(col_name: str, val, anon_location: bool = True):
+    try:
+        if val is None or not str(val).strip(): return val, None
+        text = str(val)
+        
+        if len(text) < 3: 
+            return text, None
+            
+        if col_name not in _COLUMN_POLICIES:
+            politica = define_column_policy(col_name, [text])
+        else:
+            politica = _COLUMN_POLICIES[col_name]
+
+        politica_execucao = politica
+
+        if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
+            if len(text) > 50 or len(text.split()) > 4:
+                politica_execucao = "TEXTO_LIVRE"
+
+        if politica_execucao == "IGNORAR":
+            return text, None
+            
+        # VALIDAÇÃO EXCLUSIVA DE NOMES
+        if politica_execucao == "NOME_SOLTO":
+            # Pergunta para a IA. Se ela barrar, mantemos o texto original intacto.
+            if _is_valid_entity_ollama(text, "NOME_SOLTO"):
+                fake_val = _get_fake(text, "NOME_SOLTO")
+                return fake_val, ("TEXT" if fake_val != text else None)
+            else:
+                return text, None
+
+        
+        if politica_execucao in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
+            fake_val = _get_fake(text, politica_execucao)
+            return fake_val, ("TEXT" if fake_val != text else None)
+            
+        if politica_execucao == "TEXTO_LIVRE":
+            entities = _detect_all(text, anon_location)
+            if not entities: 
+                return text, None
+            
+            result, last = [], 0
+            for s, e, v, t in entities:
+                if s < last: continue
+                result.append(text[last:s])
+                result.append(_get_fake(v, t))
+                last = e
+            result.append(text[last:])
+            texto_final = "".join(result)
+            return texto_final, ("TEXT" if texto_final != text else None)
+
+    except Exception as e:
+        logger.error(f"⚠️ Erro ao aplicar mascara na coluna '{col_name}': {e}", exc_info=True)
+        return str(val), None 
 
 def reset_memory():
-    fake.seed_instance(42)
-
-# ==================================================
-# API PRINCIPAL
-# ==================================================
-def anonymize_text(text: str) -> str:
-    if not isinstance(text, str) or not text.strip() or (text.isdigit() or len(text) < 3):
-        return text
-
-    entities = _detect_all(text)
-    if not entities: return text
-
-    result, last = [], 0
-    for s, e, v, typ in entities:
-        result.extend([text[last:s], _get_fake(v, typ)])
-        last = e
-
-    result.append(text[last:])
-    return "".join(result)
-
-def anonymize_value(col_name: str, val, anon_location: bool = True):
-    if val is None or type(val).__name__ in ['date', 'datetime', 'Timestamp']:
-        return val, None
-
-    col = (col_name or "").lower()
-
-    # 🚀 NOVO: tratar latitude/longitude numéricas
-    if anon_location and isinstance(val, (int, float)):
-        if col in ["latitude", "lat"]:
-            seed = int(hashlib.sha256(f"{val}_lat".encode()).hexdigest()[:8], 16)
-            random.seed(seed)
-            return val + random.uniform(-0.01, 0.01), "LAT_LON"
-
-        if col in ["longitude", "lon", "lng"]:
-            seed = int(hashlib.sha256(f"{val}_lon".encode()).hexdigest()[:8], 16)
-            random.seed(seed)
-            return val + random.uniform(-0.01, 0.01), "LAT_LON"
-
-        return val, None  # mantém comportamento original para outros números
-
-    val_str = str(val).strip()
-
-    # UUID (mantido)
-    if UUID_PATTERN.match(val_str):
-        return _get_fake(val_str, "UUID"), "UUID"
-
-    # 🚀 AJUSTE: coordenadas em string agora usam ruído (não só precisão)
-    if PURE_COORD_PATTERN.match(val_str):
-        return (alter_geo_precision(val_str, precision=6, noise=0.01), "COORD") if anon_location else (val_str, None)
-
-    new_val = anonymize_text(val_str)
-    return new_val, ("TEXT" if new_val != val_str else None)
-
-# Helper GPS mantido
-def alter_geo_precision(value: str, precision: int = 6, noise: float = 0.01) -> str:
-    try:
-        lat, lon = map(float, value.split(","))
-
-        # determinístico (mesmo input → mesmo output)
-        seed = int(hashlib.sha256(value.encode()).hexdigest()[:8], 16)
-        random.seed(seed)
-
-        lat += random.uniform(-noise, noise)
-        lon += random.uniform(-noise, noise)
-
-        return f"{lat:.{precision}f}, {lon:.{precision}f}"
-    except:
-        return value
+    _MAPPING_CACHE.clear()
+    _COLUMN_POLICIES.clear()
+    _OLLAMA_CACHE.clear()
+    _DYNAMIC_SAMPLES.clear()
