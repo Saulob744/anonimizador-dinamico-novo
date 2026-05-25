@@ -47,7 +47,9 @@ REGEX = {
         r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|"               
         r"\b\d{2}:\d{2}(?:\:\d{2})?\b|"                                        
         r"\b(?:19|20)\d{2,4}\b"                                               
-    ),    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
+    ),    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"),
+    "ID_NUMERICO": re.compile(r"^-?\d+$"),
+    "NUMERO_DECIMAL": re.compile(r"^-?\d+[.,]\d+$"),
     "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
     "CPF": re.compile(r"\b\d{3}[.\-\s]*\d{3}[.\-\s]*\d{3}[.\-\s]*\d{2}\b|\b\d{11}\b"),
     "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
