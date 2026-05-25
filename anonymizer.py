@@ -41,8 +41,13 @@ OLLAMA_MODEL = "llama3:latest"
 # REGEX ESTRUTURAIS
 # =========================================================
 REGEX = {
-    "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"), 
-    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
+    "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"),
+    "DATA_TIME": re.compile(
+        r"\b\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?\b|" 
+        r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|"               
+        r"\b\d{2}:\d{2}(?:\:\d{2})?\b|"                                        
+        r"\b(?:19|20)\d{2,4}\b"                                               
+    ),    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
     "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
     "CPF": re.compile(r"\b\d{3}[.\-\s]*\d{3}[.\-\s]*\d{3}[.\-\s]*\d{2}\b|\b\d{11}\b"),
     "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
@@ -116,6 +121,9 @@ def _smart_title(text: str) -> str:
     letras = sum(1 for c in text if c.isalpha())
     if letras == 0: return text
     
+    if not (text.isupper() or text.islower()):
+        return text 
+    
     excecoes = {"de", "da", "do", "dos", "das", "e"}
     
     partes = re.split(r'(\s+)', text) 
@@ -128,14 +136,13 @@ def _smart_title(text: str) -> str:
         if word_lower in excecoes:
             partes[i] = word_lower
         else:
-           
+
             partes[i] = partes[i].capitalize()
             
     return "".join(partes)
 
 
 def define_column_policy(col_name: str, samples: list) -> str:
-
     if col_name in _COLUMN_POLICIES:
         return _COLUMN_POLICIES[col_name]
 
@@ -144,26 +151,22 @@ def define_column_policy(col_name: str, samples: list) -> str:
         return "IGNORAR"
 
     amostra_base = valid_samples[0]
-   
     amostra_conjunta = " | ".join(valid_samples[:3])
 
     if len(amostra_base) > 50 or len(amostra_base.split()) > 4:
         _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
         return "TEXTO_LIVRE"
 
-   
     pontuacao = {key: 0 for key in REGEX.keys()}
     pontuacao["NOME_SOLTO"] = 0
 
     for amostra in valid_samples:
-      
         for typ, pat in REGEX.items():
             if pat.search(amostra):
                 if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra):
                     continue
                 pontuacao[typ] += 1
         
-      
         texto_formatado = _smart_title(amostra)
         parece_nome = False
         if NAME_FALLBACK_REGEX.search(texto_formatado):
@@ -174,12 +177,16 @@ def define_column_policy(col_name: str, samples: list) -> str:
         if parece_nome:
             pontuacao["NOME_SOLTO"] += 1
 
-
     melhor_tipo = max(pontuacao, key=pontuacao.get)
     maior_pontuacao = pontuacao[melhor_tipo]
 
-   
     if maior_pontuacao > 0:
+        # --- ATALHO DINÂMICO PARA ENTRADAS NÃO-SENSÍVEIS (PULA O OLLAMA) ---
+        if melhor_tipo in ["DATA_TIME", "ID_NUMERICO", "NUMERO_DECIMAL"]:
+            logger.debug(f"⏩ Perfilamento identificou tipo não-sensível '{melhor_tipo}' dinamicamente para '{col_name}'. Definindo como IGNORAR.")
+            _COLUMN_POLICIES[col_name] = "IGNORAR"
+            return "IGNORAR"
+
         if melhor_tipo == "NOME_SOLTO":
             pergunta = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém NOMES PRÓPRIOS de pessoas reais?"
             if _ask_ollama_sim_nao(pergunta, f"COL_PER:{col_name}:{amostra_conjunta}"):
@@ -193,14 +200,12 @@ def define_column_policy(col_name: str, samples: list) -> str:
                 _COLUMN_POLICIES[col_name] = melhor_tipo
                 return melhor_tipo
 
-   
     pergunta_sensivel = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém informações pessoais sensíveis que precisam ser mascaradas?"
     if _ask_ollama_sim_nao(pergunta_sensivel, f"COL_SENSITIVE:{col_name}:{amostra_conjunta}"):
         logger.debug(f"⚖️ Balança Ollama: Classificou '{col_name}' como TEXTO_LIVRE sensível genérico")
         _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
         return "TEXTO_LIVRE"
 
-   
     _COLUMN_POLICIES[col_name] = "IGNORAR"
     return "IGNORAR"
 
@@ -231,14 +236,35 @@ def _is_hallucination_basic(ent_text: str) -> bool:
     return False
 
 def _clean_extracted_name(name_text: str) -> str:
-    words = name_text.split()
+    name_text = name_text.strip(".,;:!?()\"'")
+    if not name_text: return ""
+
+    if not nlp:
+        return " ".join([w for w in name_text.split() if w.strip(".,;:!?()\"'")]).strip()
+    
+    doc = nlp(name_text)
+    tokens = list(doc)
+
+    start_idx = -1
+    for i, token in enumerate(tokens):
+        if token.pos_ == "PROPN":
+            start_idx = i
+            break
+        
+    end_idx = -1
+    for i in range(len(tokens) - 1, -1, -1):
+        if tokens[i].pos_ == "PROPN":
+            end_idx = i
+            break
+            
+    if start_idx == -1 or end_idx == -1 or start_idx > end_idx:
+        return " ".join([t.text for t in tokens]).strip(".,;:!?()\"' ")
+
     valid_words = []
-    preposicoes = {"de", "da", "do", "dos", "das", "e"}
-    for w in words:
-        w_clean = w.strip(".,;:!?()\"'")
-        if not w_clean: continue
-        valid_words.append(w)
-    return " ".join(valid_words).strip(".,;:!?()\"' ")
+    for i in range(start_idx, end_idx + 1):
+        valid_words.append(tokens[i].text_with_ws)
+        
+    return "".join(valid_words).strip(".,;:!?()\"' ")
 
 def _detect_all(text: str, anon_loc: bool):
     found = []
@@ -358,20 +384,25 @@ def _get_fake(value: str, typ: str) -> str:
 # =========================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True):
     try:
-        if val is None or not str(val).strip(): return val, None
-        text = str(val)
+        if val is None: return val, None
         
-        if len(text) < 3: 
+        try:
+            text = str(val).strip()
+        except Exception as date_err:
+            logger.warning(f"⚠️ Objeto corrompido travou o str() na coluna '{col_name}'. Usando conversão crua de segurança.")
+            text = repr(val).strip("'\" ")
+        
+     
+        if len(text) < 3 or REGEX["DATA_TIME"].fullmatch(text) or REGEX["ID_NUMERICO"].fullmatch(text) or REGEX["NUMERO_DECIMAL"].fullmatch(text): 
             return text, None
             
         # --- PERFILAMENTO ---
         if col_name not in _COLUMN_POLICIES:
-          
             politica = define_column_policy(col_name, [text])
         else:
             politica = _COLUMN_POLICIES[col_name]
 
-        # --- ROTEAMENTO  ---
+        # --- ROTEAMENTO ---
         politica_execucao = politica
 
         if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
@@ -413,7 +444,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
 
     except Exception as e:
         logger.error(f"⚠️ Erro ao aplicar mascara na coluna '{col_name}': {e}", exc_info=True)
-        return str(val), None 
+        return text if 'text' in locals() else str(val), None 
 
 def reset_memory():
     _MAPPING_CACHE.clear()
