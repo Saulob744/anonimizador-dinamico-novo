@@ -135,11 +135,7 @@ def _smart_title(text: str) -> str:
 
 
 def define_column_policy(col_name: str, samples: list) -> str:
-    """
-    Define a política de anonimização de uma coluna inteira.
-    Usa um sistema de pontuação baseado em Regex/NLP e usa o Ollama como balança final.
-    """
-    # 0. Verifica o Cache: Se já julgamos essa coluna, não gasta processamento
+
     if col_name in _COLUMN_POLICIES:
         return _COLUMN_POLICIES[col_name]
 
@@ -148,27 +144,26 @@ def define_column_policy(col_name: str, samples: list) -> str:
         return "IGNORAR"
 
     amostra_base = valid_samples[0]
-    # Junta as amostras (até 3) para dar um bom contexto ao Ollama depois
+   
     amostra_conjunta = " | ".join(valid_samples[:3])
 
-    # 1. TEXTO LIVRE DIRETO (Se for muito longo, não gastamos Regex à toa)
     if len(amostra_base) > 50 or len(amostra_base.split()) > 4:
         _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
         return "TEXTO_LIVRE"
 
-    # 2. SISTEMA DE PONTUAÇÃO
+   
     pontuacao = {key: 0 for key in REGEX.keys()}
     pontuacao["NOME_SOLTO"] = 0
 
     for amostra in valid_samples:
-        # A. Pontua Regex Estrutural
+      
         for typ, pat in REGEX.items():
             if pat.search(amostra):
                 if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra):
                     continue
                 pontuacao[typ] += 1
         
-        # B. Pontua Nomes (Regex + spaCy)
+      
         texto_formatado = _smart_title(amostra)
         parece_nome = False
         if NAME_FALLBACK_REGEX.search(texto_formatado):
@@ -179,11 +174,11 @@ def define_column_policy(col_name: str, samples: list) -> str:
         if parece_nome:
             pontuacao["NOME_SOLTO"] += 1
 
-    # Descobre qual tipo teve a maior pontuação
+
     melhor_tipo = max(pontuacao, key=pontuacao.get)
     maior_pontuacao = pontuacao[melhor_tipo]
 
-    # 3. OLLAMA COMO BALANÇA / JUIZ FINAL (Executado apenas 1x por coluna)
+   
     if maior_pontuacao > 0:
         if melhor_tipo == "NOME_SOLTO":
             pergunta = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém NOMES PRÓPRIOS de pessoas reais?"
@@ -198,15 +193,14 @@ def define_column_policy(col_name: str, samples: list) -> str:
                 _COLUMN_POLICIES[col_name] = melhor_tipo
                 return melhor_tipo
 
-    # 4. FALLBACK: PERGUNTA GENÉRICA DE DADO SENSÍVEL
-    # Se o regex achou algo mas o Ollama negou, ou se o regex não achou nada, fazemos uma última checagem
+   
     pergunta_sensivel = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém informações pessoais sensíveis que precisam ser mascaradas?"
     if _ask_ollama_sim_nao(pergunta_sensivel, f"COL_SENSITIVE:{col_name}:{amostra_conjunta}"):
         logger.debug(f"⚖️ Balança Ollama: Classificou '{col_name}' como TEXTO_LIVRE sensível genérico")
         _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
         return "TEXTO_LIVRE"
 
-    # 5. SEGURO: Ignorar coluna para poupar processamento
+   
     _COLUMN_POLICIES[col_name] = "IGNORAR"
     return "IGNORAR"
 
@@ -261,7 +255,7 @@ def _detect_all(text: str, anon_loc: bool):
                 if not _is_valid_entity_ollama(val, "GENERIC_CODE"): continue
             found.append((match.start(), match.end(), val, typ))
 
-    # DENTRO DA FUNÇÃO _detect_all
+   
     for match in CONTEXT_NAME_REGEX.finditer(text_analise):
         val = match.group(2).strip()
         val_clean = _clean_extracted_name(val)
@@ -370,14 +364,14 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         if len(text) < 3: 
             return text, None
             
-        # --- PERFILAMENTO INTELIGENTE ---
+        # --- PERFILAMENTO ---
         if col_name not in _COLUMN_POLICIES:
           
             politica = define_column_policy(col_name, [text])
         else:
             politica = _COLUMN_POLICIES[col_name]
 
-        # --- ROTEAMENTO EXECUTOR ---
+        # --- ROTEAMENTO  ---
         politica_execucao = politica
 
         if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
