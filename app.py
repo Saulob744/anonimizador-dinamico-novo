@@ -1,460 +1,473 @@
-import streamlit as st
 import re
 import random
 import string
+import unicodedata
+import hashlib
 import logging
-import warnings
-import importlib
-import urllib.parse
-import time
-import psutil
-import os
-import pyodbc
-from concurrent.futures import ProcessPoolExecutor
-import difflib
-import db_utils
-import anonymizer
-import json
-import threading
+import requests
+import html
+from functools import lru_cache
+from faker import Faker
 
-# ==================================================
-# SISTEMA DE MEMÓRIA
-# ==================================================
-STATUS_FILE = "pipeline_progress.json"
-
-def save_progress(fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False):
-   
-    data = {
-        "fase": fase,
-        "tabelas_processadas": t_atual,
-        "tabelas_total": t_total,
-        "linhas_processadas": l_atual,
-        "linhas_total": l_total,
-        "velocidade": velocidade,
-        "tempo_decorrido": tempo,
-        "finalizado": finalizado
-    }
-    with open(STATUS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-
-def load_progress():
-   
-    if os.path.exists(STATUS_FILE):
-        try:
-            with open(STATUS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-# ==================================================
-# CONFIGURAÇÕES INICIAIS
-# ==================================================
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [APP]: %(message)s')
+# =========================================================
+# CONFIGURAÇÃO
+# =========================================================
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
-logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=UserWarning, message=".*resume_download.*")
+try:
+    import spacy
+    nlp = spacy.load("pt_core_news_lg")
+    logger.debug("spaCy carregado com sucesso.")
+except OSError:
+    logger.warning("spaCy não encontrado. A detecção dependerá apenas de Regex.")
+    nlp = None
 
-importlib.reload(db_utils)
-importlib.reload(anonymizer)
+_MAPPING_CACHE = {}
+_COLUMN_POLICIES = {} 
+_OLLAMA_CACHE = {} 
+_NEGATIVE_PATTERN_CACHE = set()
 
-st.set_page_config(page_title="🛡️ Aegis Anonymizer Pro", page_icon="🛡️", layout="wide")
-st.markdown("""
-    <style>
-    [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; font-weight: bold; }
-    .stProgress .st-at { background-color: #00ffcc; }
-    .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
-    </style>
-""", unsafe_allow_html=True)
+def _get_skeleton(text: str) -> str:
+    return re.sub(r'\d+', '[NUM]', text.upper())
+_DYNAMIC_SAMPLES = {} 
 
-# ==================================================
-# FUNÇÕES AUXILIARES
-# ==================================================
+fake = Faker("pt_BR")
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_MODEL = "llama3:latest"
+
+# =========================================================
+# REGEX ESTRUTURAIS
+# =========================================================
+REGEX = {
+    "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"),
+    "DATA_TIME": re.compile(
+        r"\b\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?\b|" 
+        r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|"               
+        r"\b\d{2}:\d{2}(?:\:\d{2})?\b|"                                        
+        r"\b(?:19|20)\d{2,4}\b"                                               
+    ),    "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"),
+    "ID_NUMERICO": re.compile(r"^-?\d+$"),
+    "NUMERO_DECIMAL": re.compile(r"^-?\d+[.,]\d+$"),
+    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
+    "CPF": re.compile(r"\b\d{3}[.\-\s]*\d{3}[.\-\s]*\d{3}[.\-\s]*\d{2}\b|\b\d{11}\b"),
+    "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
+    "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b|\b[A-Z]{3}[-\s]?\d{4}\b", re.IGNORECASE),
+    "PHONE": re.compile(r"\b(?:\+?55\s*)?(?:\(?\d{2,3}\)?[\s-]*)?\d{4,5}[-\s]*\d{4}\b"),
+    "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
+    "CHASSI": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b", re.IGNORECASE), 
+    "GENERIC_CODE": re.compile(r'\b[A-Za-z0-9_/\.\-]{6,64}\b'),
+}
+
+CONTEXT_NAME_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|atendente|consultor|gerente|responsavel|usuario|agente|vendedor|motorista|funcionario|titular|favorecido)\s*[:\-]?\s+([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){0,4})\b", re.IGNORECASE)
+PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senhora|em|na|no|de|do|da|vitima|autor|paciente|soldado|policial|rua|avenida|trevo|cia|agente|vendedor|motorista|funcionario)\s+", re.IGNORECASE)
+
+NAME_FALLBACK_REGEX = re.compile(
+    r"\b[A-ZÀ-Ÿ][a-zà-ÿ]+" 
+    r"(?:\s+(?:de|da|do|dos|das|e))?"       
+    r"(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]+){1,5}\b"      
+)
+
+# =========================================================
+# 1. MOTOR DE COMUNICAÇÃO COM A IA
+# =========================================================
+def _ask_ollama_sim_nao(pergunta: str, cache_key: str) -> bool:
+    
+    if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
+    
+    termo_avaliado = cache_key.split(":")[-1] 
+    esqueleto = _get_skeleton(termo_avaliado)
+    
+    if esqueleto in _NEGATIVE_PATTERN_CACHE:
+        logger.debug(f"🛑 Bloqueado por Padrão: {termo_avaliado} ({esqueleto})")
+        return False
+    
+    prompt = f"{pergunta} Responda APENAS 'SIM' ou 'NAO', sem explicações ou pontuação."
+    logger.debug(f"🧠 IA Julgando: {pergunta}")
+    
+    try:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}}
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=40, proxies={"http": "", "https": ""})
+        if resp.status_code == 200:
+            is_valid = "SIM" in resp.json().get("response", "").strip().upper()
+            _OLLAMA_CACHE[cache_key] = is_valid 
+            
+            if not is_valid:
+                _NEGATIVE_PATTERN_CACHE.add(esqueleto)
+                
+            return is_valid
+    except Exception as e:
+        logger.warning(f"Timeout/Erro no Ollama. Falha segura ativada. Erro: {e}")
+        
+    return False
+
+def _is_valid_entity_ollama(text: str, tag: str) -> bool:
+  
+    if len(text.strip()) < 3: return False
+    
+    if tag == "PER":
+        pergunta = f"A expressão '{text}' é o NOME PRÓPRIO de uma pessoa humana real?"
+    elif tag == "GENERIC_CODE":
+        pergunta = f"A expressão '{text}' parece ser um código de identificação, chassi ou senha sensível?"
+    else:
+        return True 
+
+    return _ask_ollama_sim_nao(pergunta, f"{tag}:{text.upper()}")
+
+# =========================================================
+# 2. INTELIGÊNCIA DE PERFILAMENTO DA COLUNA 
+# =========================================================
+def _smart_title(text: str) -> str:
+    if not text: return text
+    letras = sum(1 for c in text if c.isalpha())
+    if letras == 0: return text
+    
+    if not (text.isupper() or text.islower()):
+        return text 
+    
+    excecoes = {"de", "da", "do", "dos", "das", "e"}
+    
+    partes = re.split(r'(\s+)', text) 
+    
+    for i in range(len(partes)):
+        if not partes[i].strip():
+            continue
+            
+        word_lower = partes[i].lower()
+        if word_lower in excecoes:
+            partes[i] = word_lower
+        else:
+
+            partes[i] = partes[i].capitalize()
+            
+    return "".join(partes)
+
+
+def define_column_policy(col_name: str, samples: list) -> str:
+    if col_name in _COLUMN_POLICIES:
+        return _COLUMN_POLICIES[col_name]
+
+    valid_samples = [str(s).strip() for s in samples if str(s).strip()]
+    if not valid_samples:
+        return "IGNORAR"
+
+    amostra_conjunta = " | ".join(valid_samples[:15])
+
+    # ---------------------------------------------------------
+    # 1. JULGAMENTO DE SENSIBILIDADE DA IA 
+    # ---------------------------------------------------------
+    pergunta_sensivel = (
+        f"Analisando estritamente os dados '{amostra_conjunta}', eles representam "
+        f"informações pessoais sensíveis ou identificáveis de uma pessoa física "
+        f"(como nomes humanos, documentos, contatos)? "
+        f"Responda 'NAO' se forem dados públicos, cidades, locais, estados, IDs de banco de dados ou textos genéricos."
+    )
+    is_sensitive = _ask_ollama_sim_nao(pergunta_sensivel, f"COL_SENS:{col_name}:{amostra_conjunta}")
+
+    if not is_sensitive:
+        logger.debug(f"📉 Saldo Negativo: IA avaliou os DADOS '{amostra_conjunta}' como NÃO sensíveis. Ignorando a coluna '{col_name}'.")
+        _COLUMN_POLICIES[col_name] = "IGNORAR"
+        return "IGNORAR"
+
+    # ---------------------------------------------------------
+    # 2. AVALIAÇÃO DE TEXTO LONGO
+    # ---------------------------------------------------------
+    amostra_base = valid_samples[0]
+    if len(amostra_base) > 50 or len(amostra_base.split()) > 4:
+        logger.debug(f"📝 Dados sensíveis longos detectados. Definindo como TEXTO_LIVRE.")
+        _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
+        return "TEXTO_LIVRE"
+
+    # ---------------------------------------------------------
+    # 3. REGEX 
+    # ---------------------------------------------------------
+    pontuacao = {key: 0 for key in REGEX.keys()}
+    pontuacao["NOME_SOLTO"] = 0
+
+    for amostra in valid_samples[:10]:
+        for typ, pat in REGEX.items():
+            if pat.search(amostra):
+                if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra):
+                    continue
+                pontuacao[typ] += 1
+        
+        texto_formatado = _smart_title(amostra)
+        parece_nome = False
+        if NAME_FALLBACK_REGEX.search(texto_formatado):
+            parece_nome = True
+        elif nlp and any(ent.label_ == "PER" for ent in nlp(texto_formatado).ents):
+            parece_nome = True
+            
+        if parece_nome:
+            pontuacao["NOME_SOLTO"] += 1
+
+    melhor_tipo = max(pontuacao, key=pontuacao.get)
+    maior_pontuacao = pontuacao[melhor_tipo]
+
+    if maior_pontuacao > 0 and melhor_tipo in ["DATA_TIME", "ID_NUMERICO", "NUMERO_DECIMAL"]:
+        logger.debug(f"⏩ Regex cravou dado numérico/temporal não-sensível '{melhor_tipo}'. Ignorando.")
+        _COLUMN_POLICIES[col_name] = "IGNORAR"
+        return "IGNORAR"
+
+    # ---------------------------------------------------------
+    # 4. IA 
+    # ---------------------------------------------------------
+    if maior_pontuacao > 0:
+        if melhor_tipo == "NOME_SOLTO":
+            pergunta_confirma = f"Os dados '{amostra_conjunta}' são predominantemente NOMES PRÓPRIOS de pessoas reais?"
+        else:
+            pergunta_confirma = f"Os dados '{amostra_conjunta}' correspondem ao formato/tipo '{melhor_tipo}'?"
+        
+        if _ask_ollama_sim_nao(pergunta_confirma, f"COL_CONFIRM:{melhor_tipo}:{amostra_conjunta}"):
+            logger.debug(f"✅ IA bateu o martelo: Confirmou a tag '{melhor_tipo}' para os dados '{amostra_conjunta}'.")
+            _COLUMN_POLICIES[col_name] = melhor_tipo
+            return melhor_tipo
+        else:
+            logger.debug(f"⚠️ IA rejeitou que os dados sejam '{melhor_tipo}'. Mas como é sensível, caindo para TEXTO_LIVRE.")
+    
+    _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
+    return "TEXTO_LIVRE"
+
+# =========================================================
+# 3. MOTOR DE TEXTO LIVRE 
+# =========================================================
+@lru_cache(maxsize=100000)
+def _normalize(text: str) -> str:
+    if not text: return ""
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).upper().strip()
+
+def _is_hallucination_basic(ent_text: str) -> bool:
+    ent_text = ent_text.strip(".,;:-\n '\"")
+    if not ent_text or len(ent_text) <= 2: return True
+    if any(c.isdigit() for c in ent_text) and any(c in ['.', ',', '-'] for c in ent_text): return True
+    
+    termos_proibidos = {
+        "CPF", "RG", "CNPJ", "CEP", "DOC", "DOCUMENTO", "TEL", "CEL", "TELEFONE", 
+        "CELULAR", "PIX", "CHAVE", "PLACA", "DR", "DRA", "SR", "SRA", "SISTEMA", 
+        "RELATORIO", "PROJETO", "PGTO", "PAGAMENTO", "EFETUADO", "TRANSFERENCIA", 
+        "ESTORNO", "DEVOLUCAO", "VALOR", "TARIFA", "TAXA", "VIATURA", "VEICULO"
+    }
+    texto_norm = _normalize(ent_text)
+    partes = texto_norm.split()
+    
+    if all(p in termos_proibidos for p in partes): return True
+    if texto_norm in termos_proibidos or any(texto_norm.startswith(t + " ") for t in termos_proibidos): return True
+    return False
+
+def _clean_extracted_name(name_text: str) -> str:
+    name_text = name_text.strip(".,;:!?()\"'")
+    if not name_text: return ""
+
+    if not nlp:
+        return " ".join([w for w in name_text.split() if w.strip(".,;:!?()\"'")]).strip()
+    
+    doc = nlp(name_text)
+    tokens = list(doc)
+
+    start_idx = -1
+    for i, token in enumerate(tokens):
+        if token.pos_ == "PROPN":
+            start_idx = i
+            break
+        
+    end_idx = -1
+    for i in range(len(tokens) - 1, -1, -1):
+        if tokens[i].pos_ == "PROPN":
+            end_idx = i
+            break
+            
+    if start_idx == -1 or end_idx == -1 or start_idx > end_idx:
+        return " ".join([t.text for t in tokens]).strip(".,;:!?()\"' ")
+
+    valid_words = []
+    for i in range(start_idx, end_idx + 1):
+        valid_words.append(tokens[i].text_with_ws)
+        
+    return "".join(valid_words).strip(".,;:!?()\"' ")
+
+def _detect_all(text: str, anon_loc: bool):
+    found = []
+    PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "CHASSI": 1, "RG": 2, "PHONE": 2, "PLATE": 2, "COORD": 3, "COORD_SINGLE": 3, "PER": 4, "GENERIC_CODE": 99 }
+    
+    text_analise = _smart_title(text)
+    
+    for typ, pat in REGEX.items():
+        if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: continue
+        for match in pat.finditer(text):
+            val = match.group()
+            if typ == "GENERIC_CODE":
+                if not any(c.isdigit() for c in val) or len(val) < 6: continue
+                if not _is_valid_entity_ollama(val, "GENERIC_CODE"): continue
+            found.append((match.start(), match.end(), val, typ))
+
+   
+    for match in CONTEXT_NAME_REGEX.finditer(text_analise):
+        val = match.group(2).strip()
+        val_clean = _clean_extracted_name(val)
+        
+        if val_clean and not _is_hallucination_basic(val_clean):
+            
+           
+            words = val_clean.split()
+            while len(words) >= 1:
+                candidate = " ".join(words)
+                
+                if len(words) == 1 and candidate.lower() in ["de", "da", "do", "dos", "das", "e"]:
+                    break
+                
+                if _is_valid_entity_ollama(candidate, "PER"):
+                    start = match.start(2) + val.find(candidate)
+                    texto_original = text[start:start + len(candidate)]
+                    found.append((start, start + len(candidate), texto_original, "PER"))
+                    break
+                words.pop()
+
+    if nlp:
+        doc = nlp(text_analise)
+        for ent in doc.ents:
+            if ent.label_ == "PER":
+                if any(token.pos_ in ["VERB", "PRON", "PUNCT", "SYM"] for token in ent): continue
+                prefix_match = PREFIX_TRIMMER.search(ent.text)
+                offset = prefix_match.end() if prefix_match else 0
+                val_raw = ent.text[offset:]
+                val_clean = _clean_extracted_name(val_raw)
+                if not val_clean: continue
+                
+                start_adj = ent.text[offset:].find(val_clean)
+                start = ent.start_char + offset + (start_adj if start_adj != -1 else 0)
+                texto_original = text[start : start + len(val_clean)] 
+                
+                if not _is_hallucination_basic(texto_original): 
+                    if _is_valid_entity_ollama(texto_original, "PER"):
+                        found.append((start, start + len(val_clean), texto_original, "PER"))
+
+    for match in NAME_FALLBACK_REGEX.finditer(text_analise):
+        val = match.group().strip()
+        val_clean = _clean_extracted_name(val)
+        if val_clean and not _is_hallucination_basic(val_clean):
+            if _is_valid_entity_ollama(val_clean, "PER"):
+                start = match.start() + val.find(val_clean)
+                texto_original = text[start:start + len(val_clean)]
+                found.append((start, start + len(val_clean), texto_original, "PER"))
+
+    found.sort(key=lambda x: (x[0], -(x[1] - x[0]), PRIORITY.get(x[3], 50)))
+    clean, last = [], -1
+    for s, e, v, t in found:
+        if s >= last:
+            clean.append((s, e, text[s:e], t))
+            last = e
+    return clean
+
+# =========================================================
+# 4. GERAÇÃO DE FAKES E GPS JITTER
+# =========================================================
 def apply_gps_jitter(coord_str):
     try:
-        c = float(coord_str)
+        c = float(coord_str.replace(',', '.'))
         return f"{c + random.uniform(-0.003, 0.003):.6f}"
     except ValueError:
         return coord_str
 
-def split_text_into_chunks(text, max_tokens=300):
-    words = text.split()
-    if len(words) <= max_tokens:
-        return [text]
-    return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
+def _get_fake(value: str, typ: str) -> str:
+    clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
+    norm_val = _normalize(clean_value)
+    cache_key = f"{typ}:{norm_val}"
+    if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
 
-def build_url(db_type, user, password, host, port, db):
-    if db_type == "mssql":
-        driver = [d for d in pyodbc.drivers() if "SQL Server" in d][-1]
-        if host and "localdb" in host.lower():
-            odbc_str = rf"DRIVER={{{driver}}};SERVER=(localdb)\MSSQLLocalDB;DATABASE={db};Trusted_Connection=yes;"
-            return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
-        return f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
-    
-    prefix = "postgresql+psycopg2" if db_type == "postgresql" else "mysql+pymysql"
-    return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
-
-# ==================================================
-# PROCESSAMENTO CENTRAL DAS LINHAS
-# ==================================================
-def process_chunk_parallel(rows, modo, anon_geo, target_columns):
-    if modo != "🛡️ Anonimização Total" or not rows:
-        return rows
-
-    logger.debug(f"Trabalhando em chunk de {len(rows)} linhas...")
-
-    gps_pair = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
-    gps_single = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*$")
-    uuid_regex = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-    html_regex = re.compile(r"<[^>]+>|&[a-zA-Z0-9#]+;")
-
-    processed = []
-    for r in rows:
-        row_dict = dict(r)
-
-        for col, old in row_dict.items():
-            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool', 'int', 'float']:
-                continue
-
-            old_str = str(old).strip()
-
-            if uuid_regex.match(old_str) or not target_columns or col not in target_columns:
-                continue
-
-          
-            if anon_geo:
-                if m := gps_pair.match(old_str):
-                    row_dict[col] = f"{apply_gps_jitter(m.group(1))}, {apply_gps_jitter(m.group(2))}"
-                    continue 
-                if gps_single.match(old_str):
-                    try:
-                        if -180 <= float(old_str) <= 180:
-                            row_dict[col] = apply_gps_jitter(old_str)
-                            continue
-                    except ValueError:
-                        pass
-
-            try:
-                vault = {}
-                def hide(match):
-                    token = f"__SHLD{len(vault)}__"
-                    vault[token] = match.group(0)
-                    return f" {token} "
-
-                safe_text = old_str
-                safe_text = html_regex.sub(hide, safe_text)
-                safe_text = re.sub(r'\s+', ' ', safe_text).strip()
-                
-                chunks = split_text_into_chunks(safe_text)
-                anon_chunks = []
-                
-                for chunk in chunks:
-                    new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo)
-                    str_new_val = str(new_val)
-                    
-                    if str_new_val != chunk:
-                        seq = difflib.SequenceMatcher(None, chunk.split(), str_new_val.split())
-                        for tag, i1, i2, j1, j2 in seq.get_opcodes():
-                            if tag == 'replace':
-                                termo_original = " ".join(chunk.split()[i1:i2])
-                                termo_falso = " ".join(str_new_val.split()[j1:j2])
-                                if "__SHLD" not in termo_original:
-                                    logger.info(f"🕵️ [TROCA IA | {col}] {termo_original} ➡️ {termo_falso}")
-                    
-                    anon_chunks.append(str_new_val)
-                
-                final_text = " ".join(anon_chunks)
-
-                for token, original in vault.items():
-                    final_text = final_text.replace(f" {token} ", original).replace(token, original)
-
-                row_dict[col] = final_text
-
-            except Exception as e:
-                logger.error(f"Falha ao processar texto na coluna '{col}': {e}", exc_info=True)
-                row_dict[col] = old_str 
-
-        processed.append(row_dict)
-
-    return processed
-
-# ==================================================
-# O TRABALHADOR FANTASMA
-# ==================================================
-def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols):
-    t0_global = time.time()
     try:
-        save_progress("Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
-        src_engine = db_utils.connect(build_url(db_type, **src_cfg))
-        dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
-        db_utils.set_replication_mode(dst_engine, "replica")
+        seed_hex = hashlib.sha256(norm_val.encode()).hexdigest()[:8]
+        seed_int = int(seed_hex, 16) if seed_hex.strip() else random.randint(1, 99999)
+        fake.seed_instance(seed_int)
+    except Exception:
+        fake.seed_instance(random.randint(1, 99999))
+    
+    if typ in ["PER", "NOME_SOLTO"]: val = fake.name().upper()
+    elif typ == "CPF": val = fake.cpf()
+    elif typ == "RG": val = fake.numerify('##.###.###-#') 
+    elif typ in ["PLATE", "PLACA"]: val = fake.license_plate().upper()
+    elif typ == "EMAIL": val = fake.email().lower()
+    elif typ == "PHONE": val = fake.phone_number()
+    elif typ == "IP": val = fake.ipv4()
+    elif typ == "CHASSI": val = "".join(random.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
+    elif typ in ["COORD", "COORD_SINGLE"]: 
+        val = re.sub(r"-?\d{1,3}[.,]\d+", lambda m: apply_gps_jitter(m.group(0)), value)
+    elif typ == "GENERIC_CODE": 
+        val = "".join([random.choice(string.digits) if c.isdigit() else (random.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
+    else: val = fake.word().upper()
 
-        save_progress("Mapeando estruturas...", 0, 0, 0, 0, 0, time.time() - t0_global)
+    _MAPPING_CACHE[cache_key] = val
+    return val
+
+# =========================================================
+# 5. ORQUESTRAÇÃO FINAL
+# =========================================================
+def anonymize_value(col_name: str, val, anon_location: bool = True):
+    try:
+        if val is None: return val, None
         
-        schemas = db_utils.get_user_schemas(src_engine)
-        allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
-        work_list = []
-        total_estimated, total_tables = 0, 0
-
-        for s in schemas:
-            db_utils.copy_schema(src_engine, dst_engine, s)
-            tables = [t for t in db_utils.get_tables(src_engine, s) if not allowed or t in allowed]
-            ordered = db_utils.build_dependency_graph(src_engine, tables, s)
-            for t in ordered:
-                count = db_utils.get_table_count(src_engine, t, s)
-                work_list.append((s, t, count))
-                total_estimated += count
-                total_tables += 1
-
-        if total_estimated == 0:
-            save_progress("Erro: Nenhuma linha encontrada", 0, 0, 0, 0, 0, 0, finalizado=True)
-            return
-
-        save_progress("Limpando destino (Truncate)...", 0, total_tables, 0, total_estimated, 0, time.time() - t0_global)
-        for s, t, _ in reversed(work_list):
-            db_utils.truncate_table(dst_engine, t, s)
-
-        save_progress("Iniciando Processamento...", 0, total_tables, 0, total_estimated, 0, time.time() - t0_global)
+        try:
+            text = str(val).strip()
+        except Exception as date_err:
+            logger.warning(f"⚠️ Objeto corrompido travou o str() na coluna '{col_name}'. Usando conversão crua de segurança.")
+            text = repr(val).strip("'\" ")
         
-        total_rows, processed_tables, last_json_update = 0, 0, 0
-        weighted_speed_samples = []
+     
+        if len(text) < 3 or REGEX["DATA_TIME"].fullmatch(text) or REGEX["ID_NUMERICO"].fullmatch(text) or REGEX["NUMERO_DECIMAL"].fullmatch(text): 
+            return text, None
+            
+        # --- PERFILAMENTO ---
+        if col_name not in _COLUMN_POLICIES:
+            politica = define_column_policy(col_name, [text])
+        else:
+            politica = _COLUMN_POLICIES[col_name]
 
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            for s, t, t_count in work_list:
-                processed_tables += 1
+        # --- ROTEAMENTO ---
+        politica_execucao = politica
 
-                for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
-                    chunk_start = time.time()
-                    rows = [dict(r) for r in chunk]
+        if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
+            e_texto_longo = len(text) > 50 or len(text.split()) > 4
+            
+            tem_estrutura_frase = False
+            if not e_texto_longo and nlp:
+                doc = nlp(_smart_title(text))
+                tem_per = any(ent.label_ == "PER" for ent in doc.ents)
+                tem_action = any(token.pos_ in ["VERB", "ADJ", "AUX"] for token in doc)
+                if tem_per and tem_action:
+                    tem_estrutura_frase = True
 
-                    if modo == "🛡️ Anonimização Total":
-                        if n_cores > 1:
-                            sub_sz = max(1, len(rows) // n_cores)
-                            sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
-                            
-                            futures = [
-                                executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
-                                for sub_chunk in sub_chunks
-                            ]
-                            
-                            rows = []
-                            for original_chunk, f in zip(sub_chunks, futures):
-                                try: 
-                                    result = f.result()
-                                    rows.extend(result if result else original_chunk)
-                                except Exception as e: 
-                                    logger.error(f"🚨 CPU worker falhou. Erro: {e}")
-                                    rows.extend(original_chunk)
-                        else:
-                            try:
-                                res = process_chunk_parallel(rows, modo, anon_geo, target_cols)
-                                if res: rows = res
-                            except Exception as e:
-                                logger.error(f"🚨 Erro no Single Core. Erro: {e}")
+            if e_texto_longo or tem_estrutura_frase:
+                if not NAME_FALLBACK_REGEX.fullmatch(_smart_title(text)):
+                    politica_execucao = "TEXTO_LIVRE"
 
-                    if rows:
-                        db_utils.insert_rows(dst_engine, t, s, rows)
-
-                    inserted_count = len(rows)
-                    total_rows += inserted_count
-
-                    chunk_speed = inserted_count / max(time.time() - chunk_start, 0.001)
-                    weighted_speed_samples.append(chunk_speed)
-                    if len(weighted_speed_samples) > 30:
-                        weighted_speed_samples.pop(0)
-
-                    
-                    now = time.time()
-                    if now - last_json_update > 2.5:
-                        elapsed = now - t0_global
-                        stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
-                        
-                        save_progress(
-                            fase=f"Processando: {t}",
-                            t_atual=processed_tables, t_total=total_tables,
-                            l_atual=total_rows, l_total=total_estimated,
-                            velocidade=stable_speed, tempo=elapsed, finalizado=False
-                        )
-                        last_json_update = now
-
-        db_utils.set_replication_mode(dst_engine, "origin")
-        save_progress("Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
-        logger.info("✅ Thread em background finalizada com sucesso!")
+        if politica_execucao == "IGNORAR":
+            return text, None
+            
+        if politica_execucao in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE", "NOME_SOLTO", "COORD", "COORD_SINGLE"]:
+            fake_val = _get_fake(text, politica_execucao)
+            return fake_val, ("TEXT" if fake_val != text else None)
+            
+        if politica_execucao == "TEXTO_LIVRE":
+            entities = _detect_all(text, anon_location)
+            if not entities: 
+                return text, None
+            
+            result, last = [], 0
+            for s, e, v, t in entities:
+                if s < last: continue
+                result.append(text[last:s])
+                result.append(_get_fake(v, t))
+                last = e
+            result.append(text[last:])
+            texto_final = "".join(result)
+            return texto_final, ("TEXT" if texto_final != text else None)
 
     except Exception as e:
-        logger.error(f"🚨 Erro Fatal no Background: {e}", exc_info=True)
-        save_progress(f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
+        logger.error(f"⚠️ Erro ao aplicar mascara na coluna '{col_name}': {e}", exc_info=True)
+        return text if 'text' in locals() else str(val), None 
 
-# ==================================================
-# INTERFACE E MENU LATERAL
-# ==================================================
-if "analise_concluida" not in st.session_state:
-    st.session_state.analise_concluida = False
-if "todas_colunas_disponiveis" not in st.session_state:
-    st.session_state.todas_colunas_disponiveis = []
-if "colunas_selecionadas_finais" not in st.session_state:
-    st.session_state.colunas_selecionadas_finais = []
-
-start_btn = False
-
-with st.sidebar:
-    st.title("🛡️ Aegis Control")
-    db_type = st.selectbox("Tipo de Banco de Dados", ["postgresql", "mysql", "mssql"])
-    aba_origem, aba_destino = st.tabs(["🔴 Banco Origem", "🟢 Banco Destino"])
-
-    def render_db_form(prefix):
-        return {
-            "host": st.text_input("Host", value="localhost", key=f"{prefix}_host"),
-            "port": st.text_input("Porta", key=f"{prefix}_port"),
-            "db": st.text_input("Banco", key=f"{prefix}_db"),
-            "user": st.text_input("Usuário", key=f"{prefix}_user"),
-            "password": st.text_input("Senha", type="password", key=f"{prefix}_pass")
-        }
-
-    with aba_origem: src_cfg = render_db_form("origem")
-    with aba_destino: dst_cfg = render_db_form("destino")
-
-    modo = st.selectbox("Modo", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
-    chunk_size = st.number_input("Chunk", value=1000, step=1000) 
-    filter_tables = st.text_input("Filtrar tabelas (separadas por vírgula)")
-    anon_geo = st.toggle("Mascara De GPS", value=True)
-
-    super_proc = st.toggle("🚀 Multi CPU (Atenção)", value=False)
-    n_cores = st.slider("CPU", 1, db_utils.get_cpu_info(), db_utils.get_cpu_info()) if super_proc else 1
-
-    st.divider()
-    btn_analisar = st.button("1. Analisar Estrutura", use_container_width=True)
-    
-    if btn_analisar:
-        try:
-            src_engine = db_utils.connect(build_url(db_type, **src_cfg))
-            schemas = db_utils.get_user_schemas(src_engine)
-            allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
-            todas_set = set()
-            
-            if schemas:
-                for schema in schemas:
-                    tables = db_utils.get_tables(src_engine, schema)
-                    valid_tables = [t for t in tables if not allowed or t in allowed]
-                    
-                    for table in valid_tables:
-                        chunk_gen = db_utils.fetch_rows_streaming(src_engine, table, schema, 200)
-                        primeiro_lote = next(chunk_gen, [])
-                        
-                        if primeiro_lote:
-                            rows_dict = [dict(r) for r in primeiro_lote]
-                            colunas_tabela = list(rows_dict[0].keys())
-                            for col in colunas_tabela:
-                                todas_set.add(col)
-            
-            todas = sorted(list(todas_set))
-            st.session_state.todas_colunas_disponiveis = todas if todas else []
-            st.session_state.analise_concluida = True
-            st.success(f"✅ Análise concluída! {len(todas)} colunas mapeadas.")
-        except Exception as e:
-            st.error(f"Erro ao analisar banco: {e}")
-
-    if st.session_state.analise_concluida:
-        st.markdown("### Selecione as Exceções")
-        st.info("⚠️ Todas as colunas textuais serão anonimizadas. Escolha as que devem ser IGNORADAS.")
-        
-        opcoes_validas = st.session_state.todas_colunas_disponiveis
-        colunas_ignoradas = st.multiselect("Ignorar colunas:", options=opcoes_validas, default=[])
-        colunas_finais = [col for col in opcoes_validas if col not in colunas_ignoradas]
-        
-        start_btn = st.button("2. INICIAR PROCESSAMENTO", type="primary", use_container_width=True)
-        if start_btn:
-            st.session_state.colunas_selecionadas_finais = colunas_finais
-# ==================================================
-# FRONTEND: MONITOR DE PROGRESSO
-# ==================================================
-st.title("🛡️ Pipeline De Proteção De Dados")
-
-if start_btn:
-    save_progress("Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
-    target_cols = st.session_state.colunas_selecionadas_finais
-    
-    thread = threading.Thread(
-        target=run_pipeline_background, 
-        args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols)
-    )
-    thread.daemon = True 
-    thread.start()
-    
-    time.sleep(2.5) 
-    st.rerun()   
-
-# --- MONITOR FLUIDO EM TEMPO REAL ---
-estado_atual = load_progress()
-
-if estado_atual:
-    
-    if not estado_atual.get("finalizado", True):
-        st.info("🔄 Monitorando processo em background... (Você pode minimizar, bloquear a tela ou fechar a aba!)")
-        
-        # 1. BOTÃO DE EMERGÊNCIA
-        if st.button("🛑 Forçar Parada / Limpar Sessão", type="secondary"):
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-            st.rerun()
-            
-        
-        
-        tempo_sem_atualizar = time.time() - os.path.getmtime(STATUS_FILE)
-        
-        if tempo_sem_atualizar > 600: 
-            st.error("🚨 O processo não responde há mais de 10 minutos. Clique em 'Forçar Parada' acima.")
-            st.stop()
-        elif tempo_sem_atualizar > 15:
-            st.warning("⏳ A IA está processando um lote pesado de textos. Os dados abaixo estão congelados temporariamente, mas o processo continua rodando...") 
-                
-        # 3. EXTRAÇÃO DOS DADOS
-        linhas_proc = estado_atual.get("linhas_processadas", 0)
-        linhas_totais = estado_atual.get("linhas_total", 0)
-        velocidade = estado_atual.get("velocidade", 0)
-        
-        # 4. CÁLCULO DE TEMPO RESTANTE (ETA)
-        linhas_restantes = max(0, linhas_totais - linhas_proc)
-        if velocidade > 0:
-            segundos_restantes = linhas_restantes / velocidade
-            minutos, segundos = divmod(int(segundos_restantes), 60)
-            horas, minutos = divmod(minutos, 60)
-            tempo_restante_str = f"{horas}h {minutos}m {segundos}s" if horas > 0 else f"{minutos}m {segundos}s"
-        else:
-            tempo_restante_str = "Calculando..."
-            
-        # 5. ATUALIZAÇÃO VISUAL DA TELA
-        total_linhas_calc = max(linhas_totais, 1)
-        progresso = min(0.25 + ((linhas_proc / total_linhas_calc) * 0.75), 1.0) if linhas_proc > 0 else 0.1
-        
-        st.progress(progresso)
-        st.info(f"🔷 Fase atual: {estado_atual['fase']}")
-        
-        st.markdown(f"""
-        ### 📊 Progresso do Pipeline
-        - 📂 Tabelas concluídas: **{estado_atual['tabelas_processadas']} / {estado_atual['tabelas_total']}**
-        - 🧮 Registros processados: **{linhas_proc:,} / {linhas_totais:,}**
-        - 📉 **Faltam processar:** **<span style="color:#ff4444">{linhas_restantes:,} linhas</span>**
-        - ⚡ Velocidade média: **{velocidade:,.0f} linhas/s**
-        - ⏱️ Tempo decorrido: **{estado_atual['tempo_decorrido']:.1f}s**
-        - ⏳ **Tempo Restante (ETA):** **<span style="color:#ffcc00">{tempo_restante_str}</span>**
-        """, unsafe_allow_html=True)
-        
-        
-        time.sleep(1.5) 
-        st.rerun()
-
-   
-    else:
-        if "Erro" in estado_atual.get("fase", ""):
-            st.error(f"🚨 O processo parou devido a um erro fatal: {estado_atual['fase']}")
-        else:
-            st.progress(1.0)
-            st.success("✅ Pipeline concluído com sucesso!")
-            st.balloons()
-            
-        if st.button("Limpar e Iniciar Nova Sessão"):
-            if os.path.exists(STATUS_FILE):
-                os.remove(STATUS_FILE)
-            st.rerun()
+def reset_memory():
+    _MAPPING_CACHE.clear()
+    _COLUMN_POLICIES.clear()
+    _OLLAMA_CACHE.clear()
+    _DYNAMIC_SAMPLES.clear()
