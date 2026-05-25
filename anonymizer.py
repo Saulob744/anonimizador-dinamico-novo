@@ -181,7 +181,7 @@ def define_column_policy(col_name: str, samples: list) -> str:
     maior_pontuacao = pontuacao[melhor_tipo]
 
     if maior_pontuacao > 0:
-        # --- ATALHO DINÂMICO PARA ENTRADAS NÃO-SENSÍVEIS (PULA O OLLAMA) ---
+        # --- DINÂMICO ---
         if melhor_tipo in ["DATA_TIME", "ID_NUMERICO", "NUMERO_DECIMAL"]:
             logger.debug(f"⏩ Perfilamento identificou tipo não-sensível '{melhor_tipo}' dinamicamente para '{col_name}'. Definindo como IGNORAR.")
             _COLUMN_POLICIES[col_name] = "IGNORAR"
