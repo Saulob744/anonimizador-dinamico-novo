@@ -152,17 +152,40 @@ def define_column_policy(col_name: str, samples: list) -> str:
     if not valid_samples:
         return "IGNORAR"
 
-    amostra_base = valid_samples[0]
-    amostra_conjunta = " | ".join(valid_samples[:3])
+    amostra_conjunta = " | ".join(valid_samples[:15])
 
+    # ---------------------------------------------------------
+    # 1. JULGAMENTO DE SENSIBILIDADE DA IA 
+    # ---------------------------------------------------------
+    pergunta_sensivel = (
+        f"Analisando estritamente os dados '{amostra_conjunta}', eles representam "
+        f"informações pessoais sensíveis ou identificáveis de uma pessoa física "
+        f"(como nomes humanos, documentos, contatos)? "
+        f"Responda 'NAO' se forem dados públicos, cidades, locais, estados, IDs de banco de dados ou textos genéricos."
+    )
+    is_sensitive = _ask_ollama_sim_nao(pergunta_sensivel, f"COL_SENS:{col_name}:{amostra_conjunta}")
+
+    if not is_sensitive:
+        logger.debug(f"📉 Saldo Negativo: IA avaliou os DADOS '{amostra_conjunta}' como NÃO sensíveis. Ignorando a coluna '{col_name}'.")
+        _COLUMN_POLICIES[col_name] = "IGNORAR"
+        return "IGNORAR"
+
+    # ---------------------------------------------------------
+    # 2. AVALIAÇÃO DE TEXTO LONGO
+    # ---------------------------------------------------------
+    amostra_base = valid_samples[0]
     if len(amostra_base) > 50 or len(amostra_base.split()) > 4:
+        logger.debug(f"📝 Dados sensíveis longos detectados. Definindo como TEXTO_LIVRE.")
         _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
         return "TEXTO_LIVRE"
 
+    # ---------------------------------------------------------
+    # 3. REGEX 
+    # ---------------------------------------------------------
     pontuacao = {key: 0 for key in REGEX.keys()}
     pontuacao["NOME_SOLTO"] = 0
 
-    for amostra in valid_samples:
+    for amostra in valid_samples[:10]:
         for typ, pat in REGEX.items():
             if pat.search(amostra):
                 if typ in ["GENERIC_CODE", "CHASSI"] and not any(c.isdigit() for c in amostra):
@@ -182,34 +205,29 @@ def define_column_policy(col_name: str, samples: list) -> str:
     melhor_tipo = max(pontuacao, key=pontuacao.get)
     maior_pontuacao = pontuacao[melhor_tipo]
 
+    if maior_pontuacao > 0 and melhor_tipo in ["DATA_TIME", "ID_NUMERICO", "NUMERO_DECIMAL"]:
+        logger.debug(f"⏩ Regex cravou dado numérico/temporal não-sensível '{melhor_tipo}'. Ignorando.")
+        _COLUMN_POLICIES[col_name] = "IGNORAR"
+        return "IGNORAR"
+
+    # ---------------------------------------------------------
+    # 4. IA 
+    # ---------------------------------------------------------
     if maior_pontuacao > 0:
-        # --- DINÂMICO ---
-        if melhor_tipo in ["DATA_TIME", "ID_NUMERICO", "NUMERO_DECIMAL"]:
-            logger.debug(f"⏩ Perfilamento identificou tipo não-sensível '{melhor_tipo}' dinamicamente para '{col_name}'. Definindo como IGNORAR.")
-            _COLUMN_POLICIES[col_name] = "IGNORAR"
-            return "IGNORAR"
-
         if melhor_tipo == "NOME_SOLTO":
-            pergunta = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém NOMES PRÓPRIOS de pessoas reais?"
-            if _ask_ollama_sim_nao(pergunta, f"COL_PER:{col_name}:{amostra_conjunta}"):
-                logger.debug(f"⚖️ Balança Ollama: Confirmou NOME_SOLTO para a coluna '{col_name}'")
-                _COLUMN_POLICIES[col_name] = "NOME_SOLTO"
-                return "NOME_SOLTO"
+            pergunta_confirma = f"Os dados '{amostra_conjunta}' são predominantemente NOMES PRÓPRIOS de pessoas reais?"
         else:
-            pergunta = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' parece ser do tipo estruturado {melhor_tipo}?"
-            if _ask_ollama_sim_nao(pergunta, f"COL_TYPE:{melhor_tipo}:{col_name}"):
-                logger.debug(f"⚖️ Balança Ollama: Confirmou {melhor_tipo} para a coluna '{col_name}'")
-                _COLUMN_POLICIES[col_name] = melhor_tipo
-                return melhor_tipo
-
-    pergunta_sensivel = f"A coluna '{col_name}' com os dados '{amostra_conjunta}' contém informações pessoais sensíveis que precisam ser mascaradas?"
-    if _ask_ollama_sim_nao(pergunta_sensivel, f"COL_SENSITIVE:{col_name}:{amostra_conjunta}"):
-        logger.debug(f"⚖️ Balança Ollama: Classificou '{col_name}' como TEXTO_LIVRE sensível genérico")
-        _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
-        return "TEXTO_LIVRE"
-
-    _COLUMN_POLICIES[col_name] = "IGNORAR"
-    return "IGNORAR"
+            pergunta_confirma = f"Os dados '{amostra_conjunta}' correspondem ao formato/tipo '{melhor_tipo}'?"
+        
+        if _ask_ollama_sim_nao(pergunta_confirma, f"COL_CONFIRM:{melhor_tipo}:{amostra_conjunta}"):
+            logger.debug(f"✅ IA bateu o martelo: Confirmou a tag '{melhor_tipo}' para os dados '{amostra_conjunta}'.")
+            _COLUMN_POLICIES[col_name] = melhor_tipo
+            return melhor_tipo
+        else:
+            logger.debug(f"⚠️ IA rejeitou que os dados sejam '{melhor_tipo}'. Mas como é sensível, caindo para TEXTO_LIVRE.")
+    
+    _COLUMN_POLICIES[col_name] = "TEXTO_LIVRE"
+    return "TEXTO_LIVRE"
 
 # =========================================================
 # 3. MOTOR DE TEXTO LIVRE 
