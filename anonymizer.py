@@ -1,4 +1,5 @@
 import re
+import os
 import random
 import string
 import unicodedata
@@ -6,14 +7,18 @@ import hashlib
 import logging
 import requests
 import html
+import hmac
 from functools import lru_cache
 from faker import Faker
 
 # =========================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO E SEGURANÇA (LGPD)
 # =========================================================
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
+
+# O Salt impede ataques de dicionário e engenharia reversa nas tabelas anonimizadas
+SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "MudarParaUmSaltAltamenteComplexoESecreto123!")
 
 try:
     import spacy
@@ -34,12 +39,18 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "llama3:latest"
 
 # =========================================================
-# REGEX ESTRUTURAIS
+# REGEX ESTRUTURAIS (ATUALIZADO COM DATA/HORA)
 # =========================================================
 REGEX = {
+    # 1. Filtro de Data e Hora (Padrões ISO, BR, Timestamps e Horários isolados)
+    "DATE_TIME": re.compile(
+        r"^\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?$|" 
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?$|"               
+        r"^\d{2}:\d{2}(?:\:\d{2})?$"                                         
+    ),
     "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"), 
     "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
-    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
+    "EMAIL": re.compile(r"[\w\.-]++@[\w\.-]+", re.IGNORECASE),
     "CPF": re.compile(r"\b\d{3}[.\-\s]*\d{3}[.\-\s]*\d{3}[.\-\s]*\d{2}\b|\b\d{11}\b"),
     "RG": re.compile(r"\b(?:[A-Z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Z]\b|\b\d{5,14}\b", re.IGNORECASE),
     "PLATE": re.compile(r"\b[A-Z]{3}[-\s]?\d[A-Z0-9]\d{2}\b|\b[A-Z]{3}[-\s]?\d{4}\b", re.IGNORECASE),
@@ -55,7 +66,7 @@ PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senho
 NAME_FALLBACK_REGEX = re.compile(
     r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"                
     r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?"   
-    r"\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"               
+    r"\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"                
     r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,}))*\b(?!\:)"        
 )
 
@@ -68,25 +79,23 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
         return "IGNORAR"
 
     col_lower = col_name.lower().strip()
-
     
-    termos_coord = ['latitude', 'longitude', 'lat', 'lon', 'coordenada', 'gps', 'geom']
-    
-    if any(col_lower == t for t in termos_coord) or any(f"_{t}" in col_lower for t in termos_coord) or any(f"{t}_" in col_lower for t in termos_coord):
-        logger.info(f"📍 [BALANÇA] Coluna '{col_name}' blindada via nome -> COORD")
-        return "COORD"
-
-  
+    # Blindagem estática por metadado de coluna (Data, Nascimento, Timestamp, etc.)
     termos_ignorar = [
         'modelo', 'marca', 'cor', 'cidade', 'bairro', 'estado', 'pais', 'uf',
         'status', 'data', 'hora', 'delito', 'crime', 'profissao', 'religiao',
-        'logradouro', 'endereco', 'rua', 'avenida', 'cep', 'tipo', 'obs_tecnica', 'sexo'
+        'logradouro', 'endereco', 'rua', 'avenida', 'cep', 'tipo', 'obs_tecnica', 'sexo',
+        'nascimento', 'criado', 'atualizado', 'dt_', '_dt'
     ]
     if any(termo in col_lower for termo in termos_ignorar):
         logger.info(f"🛡️ [BALANÇA] Coluna '{col_name}' blindada via nome -> IGNORAR")
         return "IGNORAR"
 
-   
+    termos_coord = ['latitude', 'longitude', 'lat', 'lon', 'coordenada', 'gps', 'geom']
+    if any(col_lower == t for t in termos_coord) or any(f"_{t}" in col_lower for t in termos_coord) or any(f"{t}_" in col_lower for t in termos_coord):
+        logger.info(f"📍 [BALANÇA] Coluna '{col_name}' blindada via nome -> COORD")
+        return "COORD"
+
     total = len(amostras_limpas)
     scores = {key: 0 for key in REGEX.keys()}
     scores["NOME_SOLTO"] = 0
@@ -98,8 +107,14 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
             continue
 
         matched = False
+        
+        # Interceptação explícita de Data/Hora no mapeamento de amostras
+        if REGEX["DATE_TIME"].fullmatch(val):
+            scores["DATE_TIME"] += 1
+            continue
+
         for typ, pat in REGEX.items():
-            if pat.search(val):
+            if typ != "DATE_TIME" and pat.search(val):
                 scores[typ] += 1
                 matched = True
                 break 
@@ -115,7 +130,8 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
 
     for typ, count in scores.items():
         if typ != "TEXTO_LIVRE" and (count / total) >= threshold:
-            return typ
+            # Se a coluna for predominantemente data, define a política como IGNORAR
+            return "IGNORAR" if typ == "DATE_TIME" else typ
 
     return None
 
@@ -133,7 +149,7 @@ PERGUNTA:
 Esses dados contêm informações PESSOAIS, SENSÍVEIS ou de IDENTIFICAÇÃO DIRETA (como nomes próprios de seres humanos, documentos, placas de veículos, dados bancários, senhas ou relatos de pessoas)?
 
 REGRA DE REJEIÇÃO:
-Tipos de crime, nomes de endereços (ruas/bairros/cidades), status de processos, categorias de sistemas ou modelos/marcas de carros (ex: Corolla, HB20, Gol, Civic) NÃO SÃO DADOS SENSÍVEIS PESSOAIS.
+Datas, Horários, Tipos de crime, nomes de endereços (ruas/bairros/cidades), status de processos ou modelos/marcas de carros NÃO SÃO DADOS SENSÍVEIS PESSOAIS.
 
 Responda APENAS com a palavra 'SIM' ou 'NAO'. Não justifique.
 """
@@ -176,7 +192,7 @@ def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
         
     if tag in ["PER", "NOME_SOLTO"]:
-        prompt = f"A expressão '{text}' é o nome próprio de uma pessoa física humana? Regra: Nomes de ruas, bairros ou cidades são 'NAO'. Responda APENAS 'SIM' ou 'NAO'."
+        prompt = f"A expressão '{text}' é o nome próprio de uma pessoa física humana? Regra: Nomes de ruas, bairros, cidades ou DATAS/HORAS são 'NAO'. Responda APENAS 'SIM' ou 'NAO'."
     else:
         return True 
     
@@ -223,6 +239,7 @@ def _detect_all(text: str, anon_loc: bool):
     PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "CHASSI": 1, "RG": 2, "PHONE": 2, "PLATE": 2, "COORD": 3, "COORD_SINGLE": 3, "PER": 4, "GENERIC_CODE": 99 }
     
     for typ, pat in REGEX.items():
+        if typ == "DATE_TIME": continue # Ignora casamento de data bruta em varredura de texto livre
         if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: 
             continue
             
@@ -283,7 +300,14 @@ def _get_fake(value: str, typ: str) -> str:
     cache_key = f"{typ}:{norm_val}"
     if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
 
-    fake.seed_instance(int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16))
+    # Substituição criptográfica forte HMAC baseada em semente imprevisível externa
+    secret_bytes = SECRET_SALT.encode('utf-8')
+    data_bytes = norm_val.encode('utf-8')
+    hmac_hash = hmac.new(secret_bytes, data_bytes, hashlib.sha256).hexdigest()
+    seed_int = int(hmac_hash[:8], 16)
+    
+    fake.seed_instance(seed_int)
+    local_rand = random.Random(seed_int)
     
     if typ in ["PER", "NOME_SOLTO"]: val = fake.name().upper()
     elif typ == "CPF": val = fake.cpf()
@@ -292,11 +316,11 @@ def _get_fake(value: str, typ: str) -> str:
     elif typ == "EMAIL": val = fake.email().lower()
     elif typ == "PHONE": val = fake.phone_number()
     elif typ == "IP": val = fake.ipv4()
-    elif typ == "CHASSI": val = "".join(random.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
+    elif typ == "CHASSI": val = "".join(local_rand.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
     elif typ in ["COORD", "COORD_SINGLE"]: 
         val = re.sub(r"-?\d{1,3}[.,]\d+", lambda m: apply_gps_jitter(m.group(0)), value)
     elif typ == "GENERIC_CODE": 
-        val = "".join([random.choice(string.digits) if c.isdigit() else (random.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
+        val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else (local_rand.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
     else: val = fake.word().upper()
 
     _MAPPING_CACHE[cache_key] = val
@@ -308,9 +332,10 @@ def _get_fake(value: str, typ: str) -> str:
 def anonymize_value(col_name: str, val, anon_location: bool = True):
     try:
         if val is None or not str(val).strip(): return val, None
-        text = str(val)
+        text = str(val).strip()
         
-        if len(text) < 3: 
+        # INTERCEPTAÇÃO INDIVIDUAL: Se for menor que 3 caracteres ou casar com Data/Hora, ignora imediatamente
+        if len(text) < 3 or REGEX["DATE_TIME"].fullmatch(text): 
             return text, None
             
         if col_name not in _COLUMN_POLICIES:
@@ -324,7 +349,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             if len(text) > 50 or len(text.split()) > 4:
                 politica_execucao = "TEXTO_LIVRE"
 
- 
         if politica_execucao == "IGNORAR":
             return text, None
             
@@ -334,7 +358,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
                 return fake_val, ("TEXT" if fake_val != text else None)
             else:
                 return text, None
-
       
         if politica_execucao in ["COORD", "COORD_SINGLE"]:
             if anon_location:
