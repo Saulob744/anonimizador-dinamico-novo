@@ -1,5 +1,6 @@
 import logging
 import time
+import re
 from collections import defaultdict, deque
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
@@ -103,7 +104,7 @@ def copy_schema(src_engine, dst_engine, schema):
                 logger.warning(f"CREATE SKIP {schema}.{table.name}: {e}")
 
 # ==================================================
-# LEITURA E ESCRITA (STREAMING & INSERT)
+# LEITURA E ESCRITA 
 # ==================================================
 def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
     with engine.connect() as conn:
@@ -118,27 +119,60 @@ def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if key not in _TABLE_CACHE:
         _TABLE_CACHE[key] = sa.Table(table_name, sa.MetaData(), autoload_with=engine, schema=schema)
     table = _TABLE_CACHE[key]
+    num_cols = len(table.columns)
 
-    for attempt in range(max_retries):
-        try:
-            with engine.begin() as conn:
-                safe_rows = []
-                for row in rows:
+    max_rows_per_chunk = max(1, 30000 // num_cols)
+    sub_chunks = [rows[i:i + max_rows_per_chunk] for i in range(0, len(rows), max_rows_per_chunk)]
+
+    for chunk in sub_chunks:
+        success = False
+        for attempt in range(max_retries):
+            try:
+                with engine.begin() as conn:
+                    safe_rows = []
+                    for row in chunk:
+                        new_row = dict(row)
+                        for col in table.columns:
+                            val = new_row.get(col.name)
+                            if isinstance(val, str):
+                                if hasattr(col.type, "length") and col.type.length and col.type.length in [11, 14, 9, 8]:
+                                    cleaned_val = re.sub(r"[.\-\s/]", "", val)
+                                    if len(cleaned_val) <= col.type.length:
+                                        val = cleaned_val
+                                if hasattr(col.type, "length") and col.type.length:
+                                    val = val[:col.type.length]
+                                new_row[col.name] = val
+                        safe_rows.append(new_row)
+                    
+                    conn.execute(table.insert(), safe_rows)
+                success = True
+                break
+            except Exception as e:
+                logger.warning(f"Retry {attempt+1} {key}: {e}")
+                time.sleep(0.5)
+
+        if not success:
+            logger.warning(f"⚠️ Ativando Fallback Unitário para isolar erro de restrição em: {key}")
+            for idx, row in enumerate(chunk):
+                try:
                     new_row = dict(row)
                     for col in table.columns:
                         val = new_row.get(col.name)
-                        # 🔥 FIX AQUI (SEGURANÇA REAL OTIMIZADA)
-                        if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
-                            new_row[col.name] = val[:col.type.length]
-                    safe_rows.append(new_row)
-                
-                conn.execute(table.insert(), safe_rows)
-            return
-        except Exception as e:
-            logger.warning(f"Retry {attempt+1} {key}: {e}")
-            time.sleep(1)
-
-    logger.error(f"❌ Falha definitiva: {key}")
+                        if isinstance(val, str):
+                            if hasattr(col.type, "length") and col.type.length and col.type.length in [11, 14, 9, 8]:
+                                cleaned_val = re.sub(r"[.\-\s/]", "", val)
+                                if len(cleaned_val) <= col.type.length: val = cleaned_val
+                            if hasattr(col.type, "length") and col.type.length:
+                                val = val[:col.type.length]
+                            new_row[col.name] = val
+                    
+                    with engine.begin() as trans_conn:
+                        trans_conn.execute(table.insert(), [new_row])
+                except Exception as inner_e:
+                    print(f"\n🚨 [ERRO DE BANCO DE DADOS DETECTADO EM: {key}]")
+                    print(f"👉 Mensagem: {str(inner_e)}")
+                    print(f"📌 Registro com Falha: {new_row}\n")
+                    logger.error(f"Falha definitiva no registro {idx} da tabela {key}")
 
 def truncate_table(engine, table_name, schema):
     if not table_exists(engine, schema, table_name):
