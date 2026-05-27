@@ -17,7 +17,6 @@ from faker import Faker
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
-# O Salt impede ataques de dicionário e engenharia reversa nas tabelas anonimizadas
 SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "MudarParaUmSaltAltamenteComplexoESecreto123!")
 
 try:
@@ -42,7 +41,6 @@ OLLAMA_MODEL = "llama3:latest"
 # REGEX ESTRUTURAIS (ATUALIZADO COM DATA/HORA)
 # =========================================================
 REGEX = {
-    # 1. Filtro de Data e Hora (Padrões ISO, BR, Timestamps e Horários isolados)
     "DATE_TIME": re.compile(
         r"^\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?$|" 
         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?$|"               
@@ -80,7 +78,6 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
 
     col_lower = col_name.lower().strip()
     
-    # Blindagem estática por metadado de coluna (Data, Nascimento, Timestamp, etc.)
     termos_ignorar = [
         'modelo', 'marca', 'cor', 'cidade', 'bairro', 'estado', 'pais', 'uf',
         'status', 'data', 'hora', 'delito', 'crime', 'profissao', 'religiao',
@@ -108,7 +105,6 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
 
         matched = False
         
-        # Interceptação explícita de Data/Hora no mapeamento de amostras
         if REGEX["DATE_TIME"].fullmatch(val):
             scores["DATE_TIME"] += 1
             continue
@@ -130,7 +126,6 @@ def _calculate_column_score(col_name: str, samples: list) -> str:
 
     for typ, count in scores.items():
         if typ != "TEXTO_LIVRE" and (count / total) >= threshold:
-            # Se a coluna for predominantemente data, define a política como IGNORAR
             return "IGNORAR" if typ == "DATE_TIME" else typ
 
     return None
@@ -239,7 +234,7 @@ def _detect_all(text: str, anon_loc: bool):
     PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "CHASSI": 1, "RG": 2, "PHONE": 2, "PLATE": 2, "COORD": 3, "COORD_SINGLE": 3, "PER": 4, "GENERIC_CODE": 99 }
     
     for typ, pat in REGEX.items():
-        if typ == "DATE_TIME": continue # Ignora casamento de data bruta em varredura de texto livre
+        if typ == "DATE_TIME": continue 
         if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: 
             continue
             
@@ -300,7 +295,6 @@ def _get_fake(value: str, typ: str) -> str:
     cache_key = f"{typ}:{norm_val}"
     if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
 
-    # Substituição criptográfica forte HMAC baseada em semente imprevisível externa
     secret_bytes = SECRET_SALT.encode('utf-8')
     data_bytes = norm_val.encode('utf-8')
     hmac_hash = hmac.new(secret_bytes, data_bytes, hashlib.sha256).hexdigest()
@@ -334,7 +328,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         if val is None or not str(val).strip(): return val, None
         text = str(val).strip()
         
-        # INTERCEPTAÇÃO INDIVIDUAL: Se for menor que 3 caracteres ou casar com Data/Hora, ignora imediatamente
         if len(text) < 3 or REGEX["DATE_TIME"].fullmatch(text): 
             return text, None
             
