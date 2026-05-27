@@ -141,7 +141,7 @@ Responda APENAS com a palavra 'SIM' ou 'NAO'. Não justifique.
 
     try:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=12, proxies={"http": "", "https": ""})
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=18, proxies={"http": "", "https": ""})
 
         if resp.status_code == 200:
             ans = resp.json().get("response", "").strip().upper()
@@ -182,7 +182,7 @@ def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     
     try:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=8, proxies={"http": "", "https": ""})
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=18, proxies={"http": "", "https": ""})
         if resp.status_code == 200:
             is_valid = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_valid 
