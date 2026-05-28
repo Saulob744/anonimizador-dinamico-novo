@@ -1,4 +1,5 @@
 import re
+import os
 import random
 import string
 import unicodedata
@@ -6,27 +7,31 @@ import hashlib
 import logging
 import requests
 import html
+import hmac
+from collections import Counter
 from functools import lru_cache
 from faker import Faker
 
 # =========================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO E SEGURANÇA 
 # =========================================================
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
+
+SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "MudarParaUmSaltAltamenteComplexoESecreto123!")
 
 try:
     import spacy
     nlp = spacy.load("pt_core_news_lg")
     logger.debug("spaCy carregado com sucesso.")
 except OSError:
-    logger.warning("spaCy não encontrado. A detecção dependerá apenas de Regex.")
+    logger.warning("spaCy não encontrado. A detecção dependerá apenas de Regex e IA LLM.")
     nlp = None
 
 _MAPPING_CACHE = {}
 _COLUMN_POLICIES = {} 
 _OLLAMA_CACHE = {} 
-_DYNAMIC_SAMPLES = {} 
+_NEGATIVE_PATTERN_CACHE = set()
 
 fake = Faker("pt_BR")
 
@@ -37,6 +42,11 @@ OLLAMA_MODEL = "llama3:latest"
 # REGEX ESTRUTURAIS
 # =========================================================
 REGEX = {
+    "DATE_TIME": re.compile(
+        r"^\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?$|" 
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?$|"               
+        r"^\d{2}:\d{2}(?:\:\d{2})?$"                                        
+    ),
     "COORD": re.compile(r"-?\d{1,2}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"), 
     "COORD_SINGLE": re.compile(r"^-?\d{1,3}[.,]\d{4,}$|^-\d{5,10}$"), 
     "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+", re.IGNORECASE),
@@ -55,138 +65,195 @@ PREFIX_TRIMMER = re.compile(r"^(ao|a|para|dr\.?|dra\.?|sr\.?|sra\.?|senhor|senho
 NAME_FALLBACK_REGEX = re.compile(
     r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"                
     r"(?:\s+(?:de|da|do|dos|das|e|DE|DA|DO|DOS|DAS|E))?"   
-    r"\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"               
+    r"\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})"                
     r"(?:\s+(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,}))*\b(?!\:)"        
 )
 
 # =========================================================
-# 1. MOTOR DE BALANÇA E CONSENSO
+# 1. CLASSIFICAÇÃO 
 # =========================================================
-def _calculate_column_score(col_name: str, samples: list) -> str:
-    amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
-    if not amostras_limpas:
-        return "IGNORAR"
-
-    col_lower = col_name.lower().strip()
-
+class AegisClassifier:
     
-    termos_coord = ['latitude', 'longitude', 'lat', 'lon', 'coordenada', 'gps', 'geom']
-    
-    if any(col_lower == t for t in termos_coord) or any(f"_{t}" in col_lower for t in termos_coord) or any(f"{t}_" in col_lower for t in termos_coord):
-        logger.info(f"📍 [BALANÇA] Coluna '{col_name}' blindada via nome -> COORD")
-        return "COORD"
+    def _analyze_with_regex(self, samples: list) -> dict:
+        scores = Counter()
+        total = len(samples)
+        if total == 0: return scores
+        for s in samples:
+            for tag, padrao in REGEX.items():
+                if padrao.search(s):
+                    scores[tag] += 1
+            if NAME_FALLBACK_REGEX.search(s):
+                scores["FORMATO_NOME"] += 1
+        return {tag: f"{(count/total)*100:.0f}%" for tag, count in scores.items()}
 
-  
-    termos_ignorar = [
-        'modelo', 'marca', 'cor', 'cidade', 'bairro', 'estado', 'pais', 'uf',
-        'status', 'data', 'hora', 'delito', 'crime', 'profissao', 'religiao',
-        'logradouro', 'endereco', 'rua', 'avenida', 'cep', 'tipo', 'obs_tecnica', 'sexo'
-    ]
-    if any(termo in col_lower for termo in termos_ignorar):
-        logger.info(f"🛡️ [BALANÇA] Coluna '{col_name}' blindada via nome -> IGNORAR")
-        return "IGNORAR"
+    def _analyze_with_spacy(self, samples: list) -> dict:
+        if not nlp: return {}
+        scores = Counter()
+        total = len(samples)
+        for s in samples:
+            if len(s) > 200: continue
+            doc = nlp(s.title())
+            for ent in doc.ents:
+                scores[ent.label_] += 1
+        return {tag: f"{(count/total)*100:.0f}%" for tag, count in scores.items()}
 
-   
-    total = len(amostras_limpas)
-    scores = {key: 0 for key in REGEX.keys()}
-    scores["NOME_SOLTO"] = 0
-    scores["TEXTO_LIVRE"] = 0
-
-    for val in amostras_limpas:
-        if len(val) > 50 or len(val.split()) > 4:
-            scores["TEXTO_LIVRE"] += 1
-            continue
-
-        matched = False
-        for typ, pat in REGEX.items():
-            if pat.search(val):
-                scores[typ] += 1
-                matched = True
-                break 
-
-        if not matched:
-            if NAME_FALLBACK_REGEX.search(val) or CONTEXT_NAME_REGEX.search(val):
-                scores["NOME_SOLTO"] += 1
-
-    threshold = 0.5 
-    
-    if (scores["TEXTO_LIVRE"] / total) >= threshold:
+    def _ultimate_safety_fallback(self, col_name: str, amostras: list) -> str:
+        prompt = (
+            f"Você é a última linha de defesa de privacidade.\n"
+            f"Analise a coluna '{col_name}' e as amostras: {' | '.join(amostras)}\n\n"
+            f"PERGUNTA: Existe ALGUMA possibilidade de que estes dados contenham informações únicas, identificadores pessoais, relatos ou dados de pessoas?\n"
+            f"Responda APENAS 'SIM' ou 'NAO'."
+        )
+        logger.warning(f"🚨 [FALLBACK CRÍTICO] Acionando defesa para '{col_name}'...")
+        try:
+            payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
+            if resp.status_code == 200:
+                ans = resp.json().get("response", "").strip().upper()
+                return "TEXTO_LIVRE" if "SIM" in ans else "IGNORAR"
+        except Exception as e:
+            logger.error(f"❌ Erro na Rede de Segurança. Fail-Safe ativado. Erro: {e}")
+            
         return "TEXTO_LIVRE"
 
-    for typ, count in scores.items():
-        if typ != "TEXTO_LIVRE" and (count / total) >= threshold:
-            return typ
+    def get_column_tag(self, col_name: str, samples: list) -> str:
+        amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
+        if not amostras_limpas: return "IGNORAR"
 
-    return None
-
-def _ask_llm_if_sensitive(col_name: str, samples: list) -> str:
-    amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
-    if not amostras_limpas: return "IGNORAR"
-
-    amostra_str = " | ".join(amostras_limpas[:10])
-
-    prompt = f"""
-Você é um auditor de LGPD de alta precisão. 
-Sua tarefa é analisar a coluna '{col_name}' e as amostras: {amostra_str}
-
-PERGUNTA:
-Esses dados contêm informações PESSOAIS, SENSÍVEIS ou de IDENTIFICAÇÃO DIRETA (como nomes próprios de seres humanos, documentos, placas de veículos, dados bancários, senhas ou relatos de pessoas)?
-
-REGRA DE REJEIÇÃO:
-Tipos de crime, nomes de endereços (ruas/bairros/cidades), status de processos, categorias de sistemas ou modelos/marcas de carros (ex: Corolla, HB20, Gol, Civic) NÃO SÃO DADOS SENSÍVEIS PESSOAIS.
-
-Responda APENAS com a palavra 'SIM' ou 'NAO'. Não justifique.
-"""
-    logger.info(f"🧠 [FALLBACK IA] Balança indecisa. Avaliando sensibilidade da coluna '{col_name}'...")
-
-    try:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=12, proxies={"http": "", "https": ""})
-
-        if resp.status_code == 200:
-            ans = resp.json().get("response", "").strip().upper()
-            if "SIM" in ans:
+        # -----------------------------------------------------------------
+        #  DETECÇÃO DINÂMICA DE FRASES
+        # -----------------------------------------------------------------
+        amostras_teste = amostras_limpas[:10]
+        
+        if nlp:
+            verb_score = sum(1 for s in amostras_teste if any(token.pos_ in ["VERB", "AUX"] for token in nlp(s.lower())))
+            if verb_score >= (len(amostras_teste) / 3):  
+                logger.debug(f"📝 Bypass Dinâmico: '{col_name}' -> TEXTO_LIVRE (Ação/Verbo detectado).")
                 return "TEXTO_LIVRE"
-            else:
-                return "IGNORAR"
-    except Exception as e:
-        logger.warning(f"Erro no fallback da IA para '{col_name}': {e}")
+        else:
+            # Fallback matemático 
+            avg_words = sum(len(s.split()) for s in amostras_teste) / len(amostras_teste)
+            if avg_words > 4 or any(len(s) > 60 for s in amostras_teste):
+                return "TEXTO_LIVRE"
 
-    return "TEXTO_LIVRE"
+        col_lower = col_name.lower()
+        termos_ignorados = {
+            'cidade', 'municipio', 'estado', 'pais', 'uf', 'bairro', 'cep', 
+            'status', 'tipo', 'categoria', 'marca', 'modelo', 'cor', 'produto'
+        }
+        if any(termo in col_lower for termo in termos_ignorados):
+            logger.debug(f"🛡️ Blindagem LGPD: '{col_name}' -> IGNORAR.")
+            return "IGNORAR"
+        
+        amostras_unicas = list(set(amostras_limpas))[:15]
+
+        if all(REGEX["DATE_TIME"].fullmatch(s) for s in amostras_unicas):
+            return "IGNORAR"
+
+        # --- Relatórios de Padrões Estruturais ---
+        regex_report = self._analyze_with_regex(amostras_unicas)
+        spacy_report = self._analyze_with_spacy(amostras_unicas)
+
+        # --- FAST-TRACK MATEMÁTICO ---
+        if regex_report.get("CPF") and int(regex_report["CPF"].strip("%")) > 60: return "CPF"
+        if regex_report.get("PLATE") and int(regex_report["PLATE"].strip("%")) > 60: return "PLACA"
+        if regex_report.get("EMAIL") and int(regex_report["EMAIL"].strip("%")) > 60: return "EMAIL"
+        if regex_report.get("PHONE") and int(regex_report["PHONE"].strip("%")) > 60: return "PHONE"
+        if regex_report.get("IP") and int(regex_report["IP"].strip("%")) > 60: return "IGNORAR" 
+        if spacy_report.get("PER") and int(spacy_report["PER"].strip("%")) > 50: return "NOME_SOLTO"
+
+        # --- DECISÃO DO LLM ---
+        prompt = f"""
+Sua missão é classificar a coluna '{col_name}' baseando-se nas amostras e na análise.
+
+[ANALISE ESTRUTURAL]
+Regex detectou: {regex_report}
+NLP detectou: {spacy_report}
+Amostras reais: {' | '.join(amostras_unicas)}
+
+[REGRA CRÍTICA - LGPD]
+1. Nomes de Cidades, Estados, Bairros e Ruas NÃO SÃO PESSOAS. Escolha IGNORAR.
+2. Cores, Marcas e Modelos de veículos NÃO SÃO SENSÍVEIS. Escolha IGNORAR.
+3. Nomes compostos e sobrenomes (ex: Silva, Abreu Silva, Carlos) SÃO PESSOAS. Se a Regex acusar "FORMATO_NOME", escolha NOME_SOLTO.
+
+Escolha APENAS UMA tag correspondente da lista abaixo:
+IGNORAR - (Cidades, locais, datas, IDs numéricos, status, cores, marcas de carro, modelos)
+NOME_SOLTO - (Nomes próprios de pessoas físicas)
+CPF - (Documentos, CPFs, RGs, CNPJs)
+EMAIL - (Endereços de email)
+PHONE - (Números de telefone)
+COORD - (Latitudes e longitudes)
+PLACA - (Placas de veículos automotores, carros, motos)
+TEXTO_LIVRE - (Textos longos, relatos, observações, histórico)
+
+Sua resposta deve conter APENAS o nome da tag.
+"""
+        logger.info(f"⚖️ [COMITÊ AEGIS] Avaliando a coluna '{col_name}' no LLM...")
+        try:
+            payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 10}}
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=28)
+            if resp.status_code == 200:
+                tag = resp.json().get("response", "").strip().upper()
+                tags_validas = ["IGNORAR", "NOME_SOLTO", "CPF", "EMAIL", "PHONE", "COORD", "PLACA", "TEXTO_LIVRE"]
+                for tv in tags_validas:
+                    if tv in tag: 
+                        return tv
+        except Exception as e:
+            logger.warning(f"❌ LLM indisponível para '{col_name}'. Erro: {e}")
+
+        return self._ultimate_safety_fallback(col_name, amostras_unicas)
+
+
+_aegis_engine = AegisClassifier()
 
 def define_column_policy(col_name: str, sample_values: list) -> str:
     if col_name in _COLUMN_POLICIES: 
         return _COLUMN_POLICIES[col_name]
         
-    politica = _calculate_column_score(col_name, sample_values)
-    if not politica:
-        politica = _ask_llm_if_sensitive(col_name, sample_values)
+    politica = _aegis_engine.get_column_tag(col_name, sample_values)
     
     logger.info(f"✅ Política Definida Mestre para '{col_name}': {politica}")
     _COLUMN_POLICIES[col_name] = politica
     return politica
 
 # =========================================================
-# 2. JUIZ DE ENTIDADES & TEXTO LIVRE
+# 2. JUIZ DE ENTIDADES E PROCESSAMENTO DE TEXTO
 # =========================================================
+def _get_skeleton(text: str) -> str:
+    return re.sub(r'\d+', '[NUM]', text.upper())
+
 def _is_valid_entity_ollama(text: str, tag: str) -> bool:
     if len(text.strip()) < 3: return False
     
     cache_key = f"{tag}:{text.upper()}"
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
+    
+    esqueleto = _get_skeleton(text)
+    if esqueleto in _NEGATIVE_PATTERN_CACHE:
+        return False
         
     if tag in ["PER", "NOME_SOLTO"]:
-        prompt = f"A expressão '{text}' é o nome próprio de uma pessoa física humana? Regra: Nomes de ruas, bairros ou cidades são 'NAO'. Responda APENAS 'SIM' ou 'NAO'."
+        prompt = f"""Atue como um filtro rigoroso de LGPD.
+A expressão '{text}' é EXCLUSIVAMENTE o nome próprio de uma pessoa física humana real?
+Regras de REJEIÇÃO (Responda NAO se for):
+- Cargos, profissões ou papéis (ex: 'Motorista', 'Atendente', 'Médico', 'Vítima')
+- Nomes de ruas, cidades, bairros ou locais
+- Status de sistemas, jargões, nomes de arquivos ou marcas corporativas
+Responda APENAS 'SIM' ou 'NAO'."""
     else:
         return True 
     
     try:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=8, proxies={"http": "", "https": ""})
+        resp = requests.post(OLLAMA_URL, json=payload, timeout=28, proxies={"http": "", "https": ""})
+        
         if resp.status_code == 200:
             is_valid = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_valid 
+            if not is_valid:
+                _NEGATIVE_PATTERN_CACHE.add(esqueleto)
             return is_valid
+            
     except Exception as e:
         logger.warning(f"Timeout no Ollama para '{text}'. Erro: {e}")
         
@@ -223,8 +290,8 @@ def _detect_all(text: str, anon_loc: bool):
     PRIORITY = { "EMAIL": 1, "IP": 1, "CPF": 1, "CHASSI": 1, "RG": 2, "PHONE": 2, "PLATE": 2, "COORD": 3, "COORD_SINGLE": 3, "PER": 4, "GENERIC_CODE": 99 }
     
     for typ, pat in REGEX.items():
-        if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: 
-            continue
+        if typ == "DATE_TIME": continue 
+        if not anon_loc and typ in ["COORD", "COORD_SINGLE"]: continue
             
         for match in pat.finditer(text):
             val = match.group()
@@ -270,6 +337,9 @@ def _detect_all(text: str, anon_loc: bool):
             last = e
     return clean
 
+# =========================================================
+# 3. MÁQUINA DE FALSOS DADOS E CRIPTOGRAFIA
+# =========================================================
 def apply_gps_jitter(coord_str):
     try:
         c = float(coord_str.replace(',', '.'))
@@ -281,9 +351,16 @@ def _get_fake(value: str, typ: str) -> str:
     clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
     norm_val = _normalize(clean_value)
     cache_key = f"{typ}:{norm_val}"
+    
     if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
 
-    fake.seed_instance(int(hashlib.sha256(norm_val.encode()).hexdigest()[:8], 16))
+    secret_bytes = SECRET_SALT.encode('utf-8')
+    data_bytes = norm_val.encode('utf-8')
+    hmac_hash = hmac.new(secret_bytes, data_bytes, hashlib.sha256).hexdigest()
+    seed_int = int(hmac_hash[:8], 16)
+    
+    fake.seed_instance(seed_int)
+    local_rand = random.Random(seed_int)
     
     if typ in ["PER", "NOME_SOLTO"]: val = fake.name().upper()
     elif typ == "CPF": val = fake.cpf()
@@ -292,39 +369,44 @@ def _get_fake(value: str, typ: str) -> str:
     elif typ == "EMAIL": val = fake.email().lower()
     elif typ == "PHONE": val = fake.phone_number()
     elif typ == "IP": val = fake.ipv4()
-    elif typ == "CHASSI": val = "".join(random.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
+    elif typ == "CHASSI": val = "".join(local_rand.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
     elif typ in ["COORD", "COORD_SINGLE"]: 
         val = re.sub(r"-?\d{1,3}[.,]\d+", lambda m: apply_gps_jitter(m.group(0)), value)
     elif typ == "GENERIC_CODE": 
-        val = "".join([random.choice(string.digits) if c.isdigit() else (random.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
+        val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else (local_rand.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
     else: val = fake.word().upper()
 
     _MAPPING_CACHE[cache_key] = val
     return val
 
 # =========================================================
-# 4. ORQUESTRAÇÃO DE ANONIMIZAÇÃO
+# 4. ORQUESTRAÇÃO DE ANONIMIZAÇÃO PRINCIPAL
 # =========================================================
 def anonymize_value(col_name: str, val, anon_location: bool = True):
     try:
         if val is None or not str(val).strip(): return val, None
-        text = str(val)
+        text = str(val).strip()
         
-        if len(text) < 3: 
+        if len(text) < 3 or REGEX["DATE_TIME"].fullmatch(text): 
             return text, None
             
-        if col_name not in _COLUMN_POLICIES:
-            politica = define_column_policy(col_name, [text])
-        else:
-            politica = _COLUMN_POLICIES[col_name]
+        politica_execucao = define_column_policy(col_name, [text])
 
-        politica_execucao = politica
-
+        # -----------------------------------------------------------------
+        # DETECÇÃO DINÂMICA DE DESVIOS DE PADRÃO
+        # -----------------------------------------------------------------
         if politica_execucao not in ["TEXTO_LIVRE", "IGNORAR"]:
-            if len(text) > 50 or len(text.split()) > 4:
+            is_phrase = False
+    
+            if len(text.split()) > 3:
+                if nlp and any(token.pos_ in ["VERB", "AUX"] for token in nlp(text.lower()[:100])):
+                    is_phrase = True
+                elif len(text) > 40: 
+                    is_phrase = True
+            
+            if is_phrase:
                 politica_execucao = "TEXTO_LIVRE"
 
- 
         if politica_execucao == "IGNORAR":
             return text, None
             
@@ -332,16 +414,17 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             if _is_valid_entity_ollama(text, "NOME_SOLTO"):
                 fake_val = _get_fake(text, "NOME_SOLTO")
                 return fake_val, ("TEXT" if fake_val != text else None)
-            else:
-                return text, None
-
+            return text, None
       
         if politica_execucao in ["COORD", "COORD_SINGLE"]:
             if anon_location:
                 fake_val = _get_fake(text, politica_execucao)
                 return fake_val, ("TEXT" if fake_val != text else None)
-            else:
-                return text, None
+            return text, None
+            
+        if politica_execucao == "PLACA":
+            fake_val = _get_fake(text, "PLATE")
+            return fake_val, ("TEXT" if fake_val != text else None)
 
         if politica_execucao in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
             fake_val = _get_fake(text, politica_execucao)
@@ -362,15 +445,14 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             texto_final = "".join(result)
             return texto_final, ("TEXT" if texto_final != text else None)
 
-       
         return text, None
 
     except Exception as e:
-        logger.error(f"⚠️ Erro ao aplicar mascara na coluna '{col_name}': {e}", exc_info=True)
+        logger.error(f"⚠️ Erro crítico na máscara da coluna '{col_name}': {e}", exc_info=True)
         return str(val), None 
 
 def reset_memory():
     _MAPPING_CACHE.clear()
     _COLUMN_POLICIES.clear()
     _OLLAMA_CACHE.clear()
-    _DYNAMIC_SAMPLES.clear()
+    _NEGATIVE_PATTERN_CACHE.clear()
