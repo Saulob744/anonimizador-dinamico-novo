@@ -8,6 +8,7 @@ import logging
 import requests
 import html
 import hmac
+from collections import Counter
 from functools import lru_cache
 from faker import Faker
 
@@ -24,7 +25,7 @@ try:
     nlp = spacy.load("pt_core_news_lg")
     logger.debug("spaCy carregado com sucesso.")
 except OSError:
-    logger.warning("spaCy não encontrado. A detecção dependerá apenas de Regex.")
+    logger.warning("spaCy não encontrado. A detecção dependerá apenas de Regex e IA LLM.")
     nlp = None
 
 _MAPPING_CACHE = {}
@@ -38,7 +39,7 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 OLLAMA_MODEL = "llama3:latest"
 
 # =========================================================
-# REGEX ESTRUTURAIS (ATUALIZADO COM DATA/HORA)
+# REGEX ESTRUTURAIS
 # =========================================================
 REGEX = {
     "DATE_TIME": re.compile(
@@ -69,109 +70,129 @@ NAME_FALLBACK_REGEX = re.compile(
 )
 
 # =========================================================
-# 1. MOTOR DE BALANÇA E CONSENSO
+# 1. O COMITÊ DE CLASSIFICAÇÃO 
 # =========================================================
-def _calculate_column_score(col_name: str, samples: list) -> str:
-    amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
-    if not amostras_limpas:
-        return "IGNORAR"
-
-    col_lower = col_name.lower().strip()
+class AegisClassifier:
     
-    termos_ignorar = [
-        'modelo', 'marca', 'cor', 'cidade', 'bairro', 'estado', 'pais', 'uf',
-        'status', 'data', 'hora', 'delito', 'crime', 'profissao', 'religiao',
-        'logradouro', 'endereco', 'rua', 'avenida', 'cep', 'tipo', 'obs_tecnica', 'sexo',
-        'nascimento', 'criado', 'atualizado', 'dt_', '_dt'
-    ]
-    if any(termo in col_lower for termo in termos_ignorar):
-        logger.info(f"🛡️ [BALANÇA] Coluna '{col_name}' blindada via nome -> IGNORAR")
-        return "IGNORAR"
+    def _analyze_with_regex(self, samples: list) -> dict:
+        scores = Counter()
+        total = len(samples)
+        if total == 0: return scores
+        for s in samples:
+            for tag, padrao in REGEX.items():
+                if padrao.search(s):
+                    scores[tag] += 1
+            if NAME_FALLBACK_REGEX.search(s):
+                scores["FORMATO_NOME"] += 1
+        return {tag: f"{(count/total)*100:.0f}%" for tag, count in scores.items()}
 
-    termos_coord = ['latitude', 'longitude', 'lat', 'lon', 'coordenada', 'gps', 'geom']
-    if any(col_lower == t for t in termos_coord) or any(f"_{t}" in col_lower for t in termos_coord) or any(f"{t}_" in col_lower for t in termos_coord):
-        logger.info(f"📍 [BALANÇA] Coluna '{col_name}' blindada via nome -> COORD")
-        return "COORD"
+    def _analyze_with_spacy(self, samples: list) -> dict:
+        if not nlp: return {}
+        scores = Counter()
+        total = len(samples)
+        for s in samples:
+            if len(s) > 200: continue
+            doc = nlp(s.title())
+            for ent in doc.ents:
+                scores[ent.label_] += 1
+        return {tag: f"{(count/total)*100:.0f}%" for tag, count in scores.items()}
 
-    total = len(amostras_limpas)
-    scores = {key: 0 for key in REGEX.keys()}
-    scores["NOME_SOLTO"] = 0
-    scores["TEXTO_LIVRE"] = 0
-
-    for val in amostras_limpas:
-        if len(val) > 50 or len(val.split()) > 4:
-            scores["TEXTO_LIVRE"] += 1
-            continue
-
-        matched = False
-        
-        if REGEX["DATE_TIME"].fullmatch(val):
-            scores["DATE_TIME"] += 1
-            continue
-
-        for typ, pat in REGEX.items():
-            if typ != "DATE_TIME" and pat.search(val):
-                scores[typ] += 1
-                matched = True
-                break 
-
-        if not matched:
-            if NAME_FALLBACK_REGEX.search(val) or CONTEXT_NAME_REGEX.search(val):
-                scores["NOME_SOLTO"] += 1
-
-    threshold = 0.5 
-    
-    if (scores["TEXTO_LIVRE"] / total) >= threshold:
-        return "TEXTO_LIVRE"
-
-    for typ, count in scores.items():
-        if typ != "TEXTO_LIVRE" and (count / total) >= threshold:
-            return "IGNORAR" if typ == "DATE_TIME" else typ
-
-    return None
-
-def _ask_llm_if_sensitive(col_name: str, samples: list) -> str:
-    amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
-    if not amostras_limpas: return "IGNORAR"
-
-    amostra_str = " | ".join(amostras_limpas[:10])
-
-    prompt = f"""
-Você é um auditor de LGPD de alta precisão. 
-Sua tarefa é analisar a coluna '{col_name}' e as amostras: {amostra_str}
+    def _ultimate_safety_fallback(self, col_name: str, amostras: list) -> str:
+        prompt = f"""
+Você é a última linha de defesa de privacidade.
+Analise a coluna '{col_name}' e as amostras: {' | '.join(amostras)}
 
 PERGUNTA:
-Esses dados contêm informações PESSOAIS, SENSÍVEIS ou de IDENTIFICAÇÃO DIRETA (como nomes próprios de seres humanos, documentos, placas de veículos, dados bancários, senhas ou relatos de pessoas)?
+Existe ALGUMA possibilidade de que estes dados contenham informações únicas, identificadores pessoais, relatos ou dados de pessoas (mesmo que misturados)?
 
-REGRA DE REJEIÇÃO:
-Datas, Horários, Tipos de crime, nomes de endereços (ruas/bairros/cidades), status de processos ou modelos/marcas de carros NÃO SÃO DADOS SENSÍVEIS PESSOAIS.
-
-Responda APENAS com a palavra 'SIM' ou 'NAO'. Não justifique.
+Responda APENAS 'SIM' ou 'NAO'.
 """
-    logger.info(f"🧠 [FALLBACK IA] Balança indecisa. Avaliando sensibilidade da coluna '{col_name}'...")
+        logger.warning(f"🚨 [FALLBACK CRÍTICO] Acionando última linha de defesa para '{col_name}'...")
+        try:
+            payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
+            if resp.status_code == 200:
+                ans = resp.json().get("response", "").strip().upper()
+                if "SIM" in ans:
+                    return "TEXTO_LIVRE"
+                else:
+                    return "IGNORAR"
+        except Exception as e:
+            logger.error(f"❌ Erro na Rede de Segurança. Fail-Safe ativado. Erro: {e}")
+            
+        return "TEXTO_LIVRE"
 
-    try:
-        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=18, proxies={"http": "", "https": ""})
+    def get_column_tag(self, col_name: str, samples: list) -> str:
+        amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
+        if not amostras_limpas: return "IGNORAR"
+        
+        amostras_unicas = list(set(amostras_limpas))[:15]
 
-        if resp.status_code == 200:
-            ans = resp.json().get("response", "").strip().upper()
-            if "SIM" in ans:
-                return "TEXTO_LIVRE"
-            else:
-                return "IGNORAR"
-    except Exception as e:
-        logger.warning(f"Erro no fallback da IA para '{col_name}': {e}")
+        if all(REGEX["DATE_TIME"].fullmatch(s) for s in amostras_unicas):
+            return "IGNORAR"
 
-    return "TEXTO_LIVRE"
+        regex_report = self._analyze_with_regex(amostras_unicas)
+        spacy_report = self._analyze_with_spacy(amostras_unicas)
+
+        # =================================================================
+        #  FAST-TRACK MATEMÁTICO 
+        # =================================================================
+        if regex_report.get("CPF") and int(regex_report["CPF"].strip("%")) > 60: return "CPF"
+        if regex_report.get("PLATE") and int(regex_report["PLATE"].strip("%")) > 60: return "PLACA"
+        if regex_report.get("EMAIL") and int(regex_report["EMAIL"].strip("%")) > 60: return "EMAIL"
+        if regex_report.get("PHONE") and int(regex_report["PHONE"].strip("%")) > 60: return "PHONE"
+        if regex_report.get("IP") and int(regex_report["IP"].strip("%")) > 60: return "IGNORAR" 
+
+        prompt = f"""
+Sua missão é classificar a coluna '{col_name}' baseando-se nas amostras e na análise.
+
+[ANALISE ESTRUTURAL]
+Regex detectou: {regex_report}
+NLP detectou: {spacy_report}
+Amostras reais: {' | '.join(amostras_unicas)}
+
+[REGRA CRÍTICA - LGPD]
+1. Nomes de Cidades, Estados, Bairros e Ruas NÃO SÃO PESSOAS. Escolha IGNORAR.
+2. Cores, Marcas e Modelos de veículos NÃO SÃO SENSÍVEIS. Escolha IGNORAR.
+3. Nomes compostos e sobrenomes (ex: Silva, Abreu Silva, Carlos) SÃO PESSOAS. Se a Regex acusar "FORMATO_NOME", escolha NOME_SOLTO.
+
+Escolha APENAS UMA tag correspondente da lista abaixo:
+IGNORAR - (Cidades, locais, datas, IDs numéricos, status, cores, marcas de carro, modelos)
+NOME_SOLTO - (Nomes próprios de pessoas físicas)
+CPF - (Documentos, CPFs, RGs, CNPJs)
+EMAIL - (Endereços de email)
+PHONE - (Números de telefone)
+COORD - (Latitudes e longitudes)
+PLACA - (Placas de veículos automotores, carros, motos)
+TEXTO_LIVRE - (Textos longos, relatos, observações, histórico)
+
+Sua resposta deve conter APENAS o nome da tag.
+"""
+        logger.info(f"⚖️ [COMITÊ AEGIS] Avaliando a coluna '{col_name}'...")
+        try:
+            payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 10}}
+            resp = requests.post(OLLAMA_URL, json=payload, timeout=20)
+            if resp.status_code == 200:
+                tag = resp.json().get("response", "").strip().upper()
+                
+                tags_validas = ["IGNORAR", "NOME_SOLTO", "CPF", "EMAIL", "PHONE", "COORD", "PLACA", "TEXTO_LIVRE"]
+                for tv in tags_validas:
+                    if tv in tag: 
+                        return tv
+        except Exception as e:
+            logger.warning(f"❌ Fallback acionado para '{col_name}'. Erro: {e}")
+
+        if spacy_report.get("PER") and int(spacy_report["PER"].strip("%")) > 50: return "NOME_SOLTO"
+        
+        return self._ultimate_safety_fallback(col_name, amostras_unicas)
+
+_aegis_engine = AegisClassifier()
 
 def define_column_policy(col_name: str, sample_values: list) -> str:
     if col_name in _COLUMN_POLICIES: 
         return _COLUMN_POLICIES[col_name]
         
-    politica = _calculate_column_score(col_name, sample_values)
-    if not politica:
-        politica = _ask_llm_if_sensitive(col_name, sample_values)
+    politica = _aegis_engine.get_column_tag(col_name, sample_values)
     
     logger.info(f"✅ Política Definida Mestre para '{col_name}': {politica}")
     _COLUMN_POLICIES[col_name] = politica
@@ -358,6 +379,10 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
                 return fake_val, ("TEXT" if fake_val != text else None)
             else:
                 return text, None
+            
+        if politica_execucao == "PLACA":
+            fake_val = _get_fake(text, "PLATE")
+            return fake_val, ("TEXT" if fake_val != text else None)
 
         if politica_execucao in ["CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
             fake_val = _get_fake(text, politica_execucao)
@@ -378,7 +403,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             texto_final = "".join(result)
             return texto_final, ("TEXT" if texto_final != text else None)
 
-       
         return text, None
 
     except Exception as e:

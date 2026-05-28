@@ -59,14 +59,17 @@ warnings.filterwarnings("ignore", category=UserWarning, message=".*resume_downlo
 importlib.reload(db_utils)
 importlib.reload(anonymizer)
 
-st.set_page_config(page_title="🛡️ Aegis Anonymizer Pro", page_icon="🛡️", layout="wide")
-st.markdown("""
-    <style>
-    [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; font-weight: bold; }
-    .stProgress .st-at { background-color: #00ffcc; }
-    .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
-    </style>
-""", unsafe_allow_html=True)
+try:
+    st.set_page_config(page_title="🛡️ Aegis Anonymizer Pro", page_icon="🛡️", layout="wide")
+    st.markdown("""
+        <style>
+        [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; font-weight: bold; }
+        .stProgress .st-at { background-color: #00ffcc; }
+        .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
+        </style>
+    """, unsafe_allow_html=True)
+except Exception:
+    pass 
 
 # ==================================================
 # FUNÇÕES AUXILIARES
@@ -85,15 +88,28 @@ def split_text_into_chunks(text, max_tokens=300):
     return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
 
 def build_url(db_type, user, password, host, port, db):
+    if not db:
+        raise ValueError("O nome do banco de dados (db) chegou nulo ou vazio na função build_url!")
+        
+    database_limpo = str(db).strip()
+    if database_limpo == "":
+        raise ValueError("O nome do banco de dados (db) está em branco!")
+
+    safe_db = urllib.parse.quote(database_limpo, safe="")
+    safe_user = urllib.parse.quote(user, safe="")
+    safe_pass = urllib.parse.quote(password, safe="")
+    
     if db_type == "mssql":
         driver = [d for d in pyodbc.drivers() if "SQL Server" in d][-1]
         if host and "localdb" in host.lower():
-            odbc_str = rf"DRIVER={{{driver}}};SERVER=(localdb)\MSSQLLocalDB;DATABASE={db};Trusted_Connection=yes;"
+            odbc_str = rf"DRIVER={{{driver}}};SERVER=(localdb)\MSSQLLocalDB;DATABASE={database_limpo};Trusted_Connection=yes;"
             return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
-        return f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
+            
+        return f"mssql+pyodbc://@{host}:{port}/{safe_db}?driver={urllib.parse.quote(driver, safe='')}&trusted_connection=yes"
     
     prefix = "postgresql+psycopg2" if db_type == "postgresql" else "mysql+pymysql"
-    return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
+    
+    return f"{prefix}://{safe_user}:{safe_pass}@{host}:{port}/{safe_db}?client_encoding=utf8"
 
 # ==================================================
 # PROCESSAMENTO CENTRAL DAS LINHAS
@@ -372,18 +388,21 @@ with st.sidebar:
 st.title("🛡️ Pipeline De Proteção De Dados")
 
 if start_btn:
-    save_progress("Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
-    target_cols = st.session_state.colunas_selecionadas_finais
-    
-    thread = threading.Thread(
-        target=run_pipeline_background, 
-        args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols)
-    )
-    thread.daemon = True 
-    thread.start()
-    
-    time.sleep(2.5) 
-    st.rerun()   
+    if not src_cfg["db"].strip() or not dst_cfg["db"].strip():
+        st.error("🚨 ALERTA: O nome do banco de dados de Origem e Destino são OBRIGATÓRIOS. Preencha as abas na barra lateral antes de iniciar.")
+    else:
+        save_progress("Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
+        target_cols = st.session_state.colunas_selecionadas_finais
+        
+        thread = threading.Thread(
+            target=run_pipeline_background, 
+            args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, anon_geo, target_cols)
+        )
+        thread.daemon = True 
+        thread.start()
+        
+        time.sleep(2.5) 
+        st.rerun()   
 
 # --- MONITOR FLUIDO EM TEMPO REAL ---
 estado_atual = load_progress()
