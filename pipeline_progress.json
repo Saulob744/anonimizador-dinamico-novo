@@ -1,1 +1,1 @@
-{"fase": "Processando: tb_plantao_diario", "tabelas_processadas": 6, "tabelas_total": 10, "linhas_processadas": 2060227, "linhas_total": 2522614, "velocidade": 143486.75086639356, "tempo_decorrido": 11211.996815919876, "finalizado": false}
+{"fase": "Processando: tb_clientes_gps", "tabelas_processadas": 4, "tabelas_total": 10, "linhas_processadas": 1976025, "linhas_total": 2522614, "velocidade": 81.07448370744615, "tempo_decorrido": 27685.430377721786, "finalizado": false}
