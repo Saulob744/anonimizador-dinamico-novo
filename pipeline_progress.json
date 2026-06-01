@@ -1,1 +1,1 @@
-{"fase": "Processando: tb_clientes_gps", "tabelas_processadas": 4, "tabelas_total": 10, "linhas_processadas": 1977625, "linhas_total": 2522614, "velocidade": 73.09404067621911, "tempo_decorrido": 27703.39203953743, "finalizado": false}
+{"fase": "Processando: tb_indices_anuais", "tabelas_processadas": 5, "tabelas_total": 10, "linhas_processadas": 2010227, "linhas_total": 2522614, "velocidade": 3411.1095179075614, "tempo_decorrido": 5880.323242902756, "finalizado": false}
