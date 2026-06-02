@@ -1,1 +1,1 @@
-{"fase": "Processando: tb_indices_anuais", "tabelas_processadas": 5, "tabelas_total": 10, "linhas_processadas": 2010227, "linhas_total": 2522614, "velocidade": 3411.1095179075614, "tempo_decorrido": 5880.323242902756, "finalizado": false}
+{"fase": "Processando: pessoas", "tabelas_processadas": 2, "tabelas_total": 10, "linhas_processadas": 556810, "linhas_total": 2522614, "velocidade": 454.0925592524491, "tempo_decorrido": 2245.5114254951477, "finalizado": false}
