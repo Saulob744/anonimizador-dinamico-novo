@@ -1,1 +1,1 @@
-{"fase": "Processando: pessoas", "tabelas_processadas": 2, "tabelas_total": 10, "linhas_processadas": 556810, "linhas_total": 2522614, "velocidade": 454.0925592524491, "tempo_decorrido": 2245.5114254951477, "finalizado": false}
+{"fase": "Processando: ocorrencias", "tabelas_processadas": 1, "tabelas_total": 10, "linhas_processadas": 59000, "linhas_total": 2522614, "velocidade": 16757.893419204996, "tempo_decorrido": 74.14102602005005, "finalizado": false}

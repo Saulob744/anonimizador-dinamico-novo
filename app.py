@@ -76,7 +76,7 @@ st.markdown("""
     <style>
     [data-testid="stMetricValue"] { font-size: 1.8rem; color: #00ffcc; font-weight: bold; }
     .stProgress .st-at { background-color: #00ffcc; }
-    .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e6; }
+    .debug-box { border: 1px solid #ff4444; padding: 10px; border-radius: 5px; color: #ff4444; background-color: #ffe6e9; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -395,20 +395,17 @@ if start_btn:
 estado_atual = load_progress()
 
 if estado_atual:
+    # SE O PIPELINE AINDA ESTIVER A RODAR:
     if not estado_atual.get("finalizado", True):
-        st.info("🔄 Monitorando processo em background... (Você pode minimizar, bloquear a tela ou fechar a aba!)")
-        
-        if st.button("🛑 Forçar Parada / Limpar Sessão", type="secondary"):
-            limpar_sessao()
+        st.info("🔄 O processo está rodando no servidor. Você pode minimizar a tela ou usar o botão abaixo para atualizar.")
+
+        if st.button("🔄 Atualizar Progresso (Reload)", type="primary"):
             st.rerun()
             
         tempo_sem_atualizar = time.time() - os.path.getmtime(STATUS_FILE)
         
-        if tempo_sem_atualizar > 600: 
-            st.error("🚨 O processo não responde há mais de 10 minutos. Clique em 'Forçar Parada' acima.")
-            st.stop()
-        elif tempo_sem_atualizar > 15:
-            st.warning("⏳ A IA está processando um lote pesado de textos. Os dados abaixo estão congelados temporariamente, mas o processo continua rodando...") 
+        if tempo_sem_atualizar > 15:
+            st.warning("⏳ A IA está processando um lote mais pesado. Aguarde, o processo continua rodando...") 
                 
         # EXTRAÇÃO DOS DADOS
         linhas_proc = estado_atual.get("linhas_processadas", 0)
@@ -442,9 +439,8 @@ if estado_atual:
         - ⏳ **Tempo Restante (ETA):** **<span style="color:#ffcc00">{tempo_restante_str}</span>**
         """, unsafe_allow_html=True)
         
-        time.sleep(1.5) 
+        time.sleep(2) 
         st.rerun()
-
     else:
         if "Erro" in estado_atual.get("fase", ""):
             st.error(f"🚨 O processo parou devido a um erro fatal: {estado_atual['fase']}")

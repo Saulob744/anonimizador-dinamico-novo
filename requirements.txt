@@ -1,47 +1,32 @@
-# Web Framework
+# ==========================================
+# 🌐 Web Framework & UI
+# ==========================================
 streamlit>=1.30
 
-# Database & Conectividade
+# ==========================================
+# 🗄️ Database & Conectividade
+# ==========================================
 sqlalchemy>=2.0
 psycopg2-binary>=2.9
 pyodbc>=5.0
 pymysql>=1.1
 pandas>=2.0
 
-# Utils
+# ==========================================
+# ⚙️ Utils & Sistema
+# ==========================================
 python-dotenv>=1.0
+psutil>=5.9.0
 
-# NLP / IA
+# ==========================================
+# 🧠 NLP / IA / Motor de Anonimização
+# ==========================================
 faker>=24.0
 spacy>=3.7
-
-# Modelo do spaCy (instalar separado via comando)
-# python -m spacy download pt_core_news_lg
-
-# NER avançado (usado no seu código)
 gliner>=0.2.0
-
-# Dependências comuns do gliner
+presidio-analyzer>=2.2.35
 torch>=2.0
 transformers>=4.40
-faker
-pandas
-psutil
-psycopg2-binary
-pymysql
-python-dotenv
-sqlalchemy
-streamlit
-faker>=24.0
-gliner>=0.2.0
-pandas>=2.0
-psutil
-psycopg2-binary>=2.9
-pymysql>=1.1
-pyodbc>=5.0
-python-dotenv>=1.0
-spacy>=3.7
-sqlalchemy>=2.0
-streamlit>=1.30
-torch>=2.0
-transformers>=4.40
+
+# Instrução de Instalação Pós-Requirements:
+# Lembre-se de rodar: python -m spacy download pt_core_news_lg

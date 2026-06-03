@@ -37,16 +37,16 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
 
 REGEX = {
-    "DATE_TIME": re.compile(r"\b\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?\b|\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|\b\d{2}:\d{2}(?:\:\d{2})?\b"),
-    "COORD": re.compile(r"-?\d{1,3}[.,]\d+\s*[,;]?\s*-?\d{1,3}[.,]\d+"), 
-    "COORD_SINGLE": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{4,}(?!\d)|(?<!\d)-\d{5,10}(?!\d)"), 
-    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.IGNORECASE),
     "CPF": re.compile(r"\b\d{3}[.\-\s/_]*\d{3}[.\-\s/_]*\d{3}[.\-\s/_]*\d{2}\b|\b\d{11}\b"),
     "RG": re.compile(r"\b(?:[A-Za-z]{2}[-\s]*)?\d{1,3}[.\-\s]*\d{3}[.\-\s]*\d{3}[-\s]*[0-9A-Za-z]\b|\b\d{5,14}\b"),
+    "EMAIL": re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.IGNORECASE),
+    "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
     "PLATE": re.compile(r"\b[A-Z]{3}[-\s]*\d[A-Z0-9]\d{2}\b|\b[A-Z]{3}[-\s]*\d{4}\b", re.IGNORECASE),
     "PHONE": re.compile(r"\b(?:\+?\d{1,3}[\s-]?)?(?:\(?\d{2,3}\)?[\s-]?)?\d{4,5}[\s-]?\d{4}\b"),
-    "IP": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:[a-fA-F0-9]{1,4}:){7}[a-fA-F0-9]{1,4}\b"),
-    "CHASSI": re.compile(r"\b(?:[A-HJ-NPR-Z0-9][-\s]*){17}\b", re.IGNORECASE), 
+    "CHASSI": re.compile(r"\b(?:[A-HJ-NPR-Z0-9][-\s]*){17}\b", re.IGNORECASE),
+    "DATE_TIME": re.compile(r"\b\d{2,4}[/\-]\d{2}[/\-]\d{2,4}(?:\s+\d{2}:\d{2}(?:\:\d{2})?)?\b|\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b|\b\d{2}:\d{2}(?:\:\d{2})?\b"),    
+    "COORD": re.compile(r"\b-?\d{1,3}[.,]\d{4,}\s*[,;]\s*-?\d{1,3}[.,]\d{4,}\b"), 
+    "COORD_SINGLE": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{4,}(?!\d)|(?<!\d)-\d{5,10}(?!\d)"),
     "DOC_GENERICO": re.compile(r"\b(?:\d[.\-\s]*){7,15}\b"),
     "GENERIC_CODE": re.compile(r'\b(?:(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_/\.\-]{5,128})\b'),
 }
@@ -112,6 +112,13 @@ class AegisClassifier:
         return {tag: (count/total)*100 for tag, count in scores.items()}
 
     def get_column_tag(self, col_name: str, samples: list) -> str:
+        col_lower = col_name.lower().strip()
+        
+        if col_lower in ['cpf']: return "CPF"
+        if col_lower in ['rg']: return "RG"
+        if 'email' in col_lower: return "EMAIL"
+        if 'placa' in col_lower: return "PLATE"
+        
         amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
         if not amostras_limpas: return "IGNORAR"
         amostras_unicas = list(set(amostras_limpas))[:15]
@@ -154,14 +161,48 @@ class AegisClassifier:
                 if _ask_llm_yes_no(prompt_spacy, f"COL_{col_name}_NOME_SOLTO"):
                     return "NOME_SOLTO"
 
-        logger.info(f"Fallback acionado para '{col_name}'. LLM decidirá se é TEXTO_LIVRE.")
-        prompt_fallback = f"A amostra '{' | '.join(amostras_unicas[:5])}' possui qualquer dado pessoal identificável ou texto narrativo sensível? Responda APENAS 'SIM' ou 'NAO'."
-        if _ask_llm_yes_no(prompt_fallback, f"COL_FALLBACK_{col_name}"):
-            return "TEXTO_LIVRE"
+            logger.info(f"Fallback acionado para '{col_name}'. LLM decidirá se é TEXTO_LIVRE.")
+            prompt_fallback = f"A amostra '{' | '.join(amostras_unicas[:5])}' possui qualquer dado pessoal identificável ou texto narrativo sensível? Responda APENAS 'SIM' ou 'NAO'."
+            if _ask_llm_yes_no(prompt_fallback, f"COL_FALLBACK_{col_name}"):
+                return "TEXTO_LIVRE"
 
         return "IGNORAR"
 
 _aegis_engine = AegisClassifier()
+
+# =========================================================================
+    # MOTOR DINÂMICO DE REJEIÇÃO
+    # =========================================================================
+def is_dynamic_jargon(texto_candidato: str) -> bool:
+        t_limpo = ''.join(c for c in unicodedata.normalize('NFD', texto_candidato.lower()) if unicodedata.category(c) != 'Mn')
+        
+        if not any(v in t_limpo for v in 'aeiouy'):
+            return True
+
+        if not nlp:
+            return False
+
+        doc = nlp(texto_candidato)
+
+        for ent in doc.ents:
+            if ent.label_ in ["ORG", "MISC", "LOC"]:
+                return True
+
+        for token in doc:
+            if token.is_upper and len(token.text) <= 4:
+                return True
+
+            if token.pos_ in ["NUM", "SYM", "PUNCT", "VERB"]:
+                if token.is_title:
+                    continue
+                return True
+                
+            morfologia = str(token.morph)
+            if "VerbForm=Part" in morfologia or "VerbForm=Ger" in morfologia:
+                return True
+
+        return False
+    # =========================================================================
 
 def define_column_policy(col_name: str, sample_values: list) -> str:
     if col_name not in _COLUMN_POLICIES: 
@@ -175,17 +216,20 @@ def _normalize(text: str) -> str:
 
 def _detect_all(text: str, anon_loc: bool):
     found = []
-    
     TRUSTED_TAGS = {"CPF", "RG", "EMAIL", "IP", "PLATE", "CHASSI", "PHONE", "COORD", "COORD_SINGLE"}
     
+    INVALID_NAME_WORDS = re.compile(
+        r"\b(rua|avenida|av|travessa|trav|praça|praca|alameda|rodovia|rod|bairro|lote|lt|quadra|qd|condominio|cond|edificio|ed|bloco|apartamento|apto|casa|km|br|centro|jardim|jd|parque|pq|vila|"
+        r"pgto|pagamento|pago|efetuado|transferencia|transf|pix|banco|agencia|conta|boleto|valor|saldo|debito|credito|tarifa|taxa|estorno|cancelado|aprovado|rejeitado|compra|venda|op|"
+        r"sistema|relatorio|projeto|arquivo|anexo|dados|info|usuario|senha|login|id|codigo|protocolo|veiculo|carro|moto|placa|chassi|renavam)\b", 
+        re.IGNORECASE
+    )
     for typ, pat in REGEX.items():
         if typ == "DATE_TIME" or (not anon_loc and typ in ["COORD", "COORD_SINGLE"]): continue
         for match in pat.finditer(text):
             val = match.group()
-            
             if typ == "GENERIC_CODE" and (not any(c.isdigit() for c in val) or len(val) < 6): 
                 continue
-
             if typ in TRUSTED_TAGS:
                 found.append((match.start(), match.end(), val, typ))
             else:
@@ -195,12 +239,12 @@ def _detect_all(text: str, anon_loc: bool):
 
     for match in CONTEXT_NAME_REGEX.finditer(text):
         val = match.group(2).strip()
-        if len(val) >= 3 and _is_valid_entity_ollama(val, "PER"):
+        if len(val) >= 3 and not INVALID_NAME_WORDS.search(val) and _is_valid_entity_ollama(val, "PER"):
             found.append((match.start(2), match.end(2), text[match.start(2):match.end(2)], "PER"))
 
     for match in NAME_FALLBACK_REGEX.finditer(text):
         val = match.group().strip()
-        if len(val) >= 3 and _is_valid_entity_ollama(val, "PER"):
+        if len(val) >= 3 and not INVALID_NAME_WORDS.search(val) and _is_valid_entity_ollama(val, "PER"):
             found.append((match.start(), match.end(), val, "PER"))
 
     if nlp:
@@ -210,7 +254,7 @@ def _detect_all(text: str, anon_loc: bool):
         for ent in doc.ents:
             if ent.label_ == "PER":
                 val_clean = ent.text.strip(".,;:?!() \n'\"")
-                if len(val_clean) < 3 or any(char.isdigit() for char in val_clean): 
+                if len(val_clean) < 3 or any(char.isdigit() for char in val_clean) or INVALID_NAME_WORDS.search(val_clean): 
                     continue
 
                 logger.debug(f"spaCy encontrou '{val_clean}'. Solicitando palavra final da LLM.")
@@ -253,6 +297,8 @@ def _get_fake(value: str, typ: str) -> str:
     elif typ == "IP": val = fake.ipv4()
     elif typ == "CHASSI": val = "".join(local_rand.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
     elif typ in ["COORD", "COORD_SINGLE"]: val = re.sub(r"-?\d{1,3}[.,]\d+", lambda m: apply_gps_jitter(m.group(0)), value)
+    elif typ == "DOC_GENERICO": 
+        val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else c for c in clean_value])
     elif typ == "GENERIC_CODE": val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else (local_rand.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
     else: val = fake.word().upper()
 
@@ -289,7 +335,6 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             return texto_final, ("TEXT" if texto_final != text else None)
 
         return text, None
-
     except Exception as e:
         logger.error(f"Erro na máscara da coluna '{col_name}': {e}")
         return str(val), None 
