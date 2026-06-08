@@ -11,7 +11,6 @@ import psutil
 import os
 import pyodbc
 from concurrent.futures import ProcessPoolExecutor
-import difflib
 import db_utils
 import anonymizer
 import json
@@ -116,6 +115,12 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
 
     logger.debug(f"Trabalhando em chunk de {len(rows)} linhas...")
 
+    colunas_da_tabela = list(rows[0].keys())
+    colunas_alvo_reais = [c for c in colunas_da_tabela if c in target_columns]
+
+    if colunas_alvo_reais:
+        anonymizer.setup_column_policies(rows, colunas_alvo_reais)
+
     gps_pair = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
     gps_single = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*$")
     uuid_regex = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
@@ -126,12 +131,15 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
         row_dict = dict(r)
 
         for col, old in row_dict.items():
+            if not target_columns or col not in target_columns:
+                continue
+
             if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool', 'int', 'float']:
                 continue
 
             old_str = str(old).strip()
 
-            if uuid_regex.match(old_str) or not target_columns or col not in target_columns:
+            if uuid_regex.match(old_str):
                 continue
 
             if anon_geo:
@@ -148,37 +156,29 @@ def process_chunk_parallel(rows, modo, anon_geo, target_columns):
 
             try:
                 vault = {}
-                def hide(match):
-                    token = f"__SHLD{len(vault)}__"
-                    vault[token] = match.group(0)
-                    return f" {token} "
-
                 safe_text = old_str
-                safe_text = html_regex.sub(hide, safe_text)
-                safe_text = re.sub(r'\s+', ' ', safe_text).strip()
+                
+                if "<" in safe_text or "&" in safe_text:
+                    def hide(match):
+                        token = f" __SHLD{len(vault)}__ "
+                        vault[token.strip()] = match.group(0)
+                        return token
+                    
+                    safe_text = html_regex.sub(hide, safe_text)
+                    safe_text = re.sub(r'\s+', ' ', safe_text).strip()
                 
                 chunks = split_text_into_chunks(safe_text)
                 anon_chunks = []
                 
                 for chunk in chunks:
-                    new_val, flag = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo)
-                    str_new_val = str(new_val)
-                    
-                    if str_new_val != chunk:
-                        seq = difflib.SequenceMatcher(None, chunk.split(), str_new_val.split())
-                        for tag, i1, i2, j1, j2 in seq.get_opcodes():
-                            if tag == 'replace':
-                                termo_original = " ".join(chunk.split()[i1:i2])
-                                termo_falso = " ".join(str_new_val.split()[j1:j2])
-                                if "__SHLD" not in termo_original:
-                                    logger.info(f"🕵️ [TROCA IA | {col}] {termo_original} ➡️ {termo_falso}")
-                    
-                    anon_chunks.append(str_new_val)
+                    new_val, _ = anonymizer.anonymize_value(col, chunk, anon_location=anon_geo)
+                    anon_chunks.append(str(new_val))
                 
                 final_text = " ".join(anon_chunks)
 
-                for token, original in vault.items():
-                    final_text = final_text.replace(f" {token} ", original).replace(token, original)
+                if vault:
+                    for token, original in vault.items():
+                        final_text = final_text.replace(f" {token} ", original).replace(token, original)
 
                 row_dict[col] = final_text
 
@@ -395,7 +395,6 @@ if start_btn:
 estado_atual = load_progress()
 
 if estado_atual:
-    # SE O PIPELINE AINDA ESTIVER A RODAR:
     if not estado_atual.get("finalizado", True):
         st.info("🔄 O processo está rodando no servidor. Você pode minimizar a tela ou usar o botão abaixo para atualizar.")
 
