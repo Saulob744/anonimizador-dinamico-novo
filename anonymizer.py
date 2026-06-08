@@ -8,23 +8,27 @@ import logging
 import requests
 import html
 import hmac
+import json
 from collections import Counter
 from functools import lru_cache
 from faker import Faker
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
 
 SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "SaltDeEmergenciaApenasParaDesenvolvimento123!")
-if SECRET_SALT == "SaltDeEmergenciaApenasParaDesenvolvimento123!":
-    logger.warning("ANONYMIZER_SECRET_SALT ausente/fraco. Usando default inseguro.")
 
 try:
     import spacy
-    nlp = spacy.load("pt_core_news_lg")
+    nlp = spacy.load("pt_core_news_lg", disable=["parser", "attribute_ruler", "lemmatizer", "tok2vec"])
 except OSError:
     logger.warning("spaCy não encontrado.")
     nlp = None
+
+# =========================================================
+# OTIMIZAÇÃO 1: TÚNEL HTTP PERSISTENTE
+# =========================================================
+http_session = requests.Session()
 
 _MAPPING_CACHE = {}
 _COLUMN_POLICIES = {} 
@@ -58,37 +62,51 @@ NAME_FALLBACK_REGEX = re.compile(r"\b(?:[A-ZÀ-Ÿ][a-zà-ÿ]+|[A-ZÀ-Ÿ]{2,})(?:
 def _ask_llm_yes_no(prompt: str, cache_key: str) -> bool:
     if cache_key in _OLLAMA_CACHE:
         return _OLLAMA_CACHE[cache_key]
-
     try:
-        logger.debug(f"Enviando para LLM (Cache Miss): {cache_key}")
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = requests.post(OLLAMA_URL, json=payload, timeout=15)
+        resp = http_session.post(OLLAMA_URL, json=payload, timeout=15)
         if resp.status_code == 200:
-            ans = resp.json().get("response", "").strip().upper()
-            is_yes = "SIM" in ans
+            is_yes = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_yes
-            logger.debug(f"LLM Respondeu: {'SIM' if is_yes else 'NAO'}")
             return is_yes
-    except Exception as e:
-        logger.error(f"Falha na comunicação com LLM: {e}")
-    
+    except Exception:
+        pass
     return False
 
-def _is_valid_entity_ollama(text: str, tag: str) -> bool:
-    if len(text.strip()) < 3: return False
+def _ask_llm_batch(candidates: list) -> list:
+    if not candidates: return []
+    unknowns, approved = [], []
     
-    esqueleto = re.sub(r'\d+', '[NUM]', text.upper())
-    if esqueleto in _NEGATIVE_PATTERN_CACHE: 
-        logger.debug(f"Rejeitado por Negative Cache: {text}")
-        return False
+    for c in set(candidates):
+        key = f"PER:{c.upper()}"
+        if key in _OLLAMA_CACHE:
+            if _OLLAMA_CACHE[key]: approved.append(c)
+        else:
+            unknowns.append(c)
+            
+    if not unknowns: return approved
+    
+    prompt = (
+        f"Retorne APENAS os nomes próprios de PESSOAS HUMANAS presentes na lista.\n"
+        f"Descarte empresas, ruas, bairros, cidades ou jargões operacionais.\n"
+        f"Lista: {unknowns}\n"
+        f"Responda no formato JSON estrito: {{\"nomes_reais\": [\"Nome\"]}}"
+    )
+    
+    try:
+        payload = {"model": OLLAMA_MODEL, "prompt": prompt, "format": "json", "stream": False, "options": {"temperature": 0.0}}
+        resp = http_session.post(OLLAMA_URL, json=payload, timeout=20)
+        if resp.status_code == 200:
+            data = json.loads(resp.json().get("response", ""))
+            reais = [str(n).upper() for n in data.get("nomes_reais", [])]
+            for c in unknowns:
+                valido = any(c.upper() in n or n in c.upper() for n in reais)
+                _OLLAMA_CACHE[f"PER:{c.upper()}"] = valido
+                if valido: approved.append(c)
+    except Exception:
+        for c in unknowns: _OLLAMA_CACHE[f"PER:{c.upper()}"] = False
         
-    cache_key = f"{tag}:{text.upper()}"
-    prompt = f"Avalie o dado '{text}'. Ele pertence DEFINITIVAMENTE à categoria '{tag}' ou identifica uma pessoa real? Responda APENAS 'SIM' ou 'NAO'."
-    
-    result = _ask_llm_yes_no(prompt, cache_key)
-    if not result:
-        _NEGATIVE_PATTERN_CACHE.add(esqueleto)
-    return result
+    return approved
 
 class AegisClassifier:
     def __init__(self):
@@ -98,116 +116,96 @@ class AegisClassifier:
             "EMAIL": "EMAIL", "PHONE": "PHONE", "CHASSI": "CHASSI",
             "IP": "IP", "GENERIC_CODE": "GENERIC_CODE",
             "COORD": "COORD", "COORD_SINGLE": "COORD_SINGLE",
-            "DATE_TIME": "IGNORAR"
+            "DATE_TIME": "IGNORAR",
+            "TEXTO_LIVRE": "TEXTO_LIVRE",
+            "NOME_SOLTO": "NOME_SOLTO"
         }
 
-    def _analyze_with_regex(self, samples: list) -> dict:
-        scores = Counter()
-        total = len(samples)
-        if total == 0: return {}
-        for s in samples:
-            for tag, padrao in REGEX.items():
-                if padrao.search(s):
-                    scores[tag] += 1
-        return {tag: (count/total)*100 for tag, count in scores.items()}
-
     def get_column_tag(self, col_name: str, samples: list) -> str:
-        col_lower = col_name.lower().strip()
-        
-        if col_lower in ['cpf']: return "CPF"
-        if col_lower in ['rg']: return "RG"
-        if 'email' in col_lower: return "EMAIL"
-        if 'placa' in col_lower: return "PLATE"
-        
         amostras_limpas = [str(s).strip() for s in samples if s is not None and str(s).strip()]
         if not amostras_limpas: return "IGNORAR"
-        amostras_unicas = list(set(amostras_limpas))[:15]
+        amostras_unicas = list(set(amostras_limpas))[:20]
+        total = len(amostras_unicas)
 
-        media_palavras = sum(len(s.split()) for s in amostras_unicas) / len(amostras_unicas)
-        tem_pontuacao_de_frase = any(re.search(r'[,.!?]\s+[A-Z]', s) for s in amostras_unicas)
+        placar = Counter()
+        col_lower = col_name.lower().strip()
+
+        peso_nome = total * 0.4 
+        if 'cpf' in col_lower: placar["CPF"] += peso_nome
+        if 'rg' in col_lower or 'identidade' in col_lower: placar["RG"] += peso_nome
+        if 'email' in col_lower: placar["EMAIL"] += peso_nome
+        if 'placa' in col_lower: placar["PLATE"] += peso_nome
+        if any(x in col_lower for x in ['lat', 'lon', 'coord']): placar["COORD_SINGLE"] += peso_nome
         
-        if media_palavras >= 4 or any(len(s) > 60 for s in amostras_unicas) or tem_pontuacao_de_frase:
-            logger.info(f"Coluna '{col_name}' identificada como TEXTO_LIVRE por estrutura de frase.")
-            return "TEXTO_LIVRE"
+        for s in amostras_unicas:
+            tamanho_string = max(len(s), 1)
+            for tag, padrao in REGEX.items():
+                match = padrao.search(s)
+               
+                if match and (len(match.group()) / tamanho_string) >= 0.8:
+                    placar[tag] += 1
 
-        col_lower = col_name.lower()
-        if any(termo in col_lower for termo in {'cidade', 'municipio', 'estado', 'pais', 'uf', 'bairro', 'cep', 'status', 'tipo', 'categoria', 'marca', 'modelo', 'cor', 'produto', 'data'}):
-            logger.info(f"Coluna {col_name} ignorada por heurística de nome.")
-            return "IGNORAR"
-
-        regex_scores = self._analyze_with_regex(amostras_unicas)
-        top_regex_tag = max(regex_scores, key=regex_scores.get, default=None)
-
-        if top_regex_tag and top_regex_tag != "DATE_TIME":
-            policy_tag = self.FAST_TRACK_MAP.get(top_regex_tag)
-            score = regex_scores[top_regex_tag]
-            
-            if score >= 80.0:
-                logger.info(f"Regex cravou '{policy_tag}' com {score:.1f}% de precisão. IA ignorada.")
-                return policy_tag
-
-            logger.info(f"Regex sugeriu '{policy_tag}' ({score:.1f}%). Solicitando palavra final da LLM.")
-            amostra_str = " | ".join(amostras_unicas[:5])
-            prompt_confirmacao = f"A amostra de dados '{amostra_str}' corresponde à categoria '{policy_tag}'? Responda APENAS 'SIM' ou 'NAO'."
-            
-            if _ask_llm_yes_no(prompt_confirmacao, f"COL_{col_name}_{policy_tag}"):
-                return policy_tag
+        media_palavras = sum(len(s.split()) for s in amostras_unicas) / total
+        tem_pontuacao_frase = any(re.search(r'[,.!?]\s+[A-Z]', s) for s in amostras_unicas)
+        
+        if media_palavras >= 3 or tem_pontuacao_frase:
+            placar["TEXTO_LIVRE"] += total * 0.8 
 
         if nlp:
             per_count = sum(1 for s in amostras_unicas if any(ent.label_ == "PER" for ent in nlp(s.title()).ents))
-            if (per_count / len(amostras_unicas)) * 100 >= 30.0:
-                logger.info(f"spaCy encontrou possíveis Nomes na coluna '{col_name}'. Validando com LLM.")
-                prompt_spacy = f"A amostra '{' | '.join(amostras_unicas[:5])}' contém nomes próprios de pessoas reais? Responda APENAS 'SIM' ou 'NAO'."
-                if _ask_llm_yes_no(prompt_spacy, f"COL_{col_name}_NOME_SOLTO"):
-                    return "NOME_SOLTO"
+            placar["NOME_SOLTO"] += per_count 
 
-            logger.info(f"Fallback acionado para '{col_name}'. LLM decidirá se é TEXTO_LIVRE.")
-            prompt_fallback = f"A amostra '{' | '.join(amostras_unicas[:5])}' possui qualquer dado pessoal identificável ou texto narrativo sensível? Responda APENAS 'SIM' ou 'NAO'."
-            if _ask_llm_yes_no(prompt_fallback, f"COL_FALLBACK_{col_name}"):
-                return "TEXTO_LIVRE"
+        # ========================================================
+        # O JULGAMENTO DA BALANÇA
+        # ========================================================
+        if placar:
+            vencedor, pontuacao = placar.most_common(1)[0]
+            confianca = pontuacao / total
+
+            if confianca >= 0.7:
+                tag_final = self.FAST_TRACK_MAP.get(vencedor, vencedor)
+                logger.debug(f"⚖️ Balança aprovou '{col_name}' como {tag_final} (Confiança: {confianca*100:.1f}%)")
+                return tag_final
+            
+            elif confianca >= 0.4:
+                amostra_str = " | ".join(amostras_unicas[:5])
+                prompt = f"A amostra '{amostra_str}' da coluna '{col_name}' é do tipo '{vencedor}' ou contém nomes de pessoas? Responda APENAS 'SIM' ou 'NAO'."
+                logger.debug(f"⚖️ Balança indecisa para '{col_name}'. Chamando IA...")
+                if _ask_llm_yes_no(prompt, f"COL_CONFIRM_{col_name}_{vencedor}"):
+                    return self.FAST_TRACK_MAP.get(vencedor, vencedor)
+
+        if any(termo in col_lower for termo in {'cidade', 'estado', 'pais', 'bairro', 'cep', 'status', 'tipo', 'marca', 'cor', 'data', 'hora'}):
+            return "IGNORAR"
+            
+        prompt_fallback = f"A amostra '{' | '.join(amostras_unicas[:5])}' da coluna '{col_name}' possui dados pessoais identificáveis ou texto sensível? Responda APENAS 'SIM' ou 'NAO'."
+        if _ask_llm_yes_no(prompt_fallback, f"COL_FALLBACK_{col_name}"): 
+            return "TEXTO_LIVRE"
 
         return "IGNORAR"
 
+
 _aegis_engine = AegisClassifier()
 
-# =========================================================================
-    # MOTOR DINÂMICO DE REJEIÇÃO
-    # =========================================================================
-def is_dynamic_jargon(texto_candidato: str) -> bool:
-        t_limpo = ''.join(c for c in unicodedata.normalize('NFD', texto_candidato.lower()) if unicodedata.category(c) != 'Mn')
+
+def setup_column_policies(rows: list, target_columns: list):
+   
+    if not target_columns: return
+
+    for col in target_columns:
+        if col in _COLUMN_POLICIES:
+            continue
         
-        if not any(v in t_limpo for v in 'aeiouy'):
-            return True
-
-        if not nlp:
-            return False
-
-        doc = nlp(texto_candidato)
-
-        for ent in doc.ents:
-            if ent.label_ in ["ORG", "MISC", "LOC"]:
-                return True
-
-        for token in doc:
-            if token.is_upper and len(token.text) <= 4:
-                return True
-
-            if token.pos_ in ["NUM", "SYM", "PUNCT", "VERB"]:
-                if token.is_title:
-                    continue
-                return True
+        samples = []
+        for r in rows:
+            val = r.get(col)
+            if val is not None and str(val).strip():
+                samples.append(str(val).strip())
+                if len(samples) >= 20: break
                 
-            morfologia = str(token.morph)
-            if "VerbForm=Part" in morfologia or "VerbForm=Ger" in morfologia:
-                return True
-
-        return False
-    # =========================================================================
-
-def define_column_policy(col_name: str, sample_values: list) -> str:
-    if col_name not in _COLUMN_POLICIES: 
-        _COLUMN_POLICIES[col_name] = _aegis_engine.get_column_tag(col_name, sample_values)
-    return _COLUMN_POLICIES[col_name]
+        if samples:
+            decisao = _aegis_engine.get_column_tag(col, samples)
+            _COLUMN_POLICIES[col] = decisao
+            logger.info(f"📊 Coluna '{col}' classificada como: {decisao}")
 
 @lru_cache(maxsize=100000)
 def _normalize(text: str) -> str:
@@ -216,52 +214,51 @@ def _normalize(text: str) -> str:
 
 def _detect_all(text: str, anon_loc: bool):
     found = []
-    TRUSTED_TAGS = {"CPF", "RG", "EMAIL", "IP", "PLATE", "CHASSI", "PHONE", "COORD", "COORD_SINGLE"}
     
-    INVALID_NAME_WORDS = re.compile(
+    TRUSTED_TAGS = {"CPF", "RG", "EMAIL", "IP", "PLATE", "CHASSI", "PHONE", "COORD", "COORD_SINGLE", "DOC_GENERICO", "GENERIC_CODE"}
+    
+    INVALID_WORDS = re.compile(
         r"\b(rua|avenida|av|travessa|trav|praça|praca|alameda|rodovia|rod|bairro|lote|lt|quadra|qd|condominio|cond|edificio|ed|bloco|apartamento|apto|casa|km|br|centro|jardim|jd|parque|pq|vila|"
         r"pgto|pagamento|pago|efetuado|transferencia|transf|pix|banco|agencia|conta|boleto|valor|saldo|debito|credito|tarifa|taxa|estorno|cancelado|aprovado|rejeitado|compra|venda|op|"
         r"sistema|relatorio|projeto|arquivo|anexo|dados|info|usuario|senha|login|id|codigo|protocolo|veiculo|carro|moto|placa|chassi|renavam)\b", 
         re.IGNORECASE
     )
+    
+    suspect_names = []
+
     for typ, pat in REGEX.items():
         if typ == "DATE_TIME" or (not anon_loc and typ in ["COORD", "COORD_SINGLE"]): continue
         for match in pat.finditer(text):
             val = match.group()
-            if typ == "GENERIC_CODE" and (not any(c.isdigit() for c in val) or len(val) < 6): 
-                continue
+            if typ == "GENERIC_CODE" and (not any(c.isdigit() for c in val) or len(val) < 6): continue
+            
             if typ in TRUSTED_TAGS:
                 found.append((match.start(), match.end(), val, typ))
-            else:
-                logger.debug(f"Regex encontrou {val} como {typ}. Solicitando IA.")
-                if _is_valid_entity_ollama(val, typ):
-                    found.append((match.start(), match.end(), val, typ))
 
     for match in CONTEXT_NAME_REGEX.finditer(text):
         val = match.group(2).strip()
-        if len(val) >= 3 and not INVALID_NAME_WORDS.search(val) and _is_valid_entity_ollama(val, "PER"):
-            found.append((match.start(2), match.end(2), text[match.start(2):match.end(2)], "PER"))
+        if len(val) >= 3 and not INVALID_WORDS.search(val):
+            suspect_names.append((match.start(2), match.end(2), val))
 
     for match in NAME_FALLBACK_REGEX.finditer(text):
         val = match.group().strip()
-        if len(val) >= 3 and not INVALID_NAME_WORDS.search(val) and _is_valid_entity_ollama(val, "PER"):
-            found.append((match.start(), match.end(), val, "PER"))
+        if len(val) >= 3 and not INVALID_WORDS.search(val):
+            suspect_names.append((match.start(), match.end(), val))
 
     if nlp:
-        is_bad_casing = text.isupper() or text.islower()
-        doc = nlp(text.title() if is_bad_casing else text)
-        
+        doc = nlp(text.title() if text.isupper() or text.islower() else text)
         for ent in doc.ents:
             if ent.label_ == "PER":
                 val_clean = ent.text.strip(".,;:?!() \n'\"")
-                if len(val_clean) < 3 or any(char.isdigit() for char in val_clean) or INVALID_NAME_WORDS.search(val_clean): 
-                    continue
-
-                logger.debug(f"spaCy encontrou '{val_clean}'. Solicitando palavra final da LLM.")
-                if _is_valid_entity_ollama(val_clean, "PER"):
+                if len(val_clean) >= 3 and not any(char.isdigit() for char in val_clean) and not INVALID_WORDS.search(val_clean): 
                     start = text.find(val_clean, max(0, ent.start_char - 2))
-                    if start != -1:
-                        found.append((start, start + len(val_clean), val_clean, "PER"))
+                    if start != -1: suspect_names.append((start, start + len(val_clean), val_clean))
+
+    if suspect_names:
+        unique_names = list(set([item[2] for item in suspect_names]))
+        approved_names = _ask_llm_batch(unique_names)
+        for s, e, v in suspect_names:
+            if v in approved_names: found.append((s, e, v, "PER"))
 
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
@@ -272,16 +269,13 @@ def _detect_all(text: str, anon_loc: bool):
     return clean
 
 def apply_gps_jitter(coord_str):
-    try:
-        return f"{float(coord_str.replace(',', '.')) + random.uniform(-0.003, 0.003):.6f}"
-    except ValueError:
-        return coord_str
+    try: return f"{float(coord_str.replace(',', '.')) + random.uniform(-0.003, 0.003):.6f}"
+    except ValueError: return coord_str
 
 def _get_fake(value: str, typ: str) -> str:
     clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
     norm_val = _normalize(clean_value)
     cache_key = f"{typ}:{norm_val}"
-    
     if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
 
     seed_int = int(hmac.new(SECRET_SALT.encode('utf-8'), norm_val.encode('utf-8'), hashlib.sha256).hexdigest()[:16], 16)
@@ -297,8 +291,7 @@ def _get_fake(value: str, typ: str) -> str:
     elif typ == "IP": val = fake.ipv4()
     elif typ == "CHASSI": val = "".join(local_rand.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
     elif typ in ["COORD", "COORD_SINGLE"]: val = re.sub(r"-?\d{1,3}[.,]\d+", lambda m: apply_gps_jitter(m.group(0)), value)
-    elif typ == "DOC_GENERICO": 
-        val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else c for c in clean_value])
+    elif typ == "DOC_GENERICO": val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else c for c in clean_value])
     elif typ == "GENERIC_CODE": val = "".join([str(local_rand.randint(0, 9)) if c.isdigit() else (local_rand.choice(string.ascii_uppercase) if c.isalpha() else c) for c in clean_value])
     else: val = fake.word().upper()
 
@@ -310,25 +303,29 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         if val is None or not str(val).strip(): return val, None
         text = str(val).strip()
         
-        politica_execucao = define_column_policy(col_name, [text])
+        politica_execucao = _COLUMN_POLICIES.get(col_name, "TEXTO_LIVRE")
 
-        if politica_execucao == "IGNORAR":
-            return text, None
+        if politica_execucao == "IGNORAR": return text, None
             
         if politica_execucao in ["NOME_SOLTO", "COORD", "COORD_SINGLE", "PLACA", "CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE", "DOC_GENERICO"]:
             fake_val = _get_fake(text, politica_execucao)
+            if fake_val != text:
+                logger.info(f"🕵️ [TROCA DIRETA | {col_name}] '{text}' ➡️ '{fake_val}'")
             return fake_val, ("TEXT" if fake_val != text else None)
             
         if politica_execucao == "TEXTO_LIVRE":
-            logger.debug(f"Iniciando varredura profunda de texto livre na coluna {col_name}.")
             entities = _detect_all(text, anon_location)
             if not entities: return text, None
             
             result, last = [], 0
             for s, e, v, t in entities:
                 if s < last: continue
+                
+                fake_val = _get_fake(v, t)
+                logger.info(f"🕵️ [TROCA IA | {col_name}] '{v}' ➡️ '{fake_val}'")
+                
                 result.append(text[last:s])
-                result.append(_get_fake(v, t))
+                result.append(fake_val)
                 last = e
             result.append(text[last:])
             texto_final = "".join(result)
@@ -337,7 +334,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
         return text, None
     except Exception as e:
         logger.error(f"Erro na máscara da coluna '{col_name}': {e}")
-        return str(val), None 
+        return str(val), None
 
 def reset_memory():
     _MAPPING_CACHE.clear()
