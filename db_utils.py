@@ -26,9 +26,8 @@ def connect(url: str):
     backend = parsed.get_backend_name()
     server_url = parsed.set(database="postgres" if backend == "postgresql" else "master" if backend == "mssql" else None)
     
-    engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
-
     try:
+        engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
         with engine_server.connect() as conn:
             if backend == "postgresql":
                 if not conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": db_name}).scalar():
@@ -38,11 +37,24 @@ def connect(url: str):
             elif backend == "mssql":
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}') EXEC('CREATE DATABASE [{db_name}]')"))
     except Exception as e:
-        logger.error(f"Erro ao criar DB: {e}")
-        raise
+        logger.warning(f"⚠️ Acesso root bloqueado. Assumindo que '{db_name}' já existe. Seguindo para conexão normal...")
 
-    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
+    connect_args = {}
+    if backend == "postgresql":
+        connect_args = {
+            "keepalives": 1,
+            "keepalives_idle": 30,       
+            "keepalives_interval": 10,   
+            "keepalives_count": 5        
+        }
 
+    return create_engine(
+        url, 
+        pool_pre_ping=True, 
+        pool_recycle=1800,
+        connect_args=connect_args, 
+        future=True
+    )
 # ==================================================
 # UTILITÁRIOS E INSPEÇÃO
 # ==================================================

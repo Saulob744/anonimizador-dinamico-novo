@@ -96,15 +96,32 @@ def split_text_into_chunks(text, max_tokens=300):
     return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
 
 def build_url(db_type, user, password, host, port, db):
+    url = None
+    
     if db_type == "mssql":
-        driver = [d for d in pyodbc.drivers() if "SQL Server" in d][-1]
+        try:
+            driver = [d for d in pyodbc.drivers() if "SQL Server" in d][-1]
+        except IndexError:
+            driver = "ODBC Driver 17 for SQL Server"
+            
         if host and "localdb" in host.lower():
             odbc_str = rf"DRIVER={{{driver}}};SERVER=(localdb)\MSSQLLocalDB;DATABASE={db};Trusted_Connection=yes;"
-            return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
-        return f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
-    
-    prefix = "postgresql+psycopg2" if db_type == "postgresql" else "mysql+pymysql"
-    return f"{prefix}://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}"
+            url = f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
+        elif user and password:
+            url = f"mssql+pyodbc://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}"
+        else:
+            url = f"mssql+pyodbc://@{host}:{port}/{db}?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
+            
+    elif db_type == "postgresql":
+        url = f"postgresql+psycopg2://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}?client_encoding=utf8"
+        
+    elif db_type == "mysql":
+        url = f"mysql+pymysql://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}?charset=utf8mb4"
+
+    if url:
+        logger.debug(f"🔌 Tentando conexão -> Tipo: {db_type} | Host: {host} | Banco: {db} | Usuário: {user}")
+
+    return url
 
 # ==================================================
 # PROCESSAMENTO CENTRAL DAS LINHAS
