@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 _TABLE_CACHE = {}
 
 # ==================================================
-# CONEXÃO E CRIAÇÃO DE BANCO
+# CONEXÃO E CRIAÇÃO DE BANCOS
 # ==================================================
 def connect(url: str):
     parsed = make_url(url)
