@@ -119,8 +119,23 @@ def copy_schema(src_engine, dst_engine, schema):
 # LEITURA E ESCRITA 
 # ==================================================
 def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
+    key = f"{schema}.{table}"
+    
+    if key not in _TABLE_CACHE:
+        _TABLE_CACHE[key] = sa.Table(table, sa.MetaData(), autoload_with=engine, schema=schema)
+    t_ref = _TABLE_CACHE[key]
+
+    select_cols = []
+    for col in t_ref.columns:
+        if isinstance(col.type, (sa.Date, sa.DateTime, sa.TIMESTAMP, sa.TIME)):
+            select_cols.append(sa.cast(col, sa.String).label(col.name))
+        else:
+            select_cols.append(col)
+
+    query = sa.select(*select_cols)
+
     with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(text(f"SELECT * FROM {format_table_name(engine, schema, table)}"))
+        result = conn.execution_options(stream_results=True).execute(query)
         while rows := result.mappings().fetchmany(chunk_size):
             yield rows
 
