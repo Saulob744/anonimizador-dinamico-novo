@@ -64,7 +64,7 @@ def _ask_llm_yes_no(prompt: str, cache_key: str) -> bool:
         return _OLLAMA_CACHE[cache_key]
     try:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0, "num_predict": 5}}
-        resp = http_session.post(OLLAMA_URL, json=payload, timeout=15)
+        resp = http_session.post(OLLAMA_URL, json=payload, timeout=30)
         if resp.status_code == 200:
             is_yes = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_yes
@@ -95,7 +95,7 @@ def _ask_llm_batch(candidates: list) -> list:
     
     try:
         payload = {"model": OLLAMA_MODEL, "prompt": prompt, "format": "json", "stream": False, "options": {"temperature": 0.0}}
-        resp = http_session.post(OLLAMA_URL, json=payload, timeout=20)
+        resp = http_session.post(OLLAMA_URL, json=payload, timeout=30)
         if resp.status_code == 200:
             data = json.loads(resp.json().get("response", ""))
             reais = [str(n).upper() for n in data.get("nomes_reais", [])]
@@ -341,3 +341,78 @@ def reset_memory():
     _COLUMN_POLICIES.clear()
     _OLLAMA_CACHE.clear()
     _NEGATIVE_PATTERN_CACHE.clear()
+
+# =========================================================
+# FUNÇÕES DE APOIO E PROCESSAMENTO EM PARALELO
+# =========================================================
+
+def split_text_into_chunks(text, max_tokens=300):
+    words = text.split()
+    if len(words) <= max_tokens:
+        return [text]
+    return [" ".join(words[i : i + max_tokens]) for i in range(0, len(words), max_tokens)]
+
+def process_chunk_parallel(rows, modo, anon_geo, target_columns):
+
+    if modo != "🛡️ Anonimização Total" or not rows:
+        return rows
+
+    colunas_da_tabela = list(rows[0].keys())
+    colunas_alvo_reais = [c for c in colunas_da_tabela if c in target_columns]
+
+    if colunas_alvo_reais:
+        setup_column_policies(rows, colunas_alvo_reais)
+
+    html_regex = re.compile(r"<[^>]+>|&[a-zA-Z0-9#]+;")
+
+    processed = []
+    for r in rows:
+        row_dict = dict(r)
+
+        for col, old in row_dict.items():
+            if not target_columns or col not in target_columns:
+                continue
+
+            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool', 'int', 'float']:
+                continue
+
+            old_str = str(old).strip()
+
+            if len(old_str) in [32, 36] and re.match(r"^[0-9a-fA-F\-]{32,36}$", old_str):
+                continue
+
+            try:
+                vault = {}
+                safe_text = old_str
+                
+                if "<" in safe_text or "&" in safe_text:
+                    def hide(match):
+                        token_hash = hashlib.md5(match.group(0).encode()).hexdigest()[:6].upper()
+                        token = f" TAGX{token_hash} "
+                        vault[token.strip()] = match.group(0)
+                        return token
+                    
+                    safe_text = html_regex.sub(hide, safe_text)
+                    safe_text = re.sub(r'\s+', ' ', safe_text).strip()
+                
+                chunks = split_text_into_chunks(safe_text)
+                anon_chunks = []
+                for chunk in chunks:
+                    new_val, _ = anonymize_value(col, chunk, anon_location=anon_geo)
+                    anon_chunks.append(str(new_val))
+                final_text = " ".join(anon_chunks)
+
+                if vault:
+                    for token, original in vault.items():
+                        final_text = final_text.replace(f" {token} ", original).replace(token, original)
+
+                row_dict[col] = final_text
+
+            except Exception as e:
+                logger.error(f"⚠️ Erro ao mascarar coluna '{col}'. Detalhe técnico salvo em log debug.")
+                logger.debug(f"Falha técnica: {e}")
+                row_dict[col] = old_str 
+
+        processed.append(row_dict)
+
+    return processed

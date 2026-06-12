@@ -4,7 +4,6 @@ import random
 import string
 import logging
 import warnings
-import importlib
 import urllib.parse
 import time
 import psutil
@@ -66,9 +65,6 @@ logger = logging.getLogger(__name__)
 
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*resume_download.*")
-
-importlib.reload(db_utils)
-importlib.reload(anonymizer)
 
 st.set_page_config(page_title="🛡️ Aegis Anonymizer Pro", page_icon="🛡️", layout="wide")
 st.markdown("""
@@ -262,7 +258,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                             sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
                             
                             futures = [
-                                executor.submit(process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
+                                executor.submit(anonymizer.process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
                                 for sub_chunk in sub_chunks
                             ]
                             
@@ -276,7 +272,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                                     rows.extend(original_chunk)
                         else:
                             try:
-                                res = process_chunk_parallel(rows, modo, anon_geo, target_cols)
+                                res = anonymizer.process_chunk_parallel(rows, modo, anon_geo, target_cols)
                                 if res: rows = res
                             except Exception as e:
                                 logger.error(f"🚨 Erro no Single Core. Erro: {e}")

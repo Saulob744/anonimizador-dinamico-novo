@@ -1,3 +1,4 @@
+import os
 import logging
 import time
 import re
@@ -5,9 +6,16 @@ from collections import defaultdict, deque
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine.url import make_url
+import hashlib
 
 logger = logging.getLogger(__name__)
 _TABLE_CACHE = {}
+
+# ==================================================
+# PERFORMANCE E CPU
+# ==================================================
+def get_cpu_info() -> int:
+    return os.cpu_count() or 1
 
 # ==================================================
 # CONEXÃO E CRIAÇÃO DE BANCOS
@@ -55,6 +63,7 @@ def connect(url: str):
         connect_args=connect_args, 
         future=True
     )
+
 # ==================================================
 # UTILITÁRIOS E INSPEÇÃO
 # ==================================================
@@ -148,58 +157,44 @@ def insert_rows(engine, table_name, schema, rows, max_retries=3):
     table = _TABLE_CACHE[key]
     num_cols = len(table.columns)
 
-    max_rows_per_chunk = max(1, 30000 // num_cols)
+    max_rows_per_chunk = max(1, 30000 // max(num_cols, 1))
     sub_chunks = [rows[i:i + max_rows_per_chunk] for i in range(0, len(rows), max_rows_per_chunk)]
 
     for chunk in sub_chunks:
         success = False
+        
+        safe_rows = []
+        for row in chunk:
+            new_row = dict(row)
+            for col in table.columns:
+                val = new_row.get(col.name)
+                if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
+                    new_row[col.name] = val[:col.type.length]
+            safe_rows.append(new_row)
+
         for attempt in range(max_retries):
             try:
                 with engine.begin() as conn:
-                    safe_rows = []
-                    for row in chunk:
-                        new_row = dict(row)
-                        for col in table.columns:
-                            val = new_row.get(col.name)
-                            if isinstance(val, str):
-                                if hasattr(col.type, "length") and col.type.length and col.type.length in [11, 14, 9, 8]:
-                                    cleaned_val = re.sub(r"[.\-\s/]", "", val)
-                                    if len(cleaned_val) <= col.type.length:
-                                        val = cleaned_val
-                                if hasattr(col.type, "length") and col.type.length:
-                                    val = val[:col.type.length]
-                                new_row[col.name] = val
-                        safe_rows.append(new_row)
-                    
                     conn.execute(table.insert(), safe_rows)
                 success = True
                 break
             except Exception as e:
-                logger.warning(f"Retry {attempt+1} {key}: {e}")
+                logger.warning(f"⚠️ Retry {attempt+1} em {key}. Banco rejeitou o lote. Erro: {str(e)[:150]}...")
                 time.sleep(0.5)
 
         if not success:
-            logger.warning(f"⚠️ Ativando Fallback Unitário para isolar erro de restrição em: {key}")
-            for idx, row in enumerate(chunk):
+            logger.warning(f"🔄 Fallback Unitário ativado em {key}: Salvando linha a linha para isolar o erro.")
+            for idx, row in enumerate(safe_rows):
                 try:
-                    new_row = dict(row)
-                    for col in table.columns:
-                        val = new_row.get(col.name)
-                        if isinstance(val, str):
-                            if hasattr(col.type, "length") and col.type.length and col.type.length in [11, 14, 9, 8]:
-                                cleaned_val = re.sub(r"[.\-\s/]", "", val)
-                                if len(cleaned_val) <= col.type.length: val = cleaned_val
-                            if hasattr(col.type, "length") and col.type.length:
-                                val = val[:col.type.length]
-                            new_row[col.name] = val
-                    
                     with engine.begin() as trans_conn:
-                        trans_conn.execute(table.insert(), [new_row])
+                        trans_conn.execute(table.insert(), [row])
                 except Exception as inner_e:
-                    print(f"\n🚨 [ERRO DE BANCO DE DADOS DETECTADO EM: {key}]")
-                    print(f"👉 Mensagem: {str(inner_e)}")
-                    print(f"📌 Registro com Falha: {new_row}\n")
-                    logger.error(f"Falha definitiva no registro {idx} da tabela {key}")
+                 
+                    row_signature = hashlib.sha256(str(row).encode('utf-8')).hexdigest()[:8]
+                    
+                    logger.error(f"🚨 [FALHA DEFINITIVA NO REGISTRO - {key}]")
+                    logger.error(f"👉 Assinatura (Hash) do Registro: {row_signature}")
+                    logger.error(f"👉 Mensagem Técnica: {str(inner_e)[:200]}")
 
 def truncate_table(engine, table_name, schema):
     if not table_exists(engine, schema, table_name):
