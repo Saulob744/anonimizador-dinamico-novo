@@ -248,6 +248,8 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
             for s, t, t_count in work_list:
                 processed_tables += 1
 
+                cols_da_tabela = [c.split(".", 1)[1] for c in target_cols if c.startswith(f"{t}.")]
+
                 for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
                     chunk_start = time.time()
                     rows = [dict(r) for r in chunk]
@@ -258,7 +260,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                             sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
                             
                             futures = [
-                                executor.submit(anonymizer.process_chunk_parallel, sub_chunk, modo, anon_geo, target_cols)
+                                executor.submit(anonymizer.process_chunk_parallel, sub_chunk, modo, anon_geo, cols_da_tabela)
                                 for sub_chunk in sub_chunks
                             ]
                             
@@ -364,7 +366,7 @@ with st.sidebar:
                     for table in valid_tables:
                         info_tabela = db_utils.get_table_info(src_engine, table, schema)
                         for col_info in info_tabela.get("columns", []):
-                            todas_set.add(col_info["name"])
+                            todas_set.add(f"{table}.{col_info['name']}")
             
             todas = sorted(list(todas_set))
             st.session_state.todas_colunas_disponiveis = todas if todas else []
