@@ -247,8 +247,9 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
         with ProcessPoolExecutor(max_workers=n_cores) as executor:
             for s, t, t_count in work_list:
                 processed_tables += 1
-
-                cols_da_tabela = [c.split(".", 1)[1] for c in target_cols if c.startswith(f"{t}.")]
+                
+                prefixo = f"{t}."
+                cols_da_tabela = [c.replace(prefixo, "", 1) for c in target_cols if c.startswith(prefixo)]
 
                 for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
                     chunk_start = time.time()
@@ -274,7 +275,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                                     rows.extend(original_chunk)
                         else:
                             try:
-                                res = anonymizer.process_chunk_parallel(rows, modo, anon_geo, target_cols)
+                                res = anonymizer.process_chunk_parallel(rows, modo, anon_geo, cols_da_tabela)
                                 if res: rows = res
                             except Exception as e:
                                 logger.error(f"🚨 Erro no Single Core. Erro: {e}")
