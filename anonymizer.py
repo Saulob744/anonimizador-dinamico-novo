@@ -185,7 +185,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             primeiro_falso = parts_fake[0]
             ultimo_falso = parts_fake[-1]
             
-            # Regra de Segurança: Só mapeia sobrenomes soltos que tenham mais de 3 letras
+         
             # Isso evita que a IA substitua preposições "DE" soltas ou siglas do laudo
             if len(ultimo_real) > 3 and ultimo_real not in TERMOS_PROIBIDOS:
                 if ultimo_real not in local_replacements:
@@ -195,7 +195,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
                 if primeiro_real not in local_replacements:
                     local_replacements[primeiro_real] = primeiro_falso
 
-    # Ordena as chaves de substituição (Sempre do maior nome completo para o menor fragmento)
+
     sorted_targets = sorted(local_replacements.keys(), key=len, reverse=True)
     
     res = safe_text
