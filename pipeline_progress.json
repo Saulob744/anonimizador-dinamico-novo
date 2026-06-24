@@ -1,1 +1,1 @@
-{"fase": "Iniciando Processamento...", "tabelas_processadas": 0, "tabelas_total": 10, "linhas_processadas": 0, "linhas_total": 2522614, "velocidade": 0, "tempo_decorrido": 1.027085542678833, "finalizado": false}
+{"fase": "Processando: anon_s8_perguntas_respostas_laudo_necro", "tabelas_processadas": 1, "tabelas_total": 1, "linhas_processadas": 3400, "linhas_total": 10000, "velocidade": 1.4021363772015312, "tempo_decorrido": 2489.897314310074, "finalizado": false}
