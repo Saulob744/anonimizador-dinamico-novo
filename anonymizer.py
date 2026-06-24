@@ -168,14 +168,14 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
     unique_suspects = list(set(suspects))
     valid_names = _ask_llm_batch(unique_suspects)
     
-    # --- NOVA FASE: EXPANSAO DE CO-REFERENCIA (SOBRENOMES/NOMES ISOLADOS) ---
+    # --- NOVA FASE: EXPANSAO DE CO-REFERENCIA 
     local_replacements = {}
     
     for name in valid_names:
         fake_name = _get_consistent_fake_name(name)
         local_replacements[name] = fake_name
         
-        # Divide os nomes em partes para capturar menções isoladas ao longo do texto
+     
         parts_real = name.split()
         parts_fake = fake_name.split()
         
@@ -186,7 +186,7 @@ def anonymize_value(col_name: str, val, anon_location: bool = True):
             ultimo_falso = parts_fake[-1]
             
          
-            # Isso evita que a IA substitua preposições "DE" soltas ou siglas do laudo
+          
             if len(ultimo_real) > 3 and ultimo_real not in TERMOS_PROIBIDOS:
                 if ultimo_real not in local_replacements:
                     local_replacements[ultimo_real] = ultimo_falso
