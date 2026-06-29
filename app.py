@@ -307,6 +307,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
         db_utils.set_replication_mode(dst_engine, "origin")
         save_progress("Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
         logger.info("✅ Thread em background finalizada com sucesso!")
+        anonymizer.emitir_relatorio_auditoria()
 
     except Exception as e:
         logger.error(f"🚨 Erro Fatal no Background: {e}", exc_info=True)
