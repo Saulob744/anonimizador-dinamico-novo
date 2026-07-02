@@ -1,127 +1,84 @@
-Como Engenheiro de Segurança, vejo que o seu projeto evoluiu de um simples "script de substituição" para um verdadeiro **Motor de Prevenção de Perda de Dados (DLP)** de grau militar. O seu README antigo já não faz justiça ao que construímos.
+# 🛡️ Aegis Anonymizer Pro
 
-Vou reescrever a documentação completa em Markdown, estruturando o panorama geral da arquitetura atual, as dependências do Ollama e os guias de instalação (tanto o moderno via Docker quanto o clássico via máquina local com proxy).
-
-Copie o texto abaixo e cole no seu arquivo `README.md`:
+O **Aegis Anonymizer Pro** é um pipeline de Prevenção de Perda de Dados (DLP) projetado para ambientes de rede restrita. O sistema combina Processamento de Linguagem Natural (NLP) e Inteligência Artificial Local para mascarar identidades e localizações em bancos de dados relacionais, garantindo conformidade com a LGPD e soberania total dos dados (zero tráfego externo).
 
 ---
 
-# 🛡️ Aegis Anonymizer Pro (SESP Local AI Edition)
+## 🚀 Funcionalidades Principais
 
-O **Aegis Anonymizer Pro** é um pipeline híbrido de Prevenção de Perda de Dados (DLP) projetado para operar em ambientes de rede restrita e dados sensíveis (Secretaria de Segurança Pública - SESP).
-
-Ele substituiu a abordagem simples de *Find & Replace* por um motor cognitivo avançado. O sistema atua como um "tribunal de dados", combinando Matemática, Processamento de Linguagem Natural (NLP) e Inteligência Artificial Local para mascarar identidades e localizações em bancos de dados relacionais gigantescos, garantindo 100% de conformidade com a LGPD e soberania total (Zero tráfego externo).
-
-## 🚀 Arquitetura e Funcionalidades
-
-* **AegisClassifier (Zero Trust Radar):** Um classificador estatístico que analisa as primeiras 50 amostras válidas de cada coluna e toma decisões automáticas de roteamento (ex: Fast-Track para CPFs puros ou Fallback Paranoico para textos ambíguos).
-* **LLM Lockdown (Ollama/Llama 3):** IA operando com "camisa de força" cognitiva (`temperature: 0.0`, `top_k: 1`). Ele não conversa, atua estritamente como um juiz binário (SIM/NAO) para validação de nomes próprios em laudos de texto livre, sem alucinar.
-* **Determinismo Criptográfico (K-Anonimato):** Usando sementes `HMAC` e um `SECRET_SALT`, o mesmo dado real sempre gera o mesmo dado falso (ex: "João" sempre vira "Pedro"), permitindo cruzamento seguro de dados estatísticos.
-* **Desvio Espacial (GPS Jitter):** Máscara matemática aplicada sobre coordenadas geográficas (+/- 0.003 graus) que desloca a ocorrência do local exato, mas preserva a mancha criminal no mapa da cidade.
-* **Cofre de Formatação (HTML Vault):** Protege e devolve marcações de sistema (como `<br>`, `<div>`) intactas após a anonimização, garantindo que o front-end dos laudos não quebre.
-* **Ghost Worker (Processamento Paralelo):** Motor assíncrono projetado para "sugar", processar em múltiplos núcleos de CPU e replicar tabelas inteiras de banco de dados sem sobrecarregar a memória RAM.
+* **Classificador Estatístico:** Toma decisões automáticas de roteamento de dados com base em amostragem rápida.
+* **Motor de IA Local:** Utiliza LLM (Ollama/Llama 3) com parâmetros restritos para atuar estritamente como validador de dados, sem gerar textos livres.
+* **K-Anonimato Determinístico:** Garante que o mesmo dado real sempre gere a mesma máscara, permitindo cruzamentos estatísticos seguros.
+* **Desvio Espacial (GPS Jitter):** Aplica uma máscara matemática sobre coordenadas geográficas para proteger a localização exata, mantendo a mancha criminal geral.
+* **Cofre de Formatação:** Preserva marcações de sistema e HTML intactas durante o processo de anonimização.
+* **Processamento Paralelo:** Motor assíncrono projetado para a manipulação eficiente de grandes tabelas sem sobrecarga de memória RAM.
 
 ---
 
-## 🛠️ Pré-requisitos do Sistema
+## 🛠️ Pré-requisitos e Instalação da IA
 
-Para o motor de IA funcionar, você precisa do servidor cognitivo rodando em background:
+O motor de IA do Aegis depende de um servidor cognitivo rodando em background na sua máquina hospedeira.
 
-1. **Ollama:** Instalado e rodando (v0.1.x ou superior).
-2. **Modelo Llama 3:** O cérebro do sistema. Baixe executando o comando no terminal:
+1. **Instalação do Ollama:** Acesse o site oficial do Ollama, faça o download do executável padrão para o seu sistema operacional e conclua a instalação básica.
+2. **Download do Modelo:** Com o Ollama instalado e rodando, abra o seu terminal e execute o comando abaixo para baixar o modelo base (Llama 3):
+
 ```bash
 ollama pull llama3:latest
 
 ```
 
-
-3. **Python 3.10+** (Para execução Bare Metal).
-4. **Docker** (Opcional, mas recomendado para implantação).
+3. **Ambiente de Execução:** Python 3.10+ instalado na máquina.
+4. **Conteinerização:** Docker instalado (Opcional, mas recomendado).
 
 ---
 
-## 🐳 Método 1: Desempacotamento via Docker (Recomendado)
+## ⚙️ Execução do Sistema
 
-O método mais seguro para rodar a aplicação sem conflitos de bibliotecas na máquina do usuário.
+Você pode iniciar a aplicação utilizando Docker ou rodando diretamente na sua máquina local de forma nativa.
 
-**1. Construir a Imagem (Build):**
-No terminal, dentro da pasta do projeto, execute:
+### Método 1: Via Docker (Recomendado)
+
+Abra o terminal na pasta raiz do projeto e construa a imagem do sistema:
 
 ```powershell
 docker build -t aegis-motor .
 
 ```
 
-**2. Executar o Contêiner (Run):**
-Como o Ollama roda na máquina host do Windows e o código dentro do Docker, usamos `host.docker.internal` para criar a ponte segura:
+Em seguida, inicie o contêiner mapeando a comunicação para o Ollama local:
 
 ```powershell
 docker run -p 8501:8501 -e OLLAMA_URL="http://host.docker.internal:11434/api/generate" aegis-motor
 
 ```
 
-**3. Acessar o Painel:**
-Abra o navegador e acesse: `http://localhost:8501`
+### Método 2: Execução Local Nativa
 
----
-
-## 💻 Método 2: Execução "Bare Metal" (Máquina Local + Proxy SESP)
-
-Para rodar diretamente na máquina, especialmente atrás de firewalls e proxys corporativos rigorosos.
-
-### Passo A: Configurando a Rede e o Ollama (PowerShell)
-
-Abra um terminal PowerShell e rode este script para furar o proxy e subir a IA:
+Garanta que o servidor do Ollama já está rodando em background. Abra o terminal na pasta do projeto e prepare o ambiente Python:
 
 ```powershell
-# 1. Solicita credenciais do usuário para o Proxy
-$proxyUser = Read-Host "Digite seu usuário da SESP"
-$proxyPass = Read-Host "Digite sua senha" -AsSecureString
-
-# 2. Descriptografa a senha para injeção na variável
-$BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($proxyPass)
-$plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-
-# 3. Define as variáveis de ambiente para o Ollama conseguir "enxergar" a rede e baixar modelos
-$env:HTTP_PROXY = "http://${proxyUser}:${plainPassword}@proxy00.sesp.parana:8080"
-$env:HTTPS_PROXY = $env:HTTP_PROXY
-
-Write-Host "✅ Proxy configurado. Iniciando servidor..." -ForegroundColor Green
-
-# 4. Inicia o servidor Ollama (Mantenha esta janela aberta)
-ollama serve
-
-```
-
-### Passo B: Subindo a Interface Streamlit
-
-Abra um **segundo terminal**, ative seu ambiente virtual e inicie o motor Python:
-
-```powershell
-# 1. Ative o ambiente virtual
 .\.venv\Scripts\Activate.ps1
-
-# 2. Instale as dependências (Se for a primeira vez)
 pip install -r requirements.txt
 python -m spacy download pt_core_news_lg
-
-# 3. Inicie o sistema de controle Aegis
 streamlit run app.py
 
 ```
 
----
-
-## 📂 Estrutura Interna do Projeto
-
-* `app.py`: Interface gráfica interativa (Streamlit) e orquestrador de telemetria/estado.
-* `anonymizer.py`: O "Núcleo de DLP". Contém as Regex, a trava do LLM (`Ollama`), o classificador de colunas, os farejadores do `spaCy` e o cofre de HTML.
-* `db_utils.py` *(se aplicável)*: Orquestrador de chunks e comunicação com o banco de dados via SQLAlchemy/PyODBC.
-* `requirements.txt`: Relação de blindagem de bibliotecas (Pandas, Streamlit, Requests, Faker, spaCy).
+> **Nota de Acesso:** Em ambos os métodos, após iniciar o sistema, a interface gráfica estará disponível no seu navegador de preferência através do endereço `http://localhost:8501`.
 
 ---
 
-## 🔒 Segurança e Soberania (LGPD)
+## 📂 Estrutura do Projeto
 
-Este software foi auditado para **não realizar saídas de rede externa** durante o processamento de dados.
-O tráfego de laudos e identidades ocorre estritamente pela porta `127.0.0.1:11434` (ou rede interna do Docker), morrendo na memória RAM imediatamente após a geração do dado K-Anonimizado. Nenhuma API de terceiros (como OpenAI ou Google) tem acesso à base criminal processada.
+| Arquivo | Função no Sistema |
+| --- | --- |
+| `app.py` | Interface interativa (Streamlit) e orquestrador de estado do usuário. |
+| `anonymizer.py` | Núcleo DLP contendo as expressões regulares, trava de LLM e processamento do spaCy. |
+| `db_utils.py` | Gerenciador de conexão com o banco e orquestrador de processamento em blocos. |
+| `requirements.txt` | Lista de bibliotecas de terceiros homologadas para o projeto. |
+
+---
+
+## 🔒 Diretrizes de Segurança (LGPD)
+
+Toda a arquitetura foi desenhada para processamento **offline e isolado**. O tráfego de laudos e identidades ocorre estritamente no ambiente local (`127.0.0.1`), sendo expurgado da memória RAM imediatamente após a geração do dado anonimizado. Nenhuma API externa ou serviço em nuvem tem acesso aos dados processados por esta ferramenta.
