@@ -1,15 +1,24 @@
+import os
 import logging
 import time
+import re
 from collections import defaultdict, deque
 import sqlalchemy as sa
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine.url import make_url
+import hashlib
 
 logger = logging.getLogger(__name__)
 _TABLE_CACHE = {}
 
 # ==================================================
-# CONEXÃO E CRIAÇÃO DE BANCO
+# PERFORMANCE E CPU
+# ==================================================
+def get_cpu_info() -> int:
+    return os.cpu_count() or 1
+
+# ==================================================
+# CONEXÃO E CRIAÇÃO DE BANCOS
 # ==================================================
 def connect(url: str):
     parsed = make_url(url)
@@ -25,9 +34,8 @@ def connect(url: str):
     backend = parsed.get_backend_name()
     server_url = parsed.set(database="postgres" if backend == "postgresql" else "master" if backend == "mssql" else None)
     
-    engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
-
     try:
+        engine_server = create_engine(server_url, isolation_level="AUTOCOMMIT", future=True)
         with engine_server.connect() as conn:
             if backend == "postgresql":
                 if not conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": db_name}).scalar():
@@ -37,10 +45,24 @@ def connect(url: str):
             elif backend == "mssql":
                 conn.execute(text(f"IF NOT EXISTS (SELECT name FROM sys.databases WHERE name = '{db_name}') EXEC('CREATE DATABASE [{db_name}]')"))
     except Exception as e:
-        logger.error(f"Erro ao criar DB: {e}")
-        raise
+        logger.warning(f"⚠️ Acesso root bloqueado. Assumindo que '{db_name}' já existe. Seguindo para conexão normal...")
 
-    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
+    connect_args = {}
+    if backend == "postgresql":
+        connect_args = {
+            "keepalives": 1,
+            "keepalives_idle": 30,       
+            "keepalives_interval": 10,   
+            "keepalives_count": 5        
+        }
+
+    return create_engine(
+        url, 
+        pool_pre_ping=True, 
+        pool_recycle=1800,
+        connect_args=connect_args, 
+        future=True
+    )
 
 # ==================================================
 # UTILITÁRIOS E INSPEÇÃO
@@ -103,11 +125,26 @@ def copy_schema(src_engine, dst_engine, schema):
                 logger.warning(f"CREATE SKIP {schema}.{table.name}: {e}")
 
 # ==================================================
-# LEITURA E ESCRITA (STREAMING & INSERT)
+# LEITURA E ESCRITA 
 # ==================================================
 def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
+    key = f"{schema}.{table}"
+    
+    if key not in _TABLE_CACHE:
+        _TABLE_CACHE[key] = sa.Table(table, sa.MetaData(), autoload_with=engine, schema=schema)
+    t_ref = _TABLE_CACHE[key]
+
+    select_cols = []
+    for col in t_ref.columns:
+        if isinstance(col.type, (sa.Date, sa.DateTime, sa.TIMESTAMP, sa.TIME)):
+            select_cols.append(sa.cast(col, sa.String).label(col.name))
+        else:
+            select_cols.append(col)
+
+    query = sa.select(*select_cols)
+
     with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(text(f"SELECT * FROM {format_table_name(engine, schema, table)}"))
+        result = conn.execution_options(stream_results=True).execute(query)
         while rows := result.mappings().fetchmany(chunk_size):
             yield rows
 
@@ -118,27 +155,46 @@ def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if key not in _TABLE_CACHE:
         _TABLE_CACHE[key] = sa.Table(table_name, sa.MetaData(), autoload_with=engine, schema=schema)
     table = _TABLE_CACHE[key]
+    num_cols = len(table.columns)
 
-    for attempt in range(max_retries):
-        try:
-            with engine.begin() as conn:
-                safe_rows = []
-                for row in rows:
-                    new_row = dict(row)
-                    for col in table.columns:
-                        val = new_row.get(col.name)
-                        # 🔥 FIX AQUI (SEGURANÇA REAL OTIMIZADA)
-                        if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
-                            new_row[col.name] = val[:col.type.length]
-                    safe_rows.append(new_row)
-                
-                conn.execute(table.insert(), safe_rows)
-            return
-        except Exception as e:
-            logger.warning(f"Retry {attempt+1} {key}: {e}")
-            time.sleep(1)
+    max_rows_per_chunk = max(1, 30000 // max(num_cols, 1))
+    sub_chunks = [rows[i:i + max_rows_per_chunk] for i in range(0, len(rows), max_rows_per_chunk)]
 
-    logger.error(f"❌ Falha definitiva: {key}")
+    for chunk in sub_chunks:
+        success = False
+        
+        safe_rows = []
+        for row in chunk:
+            new_row = dict(row)
+            for col in table.columns:
+                val = new_row.get(col.name)
+                if isinstance(val, str) and hasattr(col.type, "length") and col.type.length:
+                    new_row[col.name] = val[:col.type.length]
+            safe_rows.append(new_row)
+
+        for attempt in range(max_retries):
+            try:
+                with engine.begin() as conn:
+                    conn.execute(table.insert(), safe_rows)
+                success = True
+                break
+            except Exception as e:
+                logger.warning(f"⚠️ Retry {attempt+1} em {key}. Banco rejeitou o lote. Erro: {str(e)[:150]}...")
+                time.sleep(0.5)
+
+        if not success:
+            logger.warning(f"🔄 Fallback Unitário ativado em {key}: Salvando linha a linha para isolar o erro.")
+            for idx, row in enumerate(safe_rows):
+                try:
+                    with engine.begin() as trans_conn:
+                        trans_conn.execute(table.insert(), [row])
+                except Exception as inner_e:
+                 
+                    row_signature = hashlib.sha256(str(row).encode('utf-8')).hexdigest()[:8]
+                    
+                    logger.error(f"🚨 [FALHA DEFINITIVA NO REGISTRO - {key}]")
+                    logger.error(f"👉 Assinatura (Hash) do Registro: {row_signature}")
+                    logger.error(f"👉 Mensagem Técnica: {str(inner_e)[:200]}")
 
 def truncate_table(engine, table_name, schema):
     if not table_exists(engine, schema, table_name):
