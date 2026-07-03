@@ -1,32 +1,32 @@
 # ==========================================
 # 🌐 Web Framework & UI
 # ==========================================
-streamlit>=1.30
+streamlit>=1.30.0
 
 # ==========================================
 # 🗄️ Database & Conectividade
 # ==========================================
-sqlalchemy>=2.0
-psycopg2-binary>=2.9
-pyodbc>=5.0
-pymysql>=1.1
-pandas>=2.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0
+pyodbc>=5.0.0
+pymysql>=1.1.0
 
 # ==========================================
-# ⚙️ Utils & Sistema
+# 📄 Manipulação de Dados e Arquivos
 # ==========================================
-python-dotenv>=1.0
+pandas>=2.0.0
+PyPDF2>=3.0.0
+python-docx>=1.1.0
+fpdf>=1.7.2
+
+# ==========================================
+# ⚙️ Utils, Sistema e Rede (Ollama Bridge)
+# ==========================================
+python-dotenv>=1.0.0
 psutil>=5.9.0
+requests>=2.31.0
 
 # ==========================================
-# 🧠 NLP / IA / Motor de Anonimização
+# 🧠 Motor de Anonimização Híbrida
 # ==========================================
-faker>=24.0
-spacy>=3.7
-gliner>=0.2.0
-presidio-analyzer>=2.2.35
-torch>=2.0
-transformers>=4.40
-
-# Instrução de Instalação Pós-Requirements:
-# Lembre-se de rodar: python -m spacy download pt_core_news_lg
+faker>=24.0.0

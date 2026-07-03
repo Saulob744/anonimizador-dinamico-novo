@@ -3,18 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # =========================
-# 1. PROXY (opcional)
-# =========================
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-
-ENV http_proxy=$http_proxy
-ENV https_proxy=$https_proxy
-ENV no_proxy=$no_proxy
-
-# =========================
-# 2. DEPENDÊNCIAS SISTEMA + ODBC SQL SERVER
+# 1. DEPENDÊNCIAS SISTEMA
 # =========================
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -24,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     unixodbc-dev \
     ca-certificates \
     && mkdir -p /usr/share/keyrings \
-    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && curl -k -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" > /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update \
     && ACCEPT_EULA=Y apt-get install -y msodbcsql17 \
@@ -32,7 +21,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # =========================
-# 3. DEPENDÊNCIAS PYTHON
+# 2. DEPENDÊNCIAS PYTHON
 # =========================
 COPY requirements.txt .
 
@@ -43,17 +32,17 @@ RUN python -m pip install --no-cache-dir --upgrade pip && \
     --trusted-host pypi.python.org
 
 # =========================
-# 4. MODELO SPACY
+# 3. MODELO SPACY
 # =========================
 RUN python -m spacy download pt_core_news_lg
 
 # =========================
-# 5. APP
+# 4. APP
 # =========================
 COPY . .
 
 # =========================
-# 6. EXECUÇÃO
+# 5. EXECUÇÃO
 # =========================
 EXPOSE 8501
 ENV PYTHONUNBUFFERED=1
