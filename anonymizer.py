@@ -15,7 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ==============================================================================
-# ⚙️ CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
+# CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
 # ==============================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def emitir_relatorio_auditoria():
     print("="*70 + "\n")
 
 # ==============================================================================
-# 🧠 INICIALIZAÇÃO DO MOTOR DE NLP 
+# INICIALIZAÇÃO DO MOTOR DE NLP 
 # ==============================================================================
 try:
     import spacy
@@ -68,7 +68,7 @@ _OLLAMA_CACHE: dict = {}
 fake = Faker("pt_BR")
 
 # ==============================================================================
-# 🛡️ EXPRESSÕES REGULARES DO MOTOR
+# EXPRESSÕES REGULARES DO MOTOR
 # ==============================================================================
 REGEX = {
     "CPF": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){10}\d(?!\d)"),
@@ -100,7 +100,7 @@ INVALID_WORDS = re.compile(
 )
 
 # ==============================================================================
-# 🛠️ UTILITÁRIOS E CONEXÃO COM IA
+# UTILITÁRIOS E CONEXÃO COM IA
 # ==============================================================================
 def _farejador_sintatico(nome_sujo: str) -> str:
     if not nlp: return nome_sujo.strip()
@@ -263,7 +263,7 @@ def setup_column_policies(rows: list, target_columns: list):
         logger.info(f"📊 [PRO] Radar Top-Down classificou '{col}' como: {decisao} (Amostras analisadas: {len(amostra_topo)})")
 
 # ==============================================================================
-# 🔄 NORMALIZAÇÃO E GERAÇÃO DE FAKES
+# NORMALIZAÇÃO E GERAÇÃO DE FAKES
 # ==============================================================================
 @lru_cache(maxsize=100000)
 def _normalize(text: str) -> str:
@@ -323,7 +323,7 @@ def _get_fake(value: str, typ: str) -> str:
     return val
 
 # ==============================================================================
-# 🔍 MOTOR DE DETECÇÃO EM TEXTO LIVRE
+# MOTOR DE DETECÇÃO EM TEXTO LIVRE
 # ==============================================================================
 def _detect_all(text: str, anon_loc: bool):
     found = []
@@ -400,16 +400,19 @@ def _detect_all(text: str, anon_loc: bool):
 # ==============================================================================
 # SUBSTITUIÇÃO DE VALORES E PROCESSAMENTO HÍBRIDO
 # ==============================================================================
-def anonymize_value(col_name: str, val, regras_mascara: dict = None):
+def anonymize_value(col_name: str, val, regras_mascara=None):
     try:
         if val is None or not str(val).strip(): return val, None
         text = str(val).strip()
-        if regras_mascara is None: regras_mascara = {}
-        
+        if isinstance(regras_mascara, bool):
+            regras_mascara = {"COORD": regras_mascara, "COORD_SINGLE": regras_mascara}
+        elif regras_mascara is None: 
+            regras_mascara = {}
+            
         global _TELEMETRIA
         _TELEMETRIA["celulas_avaliadas"] += 1
         politica_execucao = _COLUMN_POLICIES.get(col_name, "TEXTO_LIVRE")
-
+        
         if politica_execucao == "IGNORAR": return text, None
         
         if politica_execucao in ["COORD", "COORD_SINGLE"] and not regras_mascara.get("COORD", True):
@@ -512,11 +515,13 @@ def process_chunk_parallel(rows, modo, regras_mascara, target_columns):
         processed.append(row_dict)
     return processed 
 
-def process_raw_text(text: str, regras_mascara: dict = None) -> str:
+def process_raw_text(text: str, regras_mascara=None) -> str:
     if not text or not str(text).strip():
         return text
         
-    if regras_mascara is None:
+    if isinstance(regras_mascara, bool):
+        regras_mascara = {"COORD": regras_mascara, "COORD_SINGLE": regras_mascara}
+    elif regras_mascara is None:
         regras_mascara = {}
         
     html_regex = re.compile(r"<[^>]+>")
