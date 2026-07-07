@@ -14,6 +14,7 @@ import json
 import threading
 import io
 import zipfile
+import csv
 from concurrent.futures import ProcessPoolExecutor 
 import anonymizer
 import db_utils
@@ -34,70 +35,43 @@ except ImportError: FPDF = None
 # SISTEMA DE MEMÓRIA E ESTADO
 # ==================================================
 STATUS_FILE = "pipeline_progress.json"
+FILE_STATUS_FILE = "file_pipeline_progress.json"
 
-def save_progress(fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False):
+if "CACHE_RESULTADOS_ARQUIVOS" not in st.session_state:
+    st.session_state.CACHE_RESULTADOS_ARQUIVOS = None
+if "file_process_started" not in st.session_state:
+    st.session_state.file_process_started = False
+
+def save_progress(arquivo_alvo, fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False):
     data = {
         "fase": fase, "tabelas_processadas": t_atual, "tabelas_total": t_total,
         "linhas_processadas": l_atual, "linhas_total": l_total,
         "velocidade": velocidade, "tempo_decorrido": tempo, "finalizado": finalizado
     }
     try:
-        with open(STATUS_FILE, "w", encoding="utf-8") as f:
+        with open(arquivo_alvo, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except Exception:
         pass
 
-def load_progress():
-    if os.path.exists(STATUS_FILE):
+def load_progress(arquivo_alvo):
+    if os.path.exists(arquivo_alvo):
         for _ in range(5):
             try:
-                with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                with open(arquivo_alvo, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:
                 time.sleep(0.1)
     return None
 
 def limpar_sessao():
-    if os.path.exists(STATUS_FILE):
-        try: os.remove(STATUS_FILE)
-        except Exception: pass
-    for key in ["analise_concluida", "todas_colunas_disponiveis", "colunas_selecionadas_finais", "processed_files"]:
+    for f in [STATUS_FILE, FILE_STATUS_FILE, "resultado_lote.zip"]:
+        if os.path.exists(f):
+            try: os.remove(f)
+            except Exception: pass
+    for key in ["analise_concluida", "todas_colunas_disponiveis", "colunas_selecionadas_finais", "CACHE_RESULTADOS_ARQUIVOS", "file_process_started"]:
         if key in st.session_state:
             del st.session_state[key]
-
-# ==================================================
-# ⏱️ HELPER: PROCESSAMENTO DE TEXTO COM ETA
-# ==================================================
-def process_text_with_eta(texto_bruto, regras_mascara, progress_bar, status_text):
-    if not texto_bruto.strip(): return texto_bruto
-    
-    blocos = re.split(r'(\n+)', texto_bruto)
-    chunks = []
-    current_chunk = ""
-    
-    for bloco in blocos:
-        current_chunk += bloco
-        if len(current_chunk) > 1000 and '\n' in bloco:
-            chunks.append(current_chunk)
-            current_chunk = ""
-    if current_chunk: chunks.append(current_chunk)
-        
-    total = len(chunks)
-    resultado = ""
-    start_time = time.time()
-    
-    for i, chunk in enumerate(chunks):
-        resultado += anonymizer.process_raw_text(chunk, regras_mascara)
-        
-        processed = i + 1
-        elapsed = time.time() - start_time
-        speed = processed / elapsed if elapsed > 0 else 0
-        eta = (total - processed) / speed if speed > 0 else 0
-        
-        if progress_bar: progress_bar.progress(processed / total)
-        if status_text: status_text.markdown(f"⏳ **Lendo fragmentos:** {processed}/{total} | ⚡ Vel: {speed:.1f} frag/s | ⏱️ ETA: {int(eta)}s")
-        
-    return resultado
 
 # ==================================================
 # CONFIGURAÇÕES DA TELA
@@ -146,12 +120,12 @@ def build_url(db_type, user, password, host, port, db):
     return url
 
 # ==================================================
-# O TRABALHADOR FANTASMA (BD)
+# O TRABALHADOR FANTASMA
 # ==================================================
 def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, regras_mascara, target_cols):
     t0_global = time.time()
     try:
-        save_progress("Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
+        save_progress(STATUS_FILE, "Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
         src_engine = db_utils.connect(build_url(db_type, **src_cfg))
         dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
         db_utils.set_replication_mode(dst_engine, "replica")
@@ -172,7 +146,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                 total_tables += 1
 
         if total_estimated == 0:
-            save_progress("Erro: Nenhuma linha encontrada.", 0, 0, 0, 0, 0, 0, finalizado=True)
+            save_progress(STATUS_FILE, "Erro: Nenhuma linha encontrada.", 0, 0, 0, 0, 0, 0, finalizado=True)
             return
 
         for s, t, _ in reversed(work_list): db_utils.truncate_table(dst_engine, t, s)
@@ -212,14 +186,114 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                     now = time.time()
                     if now - last_json_update > 2.5:
                         stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
-                        save_progress(f"Processando: {t}", processed_tables, total_tables, total_rows, total_estimated, stable_speed, now - t0_global, False)
+                        save_progress(STATUS_FILE, f"Processando: {t}", processed_tables, total_tables, total_rows, total_estimated, stable_speed, now - t0_global, False)
                         last_json_update = now
 
         db_utils.set_replication_mode(dst_engine, "origin")
-        save_progress("Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
+        save_progress(STATUS_FILE, "Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
 
     except Exception as e:
-        save_progress(f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
+        save_progress(STATUS_FILE, f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
+
+
+# ==================================================
+# O TRABALHADOR FANTASMA
+# ==================================================
+def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascara, colunas_ignoradas_csv, chunk_size, n_cores):
+    t0_global = time.time()
+    total_arquivos = len(arquivos_payload)
+    arquivos_prontos = []
+    
+    try:
+        save_progress(FILE_STATUS_FILE, "Iniciando Esteira de Arquivos...", 0, total_arquivos, 0, 100, 0, 0, False)
+        
+        for idx, arq in enumerate(arquivos_payload):
+            nome_base = arq["name"].rsplit('.', 1)[0]
+            extensao = arq["ext"]
+            bytes_in = arq["bytes"]
+            
+            save_progress(FILE_STATUS_FILE, f"Processando: {arq['name']}", idx, total_arquivos, 0, 100, 0, time.time()-t0_global, False)
+
+            if extensao in ["txt", "pdf"]:
+                texto_bruto = ""
+                if extensao == "txt":
+                    texto_bruto = bytes_in.decode("utf-8", errors='ignore')
+                elif extensao == "pdf":
+                    pdf_reader = PyPDF2.PdfReader(io.BytesIO(bytes_in))
+                    for pagina in pdf_reader.pages:
+                        txt_pg = pagina.extract_text()
+                        if txt_pg: texto_bruto += txt_pg + "\n\n"
+                
+                resultado_limpo = anonymizer.process_raw_text(texto_bruto, regras_mascara)
+                fmt_atual = extensao if formato_saida == "Manter Original" else formato_saida
+                
+                if fmt_atual == "txt":
+                    arquivos_prontos.append({"name": f"SEGURO_{nome_base}.txt", "data": resultado_limpo.encode('utf-8')})
+                elif fmt_atual == "pdf":
+                    pdf_out = FPDF()
+                    pdf_out.add_page(); pdf_out.set_font("Arial", size=11)
+                    pdf_out.multi_cell(0, 5, resultado_limpo.encode('latin-1', 'replace').decode('latin-1'))
+                    arquivos_prontos.append({"name": f"SEGURO_{nome_base}.pdf", "data": pdf_out.output(dest='S').encode('latin-1')})
+
+            elif extensao == "csv":
+                buffer_in = io.BytesIO(bytes_in)
+                buffer_out = io.BytesIO()
+                
+                amostra = buffer_in.read(4096).decode('utf-8', errors='ignore')
+                buffer_in.seek(0)
+                try: sep_detectado = csv.Sniffer().sniff(amostra).delimiter
+                except: sep_detectado = ','
+
+                df_header = pd.read_csv(io.BytesIO(bytes_in), sep=sep_detectado, encoding_errors='replace', on_bad_lines='skip', nrows=0)
+                cols_alvo = [c for c in df_header.columns if c not in colunas_ignoradas_csv]
+                
+                chunk_iter = pd.read_csv(buffer_in, sep=sep_detectado, encoding_errors='replace', on_bad_lines='skip', chunksize=chunk_size)
+                
+                first_chunk = True
+                linhas_processadas_total = 0
+                
+                with ProcessPoolExecutor(max_workers=n_cores) as executor:
+                    for chunk in chunk_iter:
+                        lote_start = time.time()
+                        linhas = chunk.to_dict('records')
+                        
+                        if n_cores > 1:
+                            sub_sz = max(1, len(linhas) // n_cores)
+                            sub_chunks = [linhas[i:i + sub_sz] for i in range(0, len(linhas), sub_sz)]
+                            futures = [executor.submit(anonymizer.process_chunk_parallel, sub_chunk, "🛡️ Anonimização Total", regras_mascara, cols_alvo) for sub_chunk in sub_chunks]
+                            linhas_limpas = []
+                            for sub, f in zip(sub_chunks, futures):
+                                try: linhas_limpas.extend(f.result() or sub)
+                                except Exception: linhas_limpas.extend(sub)
+                        else:
+                            try: linhas_limpas = anonymizer.process_chunk_parallel(linhas, "🛡️ Anonimização Total", regras_mascara, cols_alvo) or linhas
+                            except Exception: linhas_limpas = linhas
+
+                        df_out = pd.DataFrame(linhas_limpas)
+                        df_out.to_csv(buffer_out, index=False, mode='w' if first_chunk else 'a', header=first_chunk)
+                        first_chunk = False
+                        
+                        linhas_processadas_total += len(linhas_limpas)
+                        vel_chunk = len(linhas_limpas) / max(time.time() - lote_start, 0.001)
+                        save_progress(FILE_STATUS_FILE, f"Lote CSV: {arq['name']} ({linhas_processadas_total} linhas)", idx, total_arquivos, linhas_processadas_total, linhas_processadas_total+1000, vel_chunk, time.time()-t0_global, False)
+                
+                arquivos_prontos.append({"name": f"SEGURO_{nome_base}.csv", "data": buffer_out.getvalue()})
+
+        if len(arquivos_prontos) > 0:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for pf in arquivos_prontos:
+                    zip_file.writestr(pf["name"], pf["data"])
+            
+            with open("resultado_lote.zip", "wb") as f:
+                f.write(zip_buffer.getvalue())
+
+        save_progress(FILE_STATUS_FILE, "Concluído", total_arquivos, total_arquivos, 100, 100, 0, time.time() - t0_global, finalizado=True)
+
+    except Exception as e:
+        logger.error(f"Erro Arquivos Background: {e}", exc_info=True)
+        save_progress(FILE_STATUS_FILE, f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
+
 
 # ==================================================
 # 🌐 ESTRUTURA PRINCIPAL 
@@ -228,18 +302,17 @@ st.title("🔒 Pipeline de Proteção de Dados")
 st.markdown("Proteção de PIIs em escala para fluxos operacionais e de inteligência.")
 
 if "view_mode" not in st.session_state: st.session_state.view_mode = "Bancos de Dados"
-if "analise_concluida" not in st.session_state: st.session_state.analise_concluida = False
-if "todas_colunas_disponiveis" not in st.session_state: st.session_state.todas_colunas_disponiveis = []
-if "colunas_selecionadas_finais" not in st.session_state: st.session_state.colunas_selecionadas_finais = []
-
-start_btn = False
 
 with st.sidebar:
     st.markdown("### Selecione o Modo")
     modo_selecionado = st.radio("Menu de Navegação", ["🗄️ Bancos de Dados", "📄 Arquivos (.pdf, .csv, .txt)", "📝 Texto Livre"], label_visibility="collapsed")
-    st.session_state.view_mode = modo_selecionado.replace("🗄️ ", "").replace("📄 ", "").replace("📝 ", "")
-    st.divider()
+    
+    if modo_selecionado.replace("🗄️ ", "").replace("📄 ", "").replace("📝 ", "") != st.session_state.view_mode:
+        limpar_sessao()
+        st.session_state.view_mode = modo_selecionado.replace("🗄️ ", "").replace("📄 ", "").replace("📝 ", "")
+        st.rerun()
 
+    st.divider()
     st.markdown("### 🛡️ Políticas de Proteção")
     with st.expander("Configurar Tipos de Dados", expanded=False):
         st.markdown("<small>Desmarque para manter o dado original:</small>", unsafe_allow_html=True)
@@ -261,7 +334,6 @@ with st.sidebar:
     st.divider()
 
     if st.session_state.view_mode == "Bancos de Dados":
-        st.markdown("<div class='sidebar-section'>", unsafe_allow_html=True)
         st.markdown("#### Configuração Conexão")
         db_type = st.selectbox("Motor", ["postgresql", "mysql", "mssql"])
         ab_o, ab_d = st.tabs(["Origem", "Destino"])
@@ -277,15 +349,13 @@ with st.sidebar:
 
         with ab_o: src_cfg = render_db_form("origem")
         with ab_d: dst_cfg = render_db_form("destino")
-        st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("#### Parâmetros de Motor")
-        modo = st.selectbox("Modo", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
-        chunk_size = st.number_input("Lote (Rows)", value=1000, step=1000) 
+        modo = st.selectbox("Modo BD", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
+        chunk_size_db = st.number_input("Lote DB (Rows)", value=1000, step=1000) 
         filter_tables = st.text_input("Filtrar tabelas (vírgula)")
-
-        super_proc = st.toggle("🚀 Multi CPU", value=False)
-        n_cores = st.slider("CPU", 1, psutil.cpu_count(logical=True), psutil.cpu_count(logical=True)) if super_proc else 1
+        super_proc_db = st.toggle("🚀 Multi CPU BD", value=False)
+        n_cores_db = st.slider("CPU BD", 1, psutil.cpu_count(logical=True), psutil.cpu_count(logical=True)) if super_proc_db else 1
 
         st.divider()
         btn_analisar = st.button("Analisar Estrutura", use_container_width=True)
@@ -310,12 +380,20 @@ with st.sidebar:
                 st.success(f"✅ {len(st.session_state.todas_colunas_disponiveis)} colunas mapeadas.")
             except Exception as e: st.error(f"Erro ao analisar: {e}")
 
-        if st.session_state.analise_concluida:
+        start_btn_db = False
+        if st.session_state.get("analise_concluida", False):
             st.markdown("#### Mapeamento de Exceções")
-            colunas_ignoradas = st.multiselect("Ignorar colunas:", options=st.session_state.todas_colunas_disponiveis, default=[])
-            start_btn = st.button("Iniciar Pipeline de Banco", type="primary", use_container_width=True)
-            if start_btn: 
-                st.session_state.colunas_selecionadas_finais = [col for col in st.session_state.todas_colunas_disponiveis if col not in colunas_ignoradas]
+            colunas_ignoradas_db = st.multiselect("Ignorar colunas BD:", options=st.session_state.todas_colunas_disponiveis, default=[])
+            start_btn_db = st.button("Iniciar Pipeline de Banco", type="primary", use_container_width=True)
+            if start_btn_db: 
+                st.session_state.colunas_selecionadas_finais = [col for col in st.session_state.todas_colunas_disponiveis if col not in colunas_ignoradas_db]
+
+    elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
+        st.markdown("#### Parâmetros de Motor (Arquivos)")
+        chunk_size_file = st.number_input("Lote de Memória CSV (Rows)", value=5000, step=1000, help="Quantidade de linhas carregadas na memória por vez.")
+        super_proc_file = st.toggle("🚀 Multi CPU Arquivos", value=True)
+        n_cores_file = st.slider("CPU Arquivos", 1, psutil.cpu_count(logical=True), max(1, psutil.cpu_count(logical=True)-1)) if super_proc_file else 1
+
 
 # --------------------------------------------------
 # MÓDULO 1: BANCOS DE DADOS
@@ -323,12 +401,12 @@ with st.sidebar:
 if st.session_state.view_mode == "Bancos de Dados":
     st.markdown("### Monitoramento do Pipeline Estruturado")
     
-    if start_btn:
-        save_progress("Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
-        threading.Thread(target=run_pipeline_background, args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, dicionario_regras, st.session_state.colunas_selecionadas_finais), daemon=True).start()
+    if start_btn_db:
+        save_progress(STATUS_FILE, "Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
+        threading.Thread(target=run_pipeline_background, args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores_db, chunk_size_db, modo, dicionario_regras, st.session_state.colunas_selecionadas_finais), daemon=True).start()
         time.sleep(2.5); st.rerun()   
 
-    estado_atual = load_progress()
+    estado_atual = load_progress(STATUS_FILE)
     if estado_atual:
         if not estado_atual.get("finalizado", True):
             st.info("🔄 O processo de banco de dados está rodando em background.")
@@ -354,129 +432,92 @@ if st.session_state.view_mode == "Bancos de Dados":
         st.info("👈 Configure a conexão no menu lateral para iniciar a análise.")
 
 # --------------------------------------------------
-# MÓDULO 2: ARQUIVOS (LOTE / BATCH)
+# MÓDULO 2: ARQUIVOS
 # --------------------------------------------------
 elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
-    st.markdown("### Processamento de Arquivos em Lote (Batch)")
-    st.markdown("Faça upload de um ou mais documentos. A esteira processará todos em sequência na memória RAM.")
+    st.markdown("### Processamento de Arquivos em Lote Desacoplado")
+    st.markdown("Evita bloqueios na interface e estouros de RAM através de processamento em background (Fatiamento de Chunks).")
     
-    arquivos = st.file_uploader("Upload de Documentos", type=["txt", "csv", "pdf"], accept_multiple_files=True, label_visibility="collapsed")
-    
-    if arquivos:
-        tem_pdf_txt = any(a.name.lower().endswith(('pdf', 'txt')) for a in arquivos)
-        tem_csv = any(a.name.lower().endswith('csv') for a in arquivos)
+    if not st.session_state.file_process_started:
+        arquivos = st.file_uploader("Upload de Documentos", type=["txt", "csv", "pdf"], accept_multiple_files=True, label_visibility="collapsed")
+        
+        if arquivos:
+            tem_pdf_txt = any(a.name.lower().endswith(('pdf', 'txt')) for a in arquivos)
+            tem_csv = any(a.name.lower().endswith('csv') for a in arquivos)
 
-        formato_saida = "Manter Original"
-        if tem_pdf_txt:
-            escolha = st.radio("Formato de saída para PDFs e Textos:", ["Manter Formato Original", "Converter para PDF (.pdf)", "Extrair como Texto Simples (.txt)"], horizontal=True)
-            if escolha == "Converter para PDF (.pdf)": formato_saida = "pdf"
-            elif escolha == "Extrair como Texto Simples (.txt)": formato_saida = "txt"
+            formato_saida = "Manter Original"
+            if tem_pdf_txt:
+                escolha = st.radio("Formato de saída para PDFs e Textos:", ["Manter Formato Original", "Converter para PDF (.pdf)", "Extrair como Texto Simples (.txt)"], horizontal=True)
+                if escolha == "Converter para PDF (.pdf)": formato_saida = "pdf"
+                elif escolha == "Extrair como Texto Simples (.txt)": formato_saida = "txt"
 
-        colunas_ignoradas_csv = []
-        if tem_csv:
-            try:
-                todas_colunas_unicas = set()
-                for arq in arquivos:
-                    if arq.name.lower().endswith('.csv'):
-                        arq.seek(0)
-                        df_header = pd.read_csv(arq, sep=None, engine='python', encoding_errors='replace', on_bad_lines='skip', nrows=0)
-                        todas_colunas_unicas.update(df_header.columns)
+            colunas_ignoradas_csv = []
+            if tem_csv:
+                try:
+                    todas_colunas_unicas = set()
+                    for arq in arquivos:
+                        if arq.name.lower().endswith('.csv'):
+                            arq.seek(0)
+                            df_header = pd.read_csv(arq, sep=None, engine='python', encoding_errors='replace', on_bad_lines='skip', nrows=0)
+                            todas_colunas_unicas.update(df_header.columns)
+                    
+                    if todas_colunas_unicas:
+                        st.markdown("#### Mapeamento Global de Exceções (Tabelas CSV)")
+                        st.info("⚠️ Selecione as colunas que NÃO devem ser alteradas pela IA em **nenhuma** das tabelas carregadas.")
+                        colunas_ignoradas_csv = st.multiselect("Ignorar colunas:", options=sorted(list(todas_colunas_unicas)), default=[])
+                except Exception as e:
+                    st.warning(f"Não foi possível ler as colunas prévias ({e}).")
+
+            if st.button("🚀 Iniciar Esteira de Blindagem em Lote", type="primary", use_container_width=True):
+                st.session_state.file_process_started = True
+                payload = [{"name": a.name, "ext": a.name.split('.')[-1].lower(), "bytes": a.getvalue()} for a in arquivos]
                 
-                if todas_colunas_unicas:
-                    st.markdown("#### Mapeamento Global de Exceções (Tabelas CSV)")
-                    st.info("⚠️ Selecione as colunas que NÃO devem ser alteradas pela IA em **nenhuma** das tabelas carregadas.")
-                    colunas_ignoradas_csv = st.multiselect(
-                        "Ignorar colunas (União de todos os CSVs):", 
-                        options=sorted(list(todas_colunas_unicas)), 
-                        default=[]
-                    )
-            except Exception as e:
-                st.warning(f"Aviso: Não foi possível ler as colunas prévias dos CSVs ({e}). O motor atuará em todas as colunas.")
+                save_progress(FILE_STATUS_FILE, "Iniciando Thread Fantasma...", 0, len(payload), 0, 100, 0, 0, False)
+                threading.Thread(
+                    target=run_files_pipeline_background, 
+                    args=(payload, formato_saida, dicionario_regras, colunas_ignoradas_csv, chunk_size_file, n_cores_file), 
+                    daemon=True
+                ).start()
+                time.sleep(1)
+                st.rerun()
 
-        if st.button("🚀 Iniciar Esteira de Blindagem", type="primary", use_container_width=True):
-            st.session_state.processed_files = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            total_arquivos = len(arquivos)
-
-            try:
-                for idx, arquivo in enumerate(arquivos):
-                    extensao = arquivo.name.split('.')[-1].lower()
-                    nome_base = arquivo.name.rsplit('.', 1)[0]
-                    status_text.markdown(f"⏳ **Processando [{idx+1}/{total_arquivos}]:** `{arquivo.name}`...")
-
-                    if extensao in ["txt", "pdf"]:
-                        texto_bruto = ""
-                        if extensao == "txt":
-                            texto_bruto = arquivo.getvalue().decode("utf-8")
-                        elif extensao == "pdf":
-                            if not PyPDF2: st.error("PyPDF2 ausente."); continue
-                            pdf_reader = PyPDF2.PdfReader(arquivo)
-                            for pagina in pdf_reader.pages:
-                                txt_pg = pagina.extract_text()
-                                if txt_pg: texto_bruto += txt_pg + "\n\n"
-                        
-                        resultado_limpo = anonymizer.process_raw_text(texto_bruto, dicionario_regras)
-                        fmt_atual = extensao if formato_saida == "Manter Original" else formato_saida
-                        
-                        if fmt_atual == "txt":
-                            st.session_state.processed_files.append({"name": f"SEGURO_{nome_base}.txt", "data": resultado_limpo.encode('utf-8'), "mime": "text/plain"})
-                        elif fmt_atual == "pdf":
-                            if not FPDF: st.error("FPDF ausente."); continue
-                            pdf_out = FPDF()
-                            pdf_out.add_page(); pdf_out.set_font("Arial", size=11)
-                            pdf_out.multi_cell(0, 5, resultado_limpo.encode('latin-1', 'replace').decode('latin-1'))
-                            st.session_state.processed_files.append({"name": f"SEGURO_{nome_base}.pdf", "data": pdf_out.output(dest='S').encode('latin-1'), "mime": "application/pdf"})
-
-                    elif extensao == "csv":
-                        if not pd: st.error("Pandas ausente."); continue
-                        arquivo.seek(0)
-                        df = pd.read_csv(arquivo, sep=None, engine='python', encoding_errors='replace', on_bad_lines='skip')
-                        
-                        todas_cols_arquivo = list(df.columns)
-                        cols_alvo = [c for c in todas_cols_arquivo if c not in colunas_ignoradas_csv]
-                        
-                        linhas = df.to_dict('records')
-                        linhas_processadas = anonymizer.process_chunk_parallel(linhas, "🛡️ Anonimização Total", dicionario_regras, cols_alvo)
-                        st.session_state.processed_files.append({"name": f"SEGURO_{nome_base}.csv", "data": pd.DataFrame(linhas_processadas).to_csv(index=False).encode('utf-8'), "mime": "text/csv"})
-
-                    progress_bar.progress((idx + 1) / total_arquivos)
-
-                status_text.success(f"✅ {total_arquivos} arquivo(s) blindado(s) com sucesso!")
-            except Exception as e:
-                st.error(f"Erro na esteira de processamento: {e}")
-
-        # ==========================================
-        # DOWNLOAD DOS ARQUIVOS EM LOTE
-        # ==========================================
-        if "processed_files" in st.session_state and st.session_state.processed_files:
-            st.markdown("### 📥 Arquivos Prontos")
-            
-            if len(st.session_state.processed_files) > 1:
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                    for pf in st.session_state.processed_files:
-                        zip_file.writestr(pf["name"], pf["data"])
+    if st.session_state.file_process_started:
+        estado_arquivos = load_progress(FILE_STATUS_FILE)
+        if estado_arquivos:
+            if not estado_arquivos.get("finalizado", True):
+                st.info("🔄 A esteira de arquivos está rodando em background. A interface está liberada.")
+                if st.button("🔄 Atualizar Progresso", type="primary"): st.rerun()
                 
-                st.download_button(
-                    label="📦 Baixar Todos os Arquivos (.ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="Lote_Arquivos_Seguros.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True
-                )
-                st.divider()
-
-            for idx, pf in enumerate(st.session_state.processed_files):
-                st.download_button(
-                    label=f"📄 Baixar {pf['name']}",
-                    data=pf["data"],
-                    file_name=pf["name"],
-                    mime=pf["mime"],
-                    key=f"btn_dl_{idx}"
-                )
+                progresso_arq = (estado_arquivos['tabelas_processadas'] / max(estado_arquivos['tabelas_total'], 1))
+                st.progress(progresso_arq if progresso_arq > 0 else 0.05)
+                
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Status Atual", estado_arquivos['fase'])
+                c2.metric("Arquivos Concluídos", f"{estado_arquivos['tabelas_processadas']}/{estado_arquivos['tabelas_total']}")
+                c3.metric("Velocidade (CSV)", f"{estado_arquivos['velocidade']:,.0f} reg/s" if estado_arquivos['velocidade'] > 0 else "-")
+                
+                time.sleep(2); st.rerun()
+            else:
+                if "Erro" in estado_arquivos.get("fase", ""): 
+                    st.error(f"🚨 Falha no Processamento: {estado_arquivos['fase']}")
+                else: 
+                    st.success("✅ Esteira de Arquivos Concluída com Sucesso!")
+                    
+                    if os.path.exists("resultado_lote.zip"):
+                        with open("resultado_lote.zip", "rb") as f:
+                            zip_data = f.read()
+                            
+                        st.download_button(
+                            label="📦 Baixar Lote Blindado (.ZIP)",
+                            data=zip_data,
+                            file_name="Arquivos_Seguros_Aegis.zip",
+                            mime="application/zip",
+                            type="primary",
+                            use_container_width=True
+                        )
+                
+                if st.button("🧹 Limpar Painel e Processar Novo Lote"): 
+                    limpar_sessao(); st.rerun()
 
 # --------------------------------------------------
 # MÓDULO 3: TEXTO LIVRE
@@ -494,13 +535,6 @@ elif st.session_state.view_mode == "Texto Livre":
         placeholder_txt = st.empty()
         
     if btn_txt and texto_original:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        texto_limpo = process_text_with_eta(texto_original, dicionario_regras, progress_bar, status_text)
-        
-        progress_bar.empty()
-        status_text.empty()
-        
-        placeholder_txt.markdown(f'<div class="texto-seguro">{html.escape(texto_limpo)}</div>', unsafe_allow_html=True)
-        st.success("✅ Texto analisado e mascarado com sucesso!")
+        with st.spinner("Varrendo PIIs..."):
+            texto_limpo = anonymizer.process_raw_text(texto_original, dicionario_regras)
+            placeholder_txt.markdown(f'<div class="texto-seguro">{html.escape(texto_limpo)}</div>', unsafe_allow_html=True)

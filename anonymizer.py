@@ -131,7 +131,7 @@ def _ask_llm_yes_no(prompt: str, cache_key: str, system_prompt: str = "") -> boo
                 "num_predict": 5     
             }
         }
-        resp = http_session.post(OLLAMA_URL, json=payload, timeout=30)
+        resp = http_session.post(OLLAMA_URL, json=payload, timeout=40)
         if resp.status_code == 200:
             is_yes = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_yes
