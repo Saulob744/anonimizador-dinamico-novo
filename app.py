@@ -15,7 +15,7 @@ import threading
 import io
 import zipfile
 import csv
-from concurrent.futures import ProcessPoolExecutor 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import anonymizer
 import db_utils
 
@@ -36,6 +36,7 @@ except ImportError: FPDF = None
 # ==================================================
 STATUS_FILE = "pipeline_progress.json"
 FILE_STATUS_FILE = "file_pipeline_progress.json"
+ABORT_FILE = "abort.flag"
 
 if "CACHE_RESULTADOS_ARQUIVOS" not in st.session_state:
     st.session_state.CACHE_RESULTADOS_ARQUIVOS = None
@@ -64,8 +65,16 @@ def load_progress(arquivo_alvo):
                 time.sleep(0.1)
     return None
 
+def clear_abort():
+    if os.path.exists(ABORT_FILE):
+        try: os.remove(ABORT_FILE)
+        except: pass
+
+def check_abort():
+    return os.path.exists(ABORT_FILE)
+
 def limpar_sessao():
-    for f in [STATUS_FILE, FILE_STATUS_FILE, "resultado_lote.zip"]:
+    for f in [STATUS_FILE, FILE_STATUS_FILE, "resultado_lote.zip", ABORT_FILE]:
         if os.path.exists(f):
             try: os.remove(f)
             except Exception: pass
@@ -99,9 +108,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==================================================
-# FUNÇÕES AUXILIARES DE BANCO DE DADOS
+# 🛡️ FUNÇÕES AUXILIARES DE BANCO DE DADOS
 # ==================================================
-def build_url(db_type, user, password, host, port, db):
+def build_url(db_type, config_dict):
+    if isinstance(config_dict, str):
+        import ast
+        try: config_dict = ast.literal_eval(config_dict)
+        except: config_dict = {}
+
+    host = config_dict.get("host", "localhost")
+    port = config_dict.get("port", "")
+    db = config_dict.get("db", "")
+    user = config_dict.get("user", "")
+    password = config_dict.get("password", "")
+
     url = None
     if db_type == "mssql":
         try: driver = [d for d in pyodbc.drivers() if "SQL Server" in d][-1]
@@ -124,10 +144,11 @@ def build_url(db_type, user, password, host, port, db):
 # ==================================================
 def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, regras_mascara, target_cols):
     t0_global = time.time()
+    clear_abort()
     try:
         save_progress(STATUS_FILE, "Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
-        src_engine = db_utils.connect(build_url(db_type, **src_cfg))
-        dst_engine = db_utils.connect(build_url(db_type, **dst_cfg))
+        src_engine = db_utils.connect(build_url(db_type, src_cfg))
+        dst_engine = db_utils.connect(build_url(db_type, dst_cfg))
         db_utils.set_replication_mode(dst_engine, "replica")
 
         schemas = db_utils.get_user_schemas(src_engine)
@@ -154,7 +175,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
         total_rows, processed_tables, last_json_update = 0, 0, 0
         weighted_speed_samples = []
 
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
+        with ThreadPoolExecutor(max_workers=n_cores) as executor:
             for s, t, t_count in work_list:
                 processed_tables += 1
                 cols_da_tabela = [c.replace(f"{t}.", "", 1) for c in target_cols if c.startswith(f"{t}.")]
@@ -168,11 +189,34 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                             sub_sz = max(1, len(rows) // n_cores)
                             sub_chunks = [rows[i:i + sub_sz] for i in range(0, len(rows), sub_sz)]
                             futures = [executor.submit(anonymizer.process_chunk_parallel, sub_chunk, modo, regras_mascara, cols_da_tabela) for sub_chunk in sub_chunks]
-                            rows = []
-                            for original_chunk, f in zip(sub_chunks, futures):
-                                try: rows.extend(f.result() or original_chunk)
-                                except Exception: rows.extend(original_chunk)
+                            
+                            linhas_limpas = []
+                            abort_detected = False
+                            
+                            for sub, f in zip(sub_chunks, futures):
+                                while True:
+                                    if check_abort():
+                                        abort_detected = True
+                                        break
+                                    try:
+                                        res = f.result(timeout=1.0)
+                                        linhas_limpas.extend(res or sub)
+                                        break
+                                    except TimeoutError:
+                                        pass
+                                if abort_detected:
+                                    break
+                            
+                            if abort_detected:
+                                executor.shutdown(wait=False)
+                                save_progress(STATUS_FILE, "🛑 Abortado pelo Operador", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
+                                return
+                            
+                            rows = linhas_limpas
                         else:
+                            if check_abort():
+                                save_progress(STATUS_FILE, "🛑 Abortado pelo Operador", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
+                                return
                             try: rows = anonymizer.process_chunk_parallel(rows, modo, regras_mascara, cols_da_tabela) or rows
                             except Exception: pass
 
@@ -197,17 +241,22 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
 
 
 # ==================================================
-# O TRABALHADOR FANTASMA
+# worker
 # ==================================================
 def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascara, colunas_ignoradas_csv, chunk_size, n_cores):
     t0_global = time.time()
     total_arquivos = len(arquivos_payload)
     arquivos_prontos = []
+    clear_abort()
     
     try:
         save_progress(FILE_STATUS_FILE, "Iniciando Esteira de Arquivos...", 0, total_arquivos, 0, 100, 0, 0, False)
         
         for idx, arq in enumerate(arquivos_payload):
+            if check_abort():
+                save_progress(FILE_STATUS_FILE, "🛑 Abortado pelo Operador", idx, total_arquivos, 0, 100, 0, time.time()-t0_global, finalizado=True)
+                return
+
             nome_base = arq["name"].rsplit('.', 1)[0]
             extensao = arq["ext"]
             bytes_in = arq["bytes"]
@@ -224,9 +273,25 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
                         txt_pg = pagina.extract_text()
                         if txt_pg: texto_bruto += txt_pg + "\n\n"
                 
-                resultado_limpo = anonymizer.process_raw_text(texto_bruto, regras_mascara)
+                with ThreadPoolExecutor(max_workers=1) as txt_exec:
+                    f = txt_exec.submit(anonymizer.process_raw_text, texto_bruto, regras_mascara)
+                    abort_detected = False
+                    while True:
+                        if check_abort():
+                            abort_detected = True
+                            break
+                        try:
+                            resultado_limpo = f.result(timeout=1.0)
+                            break
+                        except TimeoutError:
+                            pass
+                    
+                    if abort_detected:
+                        txt_exec.shutdown(wait=False)
+                        save_progress(FILE_STATUS_FILE, "🛑 Abortado pelo Operador", idx, total_arquivos, 0, 100, 0, time.time()-t0_global, finalizado=True)
+                        return
+
                 fmt_atual = extensao if formato_saida == "Manter Original" else formato_saida
-                
                 if fmt_atual == "txt":
                     arquivos_prontos.append({"name": f"SEGURO_{nome_base}.txt", "data": resultado_limpo.encode('utf-8')})
                 elif fmt_atual == "pdf":
@@ -236,13 +301,12 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
                     arquivos_prontos.append({"name": f"SEGURO_{nome_base}.pdf", "data": pdf_out.output(dest='S').encode('latin-1')})
 
             elif extensao == "csv":
-                buffer_in = io.BytesIO(bytes_in)
-                buffer_out = io.BytesIO()
-                
-                amostra = buffer_in.read(4096).decode('utf-8', errors='ignore')
-                buffer_in.seek(0)
+                amostra = bytes_in[:4096].decode('utf-8', errors='ignore')
                 try: sep_detectado = csv.Sniffer().sniff(amostra).delimiter
                 except: sep_detectado = ','
+
+                buffer_out = io.StringIO()
+                buffer_in = io.BytesIO(bytes_in)
 
                 df_header = pd.read_csv(io.BytesIO(bytes_in), sep=sep_detectado, encoding_errors='replace', on_bad_lines='skip', nrows=0)
                 cols_alvo = [c for c in df_header.columns if c not in colunas_ignoradas_csv]
@@ -252,7 +316,7 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
                 first_chunk = True
                 linhas_processadas_total = 0
                 
-                with ProcessPoolExecutor(max_workers=n_cores) as executor:
+                with ThreadPoolExecutor(max_workers=n_cores) as executor:
                     for chunk in chunk_iter:
                         lote_start = time.time()
                         linhas = chunk.to_dict('records')
@@ -261,23 +325,44 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
                             sub_sz = max(1, len(linhas) // n_cores)
                             sub_chunks = [linhas[i:i + sub_sz] for i in range(0, len(linhas), sub_sz)]
                             futures = [executor.submit(anonymizer.process_chunk_parallel, sub_chunk, "🛡️ Anonimização Total", regras_mascara, cols_alvo) for sub_chunk in sub_chunks]
+                            
                             linhas_limpas = []
+                            abort_detected = False
+                            
                             for sub, f in zip(sub_chunks, futures):
-                                try: linhas_limpas.extend(f.result() or sub)
-                                except Exception: linhas_limpas.extend(sub)
+                                while True:
+                                    if check_abort():
+                                        abort_detected = True
+                                        break
+                                    try:
+                                        res = f.result(timeout=1.0)
+                                        linhas_limpas.extend(res or sub)
+                                        break
+                                    except TimeoutError:
+                                        pass
+                                if abort_detected:
+                                    break
+                                    
+                            if abort_detected:
+                                executor.shutdown(wait=False)
+                                save_progress(FILE_STATUS_FILE, "🛑 Abortado pelo Operador", idx, total_arquivos, linhas_processadas_total, linhas_processadas_total, 0, time.time()-t0_global, finalizado=True)
+                                return
                         else:
+                            if check_abort():
+                                save_progress(FILE_STATUS_FILE, "🛑 Abortado pelo Operador", idx, total_arquivos, linhas_processadas_total, linhas_processadas_total, 0, time.time()-t0_global, finalizado=True)
+                                return
                             try: linhas_limpas = anonymizer.process_chunk_parallel(linhas, "🛡️ Anonimização Total", regras_mascara, cols_alvo) or linhas
                             except Exception: linhas_limpas = linhas
 
                         df_out = pd.DataFrame(linhas_limpas)
-                        df_out.to_csv(buffer_out, index=False, mode='w' if first_chunk else 'a', header=first_chunk)
+                        df_out.to_csv(buffer_out, sep=sep_detectado, index=False, mode='a', header=first_chunk)
                         first_chunk = False
                         
                         linhas_processadas_total += len(linhas_limpas)
                         vel_chunk = len(linhas_limpas) / max(time.time() - lote_start, 0.001)
                         save_progress(FILE_STATUS_FILE, f"Lote CSV: {arq['name']} ({linhas_processadas_total} linhas)", idx, total_arquivos, linhas_processadas_total, linhas_processadas_total+1000, vel_chunk, time.time()-t0_global, False)
                 
-                arquivos_prontos.append({"name": f"SEGURO_{nome_base}.csv", "data": buffer_out.getvalue()})
+                arquivos_prontos.append({"name": f"SEGURO_{nome_base}.csv", "data": buffer_out.getvalue().encode('utf-8-sig')})
 
         if len(arquivos_prontos) > 0:
             zip_buffer = io.BytesIO()
@@ -296,7 +381,7 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
 
 
 # ==================================================
-# 🌐 ESTRUTURA PRINCIPAL 
+# 🌐 ESTRUTURA PRINCIPAL
 # ==================================================
 st.title("🔒 Pipeline de Proteção de Dados")
 st.markdown("Proteção de PIIs em escala para fluxos operacionais e de inteligência.")
@@ -314,22 +399,27 @@ with st.sidebar:
 
     st.divider()
     st.markdown("### 🛡️ Políticas de Proteção")
-    with st.expander("Configurar Tipos de Dados", expanded=False):
+    
+    with st.expander("Configurar Tipos de Dados", expanded=True):
         st.markdown("<small>Desmarque para manter o dado original:</small>", unsafe_allow_html=True)
         mask_cpf_rg = st.checkbox("CPF e RG", value=True)
+        mask_cep_cod= st.checkbox("CEPs e Códigos (IDs/Matrículas)", value=True, help="Ofusca sequências numéricas genéricas preservando a estrutura.") 
         mask_names  = st.checkbox("Nomes (IA Neural)", value=True)
         mask_phone  = st.checkbox("Telefones", value=True)
         mask_email  = st.checkbox("E-mails", value=True)
         mask_ip     = st.checkbox("Endereços IP", value=True)
         mask_plate  = st.checkbox("Placas e Chassis", value=True)
-        mask_geo    = st.checkbox("Coordenadas GPS", value=True)
+        mask_geo    = st.checkbox("📍 Coordenadas GPS (Jittering)", value=True, help="Adiciona um ruído matemático determinístico para ofuscar o local exato.")    
         mask_date   = st.checkbox("Datas e Horas", value=True)
 
     dicionario_regras = {
-        "CPF": mask_cpf_rg, "RG": mask_cpf_rg, "NOMES_IA": mask_names,
+        "CPF": mask_cpf_rg, "RG": mask_cpf_rg, 
+        "CEP": mask_cep_cod, "GENERIC_CODE": mask_cep_cod, 
+        "NOMES_IA": mask_names,
         "PHONE": mask_phone, "EMAIL": mask_email, "IP": mask_ip,
-        "PLATE": mask_plate, "CHASSI": mask_plate, "COORD": mask_geo,
-        "COORD_SINGLE": mask_geo, "DATE_TIME": mask_date
+        "PLATE": mask_plate, "CHASSI": mask_plate, 
+        "COORD": mask_geo, "COORD_SINGLE": mask_geo, 
+        "DATE_TIME": mask_date,
     }
     st.divider()
 
@@ -362,7 +452,7 @@ with st.sidebar:
         
         if btn_analisar:
             try:
-                src_engine = db_utils.connect(build_url(db_type, **src_cfg))
+                src_engine = db_utils.connect(build_url(db_type, src_cfg))
                 schemas = db_utils.get_user_schemas(src_engine)
                 allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
                 todas_set = set()
@@ -404,13 +494,22 @@ if st.session_state.view_mode == "Bancos de Dados":
     if start_btn_db:
         save_progress(STATUS_FILE, "Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
         threading.Thread(target=run_pipeline_background, args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores_db, chunk_size_db, modo, dicionario_regras, st.session_state.colunas_selecionadas_finais), daemon=True).start()
-        time.sleep(2.5); st.rerun()   
+        time.sleep(1); st.rerun()   
 
     estado_atual = load_progress(STATUS_FILE)
     if estado_atual:
         if not estado_atual.get("finalizado", True):
             st.info("🔄 O processo de banco de dados está rodando em background.")
-            if st.button("🔄 Atualizar Monitor", type="primary"): st.rerun()
+            
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                if st.button("🔄 Atualizar Monitor", type="primary", use_container_width=True): st.rerun()
+            with col_b:
+                if st.button("🛑 Abortar Operação", type="secondary", use_container_width=True):
+                    with open(ABORT_FILE, "w") as f: f.write("abort")
+                    st.warning("Sinal de parada de emergência acionado! Interrompendo motor...")
+                    time.sleep(1.5)
+                    st.rerun()
                 
             l_proc, l_tot, vel = estado_atual.get("linhas_processadas", 0), estado_atual.get("linhas_total", 0), estado_atual.get("velocidade", 0)
             eta = f"{divmod(divmod(int(max(0, l_tot - l_proc) / vel), 60)[0], 60)[0]}h {divmod(int(max(0, l_tot - l_proc) / vel), 60)[0] % 60}m {int(max(0, l_tot - l_proc) / vel) % 60}s" if vel > 0 else "..."
@@ -425,11 +524,12 @@ if st.session_state.view_mode == "Bancos de Dados":
             
             time.sleep(2); st.rerun()
         else:
-            if "Erro" in estado_atual.get("fase", ""): st.error(f"🚨 Falha no Banco: {estado_atual['fase']}")
+            if "Abortado" in estado_atual.get("fase", ""): st.warning("⚠️ Operação Interrompida com Sucesso e Sem Corromper a Base.")
+            elif "Erro" in estado_atual.get("fase", ""): st.error(f"🚨 Falha no Banco: {estado_atual['fase']}")
             else: st.success("✅ Cópia e Mascaramento de Banco de Dados Concluídos com Sucesso!")
             if st.button("Limpar Histórico de Banco"): limpar_sessao(); st.rerun()
     else:
-        st.info("👈 Configure a conexão no menu lateral para iniciar a análise.")
+        st.info("Configure a conexão no menu lateral para iniciar a análise.")
 
 # --------------------------------------------------
 # MÓDULO 2: ARQUIVOS
@@ -457,8 +557,12 @@ elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
                     todas_colunas_unicas = set()
                     for arq in arquivos:
                         if arq.name.lower().endswith('.csv'):
+                            amostra = arq.getvalue()[:4096].decode('utf-8', errors='ignore')
+                            try: sep_det = csv.Sniffer().sniff(amostra).delimiter
+                            except: sep_det = ','
+                            
                             arq.seek(0)
-                            df_header = pd.read_csv(arq, sep=None, engine='python', encoding_errors='replace', on_bad_lines='skip', nrows=0)
+                            df_header = pd.read_csv(arq, sep=sep_det, encoding_errors='replace', on_bad_lines='skip', nrows=0)
                             todas_colunas_unicas.update(df_header.columns)
                     
                     if todas_colunas_unicas:
@@ -486,19 +590,34 @@ elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
         if estado_arquivos:
             if not estado_arquivos.get("finalizado", True):
                 st.info("🔄 A esteira de arquivos está rodando em background. A interface está liberada.")
-                if st.button("🔄 Atualizar Progresso", type="primary"): st.rerun()
+                
+                col_a, col_b = st.columns([1, 1])
+                with col_a:
+                    if st.button("🔄 Atualizar Progresso", type="primary", use_container_width=True): st.rerun()
+                with col_b:
+                    if st.button("🛑 Abortar Operação", type="secondary", use_container_width=True):
+                        with open(ABORT_FILE, "w") as f: f.write("abort")
+                        st.warning("Sinal de parada de emergência acionado! Interrompendo motor...")
+                        time.sleep(1.5)
+                        st.rerun()
                 
                 progresso_arq = (estado_arquivos['tabelas_processadas'] / max(estado_arquivos['tabelas_total'], 1))
                 st.progress(progresso_arq if progresso_arq > 0 else 0.05)
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Status Atual", estado_arquivos['fase'])
+                l_proc = estado_arquivos.get("linhas_processadas", 0)
+                vel = estado_arquivos.get("velocidade", 0)
+                
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Ação Atual", estado_arquivos['fase'])
                 c2.metric("Arquivos Concluídos", f"{estado_arquivos['tabelas_processadas']}/{estado_arquivos['tabelas_total']}")
-                c3.metric("Velocidade (CSV)", f"{estado_arquivos['velocidade']:,.0f} reg/s" if estado_arquivos['velocidade'] > 0 else "-")
+                c3.metric("Linhas do CSV Atual", f"{l_proc:,}")
+                c4.metric("Mutação Neural", f"{vel:,.0f} reg/s" if vel > 0 else "-")
                 
                 time.sleep(2); st.rerun()
             else:
-                if "Erro" in estado_arquivos.get("fase", ""): 
+                if "Abortado" in estado_arquivos.get("fase", ""): 
+                    st.warning("⚠️ Operação Interrompida com Sucesso. (Nenhum arquivo sobrescrito)")
+                elif "Erro" in estado_arquivos.get("fase", ""): 
                     st.error(f"🚨 Falha no Processamento: {estado_arquivos['fase']}")
                 else: 
                     st.success("✅ Esteira de Arquivos Concluída com Sucesso!")

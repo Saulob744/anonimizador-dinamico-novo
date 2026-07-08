@@ -73,15 +73,18 @@ fake = Faker("pt_BR")
 REGEX = {
     "CPF": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){10}\d(?!\d)"),
     "IP": re.compile(r"(?<!\d)(?:\d{1,3}[_.\-\s]+){3}\d{1,3}(?!\d)"),
-    "RG": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){6,9}[0-9Xx](?!\d)"),
+    "CEP": re.compile(r"(?<!\d)\d{5}[-\s]?\d{3}(?!\d)"), 
+    "RG": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){4,13}[0-9Xx](?!\d)"), 
     "EMAIL": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
     "PLATE": re.compile(r"(?<![A-Za-z])(?:[A-Za-z][-.\s_]*){3}\d[-.\s_]*[A-Za-z0-9][-.\s_]*\d[-.\s_]*\d(?![A-Za-z0-9])"),
     "PHONE": re.compile(r"(?<!\d)(?:\+?55[-.\s_]*)?(?:\(?[0]?\d{2}\)?[-.\s_]*)?(?:9[-.\s_]*)?\d{4,5}[-.\s_]*\d{4}(?!\d)"),
     "CHASSI": re.compile(r"(?<![A-Za-z0-9])(?:[A-HJ-NPR-Z0-9][\-\s]*){16}[A-HJ-NPR-Z0-9](?![A-Za-z0-9])", re.IGNORECASE), 
     "DATE_TIME": re.compile(r"(?<!\d)\d{1,4}[/.\-\\]\d{1,2}[/.\-\\]\d{2,4}(?:[-.\s_]+\d{1,2}[:h]\d{1,2}(?::\d{1,2})?)?(?!\d)", re.IGNORECASE),    
     "COORD": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{3,}[^A-Za-z0-9]+-?\d{1,3}[.,]\d{3,}(?!\d)"), 
-    "COORD_SINGLE": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{3,}(?!\d)") 
+    "COORD_SINGLE": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{3,}(?!\d)"),
+    "GENERIC_CODE": re.compile(r"(?<!\w)(?:[A-Za-z]{1,4}[-.\s_]+)?\d{5,20}(?:[-.\s_/]+[A-Za-z0-9]+)*(?!\w)")
 }
+
 VIP_CONTEXT_REGEX = re.compile(r"\b(corpo de|cadáver de|cadaver de)\s*[:\-]?\s+([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){1,5})\b", re.IGNORECASE)
 
 SUSPECT_CONTEXT_REGEX = re.compile(r"\b(nome|cliente|paciente|sr|sra|dr|dra|vítima|vitima|autor|perito|legista|motorista|condutor|testemunha|delegado|investigador|agente|suspeito)\b(?:.*?[:\-.)])?\s*([A-ZÀ-Ÿa-zà-ÿ]{2,20}(?:\s+[A-ZÀ-Ÿa-zà-ÿ]{2,20}){1,5})\b", re.IGNORECASE)
@@ -131,7 +134,7 @@ def _ask_llm_yes_no(prompt: str, cache_key: str, system_prompt: str = "") -> boo
                 "num_predict": 5     
             }
         }
-        resp = http_session.post(OLLAMA_URL, json=payload, timeout=40)
+        resp = http_session.post(OLLAMA_URL, json=payload, timeout=300)
         if resp.status_code == 200:
             is_yes = "SIM" in resp.json().get("response", "").strip().upper()
             _OLLAMA_CACHE[cache_key] = is_yes
@@ -181,9 +184,9 @@ def _ask_llm_batch(candidates: list) -> list:
 class AegisClassifier:
     def __init__(self):
         self.FAST_TRACK_MAP = {
-            "CPF": "CPF", "RG": "RG", "PLATE": "PLACA", "EMAIL": "EMAIL", "PHONE": "PHONE", 
+            "CPF": "CPF", "RG": "RG", "CEP": "CEP", "PLATE": "PLACA", "EMAIL": "EMAIL", "PHONE": "PHONE", 
             "CHASSI": "CHASSI", "IP": "IP", "COORD": "COORD", "COORD_SINGLE": "COORD_SINGLE", 
-            "DATE_TIME": "IGNORAR", "TEXTO_LIVRE": "TEXTO_LIVRE", "NOME_SOLTO": "NOME_SOLTO"
+            "GENERIC_CODE": "GENERIC_CODE", "DATE_TIME": "IGNORAR", "TEXTO_LIVRE": "TEXTO_LIVRE", "NOME_SOLTO": "NOME_SOLTO"
         }
 
     def get_column_tag(self, col_name: str, samples: list) -> str:
@@ -204,8 +207,10 @@ class AegisClassifier:
         peso_nome = total * 0.4 
         if 'cpf' in col_lower: placar["CPF"] += peso_nome
         if 'rg' in col_lower or 'identidade' in col_lower: placar["RG"] += peso_nome
+        if 'cep' in col_lower or 'c.e.p' in col_lower: placar["CEP"] += peso_nome
         if 'email' in col_lower: placar["EMAIL"] += peso_nome
         if 'placa' in col_lower: placar["PLATE"] += peso_nome
+        if 'id' in col_lower or 'codigo' in col_lower or 'matricula' in col_lower: placar["GENERIC_CODE"] += peso_nome
         
         for s in amostras_unicas:
             tamanho_string = max(len(s), 1)
@@ -228,7 +233,7 @@ class AegisClassifier:
             confianca = pontuacao / total
             if confianca >= 0.6: return self.FAST_TRACK_MAP.get(vencedor, vencedor)
 
-        if any(termo in col_lower for termo in {'cidade', 'estado', 'pais', 'bairro', 'cep', 'status', 'tipo', 'marca', 'cor', 'data', 'hora', 'latitude', 'longitude', 'coord'}):
+        if any(termo in col_lower for termo in {'cidade', 'estado', 'pais', 'bairro', 'status', 'tipo', 'marca', 'cor', 'data', 'hora', 'latitude', 'longitude'}):
             return "IGNORAR"
         pontuacao_total = sum(placar.values())
         if pontuacao_total > 0:
@@ -270,6 +275,16 @@ def _normalize(text: str) -> str:
     if not text: return ""
     return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).upper().strip()
 
+def _imitar_estrutura_codigo(codigo_real: str, local_rand: random.Random) -> str:
+    falso = ""
+    for char in codigo_real:
+        if char.isdigit(): falso += str(local_rand.randint(0, 9))
+        elif char.isalpha(): 
+            if char.isupper(): falso += local_rand.choice(string.ascii_uppercase)
+            else: falso += local_rand.choice(string.ascii_lowercase)
+        else: falso += char 
+    return falso
+
 def _get_fake(value: str, typ: str) -> str:
     clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
     norm_val = _normalize(clean_value)
@@ -307,14 +322,15 @@ def _get_fake(value: str, typ: str) -> str:
     elif typ == "CPF": 
         val = fake.cpf()
         _TELEMETRIA["documentos_protegidos"].add(norm_val)
-    elif typ == "RG": 
-        val = fake.numerify('##.###.###-#') 
+    elif typ in ["RG", "CEP", "GENERIC_CODE"]: 
+        val = _imitar_estrutura_codigo(clean_value, local_rand)
         _TELEMETRIA["documentos_protegidos"].add(norm_val)
     elif typ in ["PLATE", "PLACA"]: 
         val = fake.license_plate().upper()
         _TELEMETRIA["documentos_protegidos"].add(norm_val)
     elif typ == "EMAIL": val = fake.email().lower()
-    elif typ == "PHONE": val = fake.phone_number()
+    elif typ == "PHONE": 
+        val = _imitar_estrutura_codigo(clean_value, local_rand)
     elif typ == "IP": val = fake.ipv4()
     elif typ == "CHASSI": val = "".join(local_rand.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
     else: val = fake.word().upper()
@@ -325,12 +341,20 @@ def _get_fake(value: str, typ: str) -> str:
 # ==============================================================================
 # MOTOR DE DETECÇÃO EM TEXTO LIVRE
 # ==============================================================================
-def _detect_all(text: str, anon_loc: bool):
+def _detect_all(text: str, regras_mascara: dict):
     found = []
     
-    TRUSTED_TAGS = {"CPF", "RG", "EMAIL", "IP", "PLATE", "CHASSI", "PHONE"}
-    if anon_loc:
-        TRUSTED_TAGS.update(["COORD", "COORD_SINGLE"])
+    TRUSTED_TAGS = set()
+    if regras_mascara.get("CPF", True): TRUSTED_TAGS.add("CPF")
+    if regras_mascara.get("RG", True): 
+        TRUSTED_TAGS.update(["RG", "CEP", "GENERIC_CODE"]) 
+    if regras_mascara.get("EMAIL", True): TRUSTED_TAGS.add("EMAIL")
+    if regras_mascara.get("IP", True): TRUSTED_TAGS.add("IP")
+    if regras_mascara.get("PLATE", True): TRUSTED_TAGS.add("PLATE")
+    if regras_mascara.get("CHASSI", True): TRUSTED_TAGS.add("CHASSI")
+    if regras_mascara.get("PHONE", True): TRUSTED_TAGS.add("PHONE")
+    
+    if regras_mascara.get("COORD", True): TRUSTED_TAGS.update(["COORD", "COORD_SINGLE"])
         
     suspect_names = []
     trusted_names = [] 
@@ -342,52 +366,53 @@ def _detect_all(text: str, anon_loc: bool):
             if typ in TRUSTED_TAGS:
                 found.append((match.start(), match.end(), val, typ))
 
-    for match in VIP_CONTEXT_REGEX.finditer(text):
-        val_sujo = match.group(2).strip()
-        val_limpo = _farejador_sintatico(val_sujo) 
-        val_norm = _normalize(val_limpo) 
+    if regras_mascara.get("NOMES_IA", True):
+        for match in VIP_CONTEXT_REGEX.finditer(text):
+            val_sujo = match.group(2).strip()
+            val_limpo = _farejador_sintatico(val_sujo) 
+            val_norm = _normalize(val_limpo) 
+                
+            if len(val_limpo) >= 3 and not INVALID_WORDS.search(val_norm):
+                start = match.start(2)
+                end = start + len(val_limpo)
+                found.append((start, end, val_limpo, "PER"))
+                trusted_names.append(val_limpo)
+
+        for match in SUSPECT_CONTEXT_REGEX.finditer(text):
+            val_sujo = match.group(2).strip()
+            val_limpo = _farejador_sintatico(val_sujo) 
+            val_norm = _normalize(val_limpo) 
+                
+            if len(val_limpo) >= 3 and not INVALID_WORDS.search(val_norm):
+                start = match.start(2)
+                end = start + len(val_limpo)
+                suspect_names.append((start, end, val_limpo))
+
+        for match in NAME_FALLBACK_REGEX.finditer(text):
+            val_sujo = match.group().strip()
+            val_limpo = _farejador_sintatico(val_sujo) 
+            val_norm = _normalize(val_limpo) 
             
-        if len(val_limpo) >= 3 and not INVALID_WORDS.search(val_norm):
-            start = match.start(2)
-            end = start + len(val_limpo)
-            found.append((start, end, val_limpo, "PER"))
-            trusted_names.append(val_limpo)
+            if len(val_limpo) >= 3 and not INVALID_WORDS.search(val_norm):
+                start = match.start()
+                end = start + len(val_limpo)
+                suspect_names.append((start, end, val_limpo))
 
-    for match in SUSPECT_CONTEXT_REGEX.finditer(text):
-        val_sujo = match.group(2).strip()
-        val_limpo = _farejador_sintatico(val_sujo) 
-        val_norm = _normalize(val_limpo) 
-            
-        if len(val_limpo) >= 3 and not INVALID_WORDS.search(val_norm):
-            start = match.start(2)
-            end = start + len(val_limpo)
-            suspect_names.append((start, end, val_limpo))
+        if nlp:
+            doc = nlp(text.title() if text.isupper() or text.islower() else text)
+            for ent in doc.ents:
+                if ent.label_ == "PER":
+                    val_clean = ent.text.strip(".,;:?!() \n'\"")
+                    val_norm = _normalize(val_clean)
+                    if len(val_clean) >= 3 and not any(char.isdigit() for char in val_clean) and not INVALID_WORDS.search(val_norm): 
+                        start = text.find(val_clean, max(0, ent.start_char - 2))
+                        if start != -1: suspect_names.append((start, start + len(val_clean), val_clean))
 
-    for match in NAME_FALLBACK_REGEX.finditer(text):
-        val_sujo = match.group().strip()
-        val_limpo = _farejador_sintatico(val_sujo) 
-        val_norm = _normalize(val_limpo) 
-        
-        if len(val_limpo) >= 3 and not INVALID_WORDS.search(val_norm):
-            start = match.start()
-            end = start + len(val_limpo)
-            suspect_names.append((start, end, val_limpo))
-
-    if nlp:
-        doc = nlp(text.title() if text.isupper() or text.islower() else text)
-        for ent in doc.ents:
-            if ent.label_ == "PER":
-                val_clean = ent.text.strip(".,;:?!() \n'\"")
-                val_norm = _normalize(val_clean)
-                if len(val_clean) >= 3 and not any(char.isdigit() for char in val_clean) and not INVALID_WORDS.search(val_norm): 
-                    start = text.find(val_clean, max(0, ent.start_char - 2))
-                    if start != -1: suspect_names.append((start, start + len(val_clean), val_clean))
-
-    if suspect_names:
-        unique_names = list(set([item[2] for item in suspect_names if item[2] not in trusted_names]))
-        approved_names = _ask_llm_batch(unique_names)
-        for s, e, v in suspect_names:
-            if v in approved_names: found.append((s, e, v, "PER"))
+        if suspect_names:
+            unique_names = list(set([item[2] for item in suspect_names if item[2] not in trusted_names]))
+            approved_names = _ask_llm_batch(unique_names)
+            for s, e, v in suspect_names:
+                if v in approved_names: found.append((s, e, v, "PER"))
 
     found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
     clean, last = [], -1
@@ -418,10 +443,13 @@ def anonymize_value(col_name: str, val, regras_mascara=None):
         if politica_execucao in ["COORD", "COORD_SINGLE"] and not regras_mascara.get("COORD", True):
             return text, None
             
-        if politica_execucao in ["NOME_SOLTO", "COORD", "COORD_SINGLE", "PLACA", "CPF", "RG", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE", "DOC_GENERICO"]:
+        if politica_execucao in ["NOME_SOLTO", "COORD", "COORD_SINGLE", "PLACA", "CPF", "RG", "CEP", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE", "DOC_GENERICO"]:
             chave_regra = politica_execucao
             if chave_regra in ["PLACA", "PLATE"]: chave_regra = "PLATE"
-            if not regras_mascara.get(chave_regra, True): return text, None
+            if chave_regra in ["CEP", "GENERIC_CODE"]: chave_regra = "RG" 
+            
+            if chave_regra not in ["COORD", "COORD_SINGLE"] and not regras_mascara.get(chave_regra, True): 
+                return text, None
                 
             fake_val = _get_fake(text, politica_execucao)
             if fake_val != text:
@@ -489,7 +517,8 @@ def process_chunk_parallel(rows, modo, regras_mascara, target_columns):
         row_dict = dict(r)
         for col, old in row_dict.items():
             if not target_columns or col not in target_columns: continue
-            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool', 'int', 'float']: continue
+            
+            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool']: continue
 
             old_str = html.unescape(str(old).strip())
             try:
