@@ -65,7 +65,7 @@ def connect(url: str):
     )
 
 # ==================================================
-# UTILITÁRIOS E INSPEÇÃO
+# UTILITÁRIOS E INSPEÇÃO 
 # ==================================================
 def get_db_type(engine):
     return engine.dialect.name
@@ -84,8 +84,19 @@ def get_tables(engine, schema):
 
 def get_table_info(engine, table, schema):
     insp = inspect(engine)
+    
+    columns_info = []
+    for col in insp.get_columns(table, schema=schema):
+        col_type = col.get("type")
+        is_date = isinstance(col_type, (sa.Date, sa.DateTime, sa.TIMESTAMP, sa.TIME))
+        columns_info.append({
+            "name": col["name"],
+            "type": str(col_type),
+            "is_date": is_date
+        })
+
     return {
-        "columns": insp.get_columns(table, schema=schema),
+        "columns": columns_info,
         "primary_keys": insp.get_pk_constraint(table, schema=schema).get("constrained_columns", []),
         "foreign_keys": insp.get_foreign_keys(table, schema=schema)
     }
@@ -125,9 +136,9 @@ def copy_schema(src_engine, dst_engine, schema):
                 logger.warning(f"CREATE SKIP {schema}.{table.name}: {e}")
 
 # ==================================================
-# LEITURA E ESCRITA 
+# LEITURA E ESCRITA
 # ==================================================
-def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
+def fetch_rows_streaming(engine, table, schema, chunk_size=10000, order_by_column=None, max_limit=None, order_direction="DESC"):
     key = f"{schema}.{table}"
     
     if key not in _TABLE_CACHE:
@@ -141,12 +152,39 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=1000):
         else:
             select_cols.append(col)
 
-    query = sa.select(*select_cols)
+    base_query = sa.select(*select_cols)
+    
+    if order_by_column and order_by_column in t_ref.columns:
+        if order_direction == "DESC":
+            base_query = base_query.order_by(t_ref.columns[order_by_column].desc())
+        else:
+            base_query = base_query.order_by(t_ref.columns[order_by_column].asc())
 
-    with engine.connect() as conn:
-        result = conn.execution_options(stream_results=True).execute(query)
-        while rows := result.mappings().fetchmany(chunk_size):
-            yield rows
+    offset = 0
+    total_yielded = 0
+
+    while True:
+        current_limit = chunk_size
+        if max_limit:
+            current_limit = min(chunk_size, max_limit - total_yielded)
+            if current_limit <= 0:
+                break
+
+        query = base_query.limit(current_limit).offset(offset)
+
+        with engine.connect() as conn:
+            rows = conn.execute(query).mappings().fetchall()
+            
+        if not rows:
+            break
+            
+        yield rows
+        
+        offset += len(rows)
+        total_yielded += len(rows)
+        
+        if max_limit and total_yielded >= max_limit:
+            break
 
 def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if not rows: return
@@ -239,7 +277,7 @@ def build_dependency_graph(engine, tables, schema):
 
     return ordered + [t for t in tables if t not in ordered]
 
-def set_replication_mode(engine, mode='replica'):
+def set_replication_role(engine, role='replica'):
     if get_db_type(engine) == "postgresql":
         with engine.begin() as conn:
-            conn.execute(text(f"SET session_replication_role = '{mode}'"))
+            conn.execute(text(f"SET session_replication_role = '{role}'"))

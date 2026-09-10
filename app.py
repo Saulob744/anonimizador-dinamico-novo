@@ -19,9 +19,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import anonymizer
 import db_utils
 
-# ==================================================
-# 📦 IMPORTAÇÕES CONDICIONAIS
-# ==================================================
 try: import pandas as pd
 except ImportError: pd = None
 try: import PyPDF2
@@ -31,9 +28,6 @@ except ImportError: docx = None
 try: from fpdf import FPDF
 except ImportError: FPDF = None
 
-# ==================================================
-# SISTEMA DE MEMÓRIA E ESTADO
-# ==================================================
 STATUS_FILE = "pipeline_progress.json"
 FILE_STATUS_FILE = "file_pipeline_progress.json"
 ABORT_FILE = "abort.flag"
@@ -43,11 +37,12 @@ if "CACHE_RESULTADOS_ARQUIVOS" not in st.session_state:
 if "file_process_started" not in st.session_state:
     st.session_state.file_process_started = False
 
-def save_progress(arquivo_alvo, fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False):
+def save_progress(arquivo_alvo, fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False, politicas=None):
     data = {
         "fase": fase, "tabelas_processadas": t_atual, "tabelas_total": t_total,
         "linhas_processadas": l_atual, "linhas_total": l_total,
-        "velocidade": velocidade, "tempo_decorrido": tempo, "finalizado": finalizado
+        "velocidade": velocidade, "tempo_decorrido": tempo, "finalizado": finalizado,
+        "politicas": politicas or {}
     }
     try:
         with open(arquivo_alvo, "w", encoding="utf-8") as f:
@@ -78,13 +73,10 @@ def limpar_sessao():
         if os.path.exists(f):
             try: os.remove(f)
             except Exception: pass
-    for key in ["analise_concluida", "todas_colunas_disponiveis", "colunas_selecionadas_finais", "CACHE_RESULTADOS_ARQUIVOS", "file_process_started"]:
+    for key in ["analise_concluida", "todas_colunas_disponiveis", "colunas_selecionadas_finais", "CACHE_RESULTADOS_ARQUIVOS", "file_process_started", "colunas_ordenaveis", "limite_linhas_db", "coluna_ordenacao", "direcao_ordenacao"]:
         if key in st.session_state:
             del st.session_state[key]
 
-# ==================================================
-# CONFIGURAÇÕES DA TELA
-# ==================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
@@ -107,9 +99,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ==================================================
-# 🛡️ FUNÇÕES AUXILIARES DE BANCO DE DADOS
-# ==================================================
 def build_url(db_type, config_dict):
     if isinstance(config_dict, str):
         import ast
@@ -139,17 +128,14 @@ def build_url(db_type, config_dict):
         url = f"mysql+pymysql://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}?charset=utf8mb4"
     return url
 
-# ==================================================
-# O TRABALHADOR FANTASMA
-# ==================================================
-def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, modo, regras_mascara, target_cols):
+def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, max_limit, order_by_col_pref, order_direction, modo, regras_mascara, target_cols):
     t0_global = time.time()
     clear_abort()
     try:
         save_progress(STATUS_FILE, "Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
         src_engine = db_utils.connect(build_url(db_type, src_cfg))
         dst_engine = db_utils.connect(build_url(db_type, dst_cfg))
-        db_utils.set_replication_mode(dst_engine, "replica")
+        db_utils.set_replication_role(dst_engine, "replica")
 
         schemas = db_utils.get_user_schemas(src_engine)
         allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
@@ -162,6 +148,8 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
             ordered = db_utils.build_dependency_graph(src_engine, tables, s)
             for t in ordered:
                 count = db_utils.get_table_count(src_engine, t, s)
+                if max_limit > 0 and count > max_limit:
+                    count = max_limit
                 work_list.append((s, t, count))
                 total_estimated += count
                 total_tables += 1
@@ -180,7 +168,11 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                 processed_tables += 1
                 cols_da_tabela = [c.replace(f"{t}.", "", 1) for c in target_cols if c.startswith(f"{t}.")]
 
-                for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size):
+                limit_val = max_limit if max_limit > 0 else None
+                col_ordem = None if order_by_col_pref == "Nenhuma" else order_by_col_pref
+                dir_ordem = "DESC" if "DESC" in order_direction else "ASC"
+                
+                for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size, order_by_column=col_ordem, max_limit=limit_val, order_direction=dir_ordem):
                     chunk_start = time.time()
                     rows = [dict(r) for r in chunk]
 
@@ -230,19 +222,15 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                     now = time.time()
                     if now - last_json_update > 2.5:
                         stable_speed = sum(weighted_speed_samples) / len(weighted_speed_samples) if weighted_speed_samples else 0
-                        save_progress(STATUS_FILE, f"Processando: {t}", processed_tables, total_tables, total_rows, total_estimated, stable_speed, now - t0_global, False)
+                        save_progress(STATUS_FILE, f"Processando: {t}", processed_tables, total_tables, total_rows, total_estimated, stable_speed, now - t0_global, False, anonymizer._COLUMN_POLICIES)
                         last_json_update = now
 
-        db_utils.set_replication_mode(dst_engine, "origin")
+        db_utils.set_replication_role(dst_engine, "origin")
         save_progress(STATUS_FILE, "Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
 
     except Exception as e:
         save_progress(STATUS_FILE, f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
 
-
-# ==================================================
-# worker
-# ==================================================
 def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascara, colunas_ignoradas_csv, chunk_size, n_cores):
     t0_global = time.time()
     total_arquivos = len(arquivos_payload)
@@ -379,10 +367,6 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
         logger.error(f"Erro Arquivos Background: {e}", exc_info=True)
         save_progress(FILE_STATUS_FILE, f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
 
-
-# ==================================================
-# 🌐 ESTRUTURA PRINCIPAL
-# ==================================================
 st.title("🔒 Pipeline de Proteção de Dados")
 st.markdown("Proteção de PIIs em escala para fluxos operacionais e de inteligência.")
 
@@ -455,7 +439,9 @@ with st.sidebar:
                 src_engine = db_utils.connect(build_url(db_type, src_cfg))
                 schemas = db_utils.get_user_schemas(src_engine)
                 allowed = [t.strip() for t in filter_tables.split(",")] if filter_tables else []
+                
                 todas_set = set()
+                ordenaveis_set = set() 
                 
                 if schemas:
                     for schema in schemas:
@@ -463,20 +449,50 @@ with st.sidebar:
                         for table in [t for t in tables if not allowed or t in allowed]:
                             info_tabela = db_utils.get_table_info(src_engine, table, schema)
                             for col_info in info_tabela.get("columns", []):
-                                todas_set.add(f"{table}.{col_info['name']}")
+                                col_name = col_info['name']
+                                todas_set.add(f"{table}.{col_name}")
+                                
+                                if col_info.get("is_date") or col_name.lower() in ['id', 'codigo', 'cod', 'created_at', 'data_registro']:
+                                    ordenaveis_set.add(col_name)
                 
                 st.session_state.todas_colunas_disponiveis = sorted(list(todas_set))
+                st.session_state.colunas_ordenaveis = sorted(list(ordenaveis_set))
                 st.session_state.analise_concluida = True
                 st.success(f"✅ {len(st.session_state.todas_colunas_disponiveis)} colunas mapeadas.")
             except Exception as e: st.error(f"Erro ao analisar: {e}")
 
         start_btn_db = False
         if st.session_state.get("analise_concluida", False):
+            st.markdown("#### ⚙️ Governança de Extração")
+            limite_linhas_db = st.number_input(
+                "Limite Máximo por Tabela (0 = Sem limite)", 
+                value=1000, step=1000, 
+                help="A extração será encerrada ao atingir esta linha. Protege contra DoS."
+            )
+            
+            opcoes_ordem = ["Nenhuma"] + st.session_state.get("colunas_ordenaveis", [])
+            col_ordem, col_dir = st.columns(2)
+            with col_ordem:
+                coluna_ordenacao = st.selectbox(
+                    "Coluna de Ordenação", 
+                    options=opcoes_ordem, 
+                    help="Recomendado: colunas de Data ou ID."
+                )
+            with col_dir:
+                direcao_ordenacao = st.selectbox(
+                    "Direção da Leitura",
+                    options=["Mais Recentes Primeiro (DESC)", "Mais Antigos Primeiro (ASC)"]
+                )
+            
             st.markdown("#### Mapeamento de Exceções")
             colunas_ignoradas_db = st.multiselect("Ignorar colunas BD:", options=st.session_state.todas_colunas_disponiveis, default=[])
             start_btn_db = st.button("Iniciar Pipeline de Banco", type="primary", use_container_width=True)
+            
             if start_btn_db: 
                 st.session_state.colunas_selecionadas_finais = [col for col in st.session_state.todas_colunas_disponiveis if col not in colunas_ignoradas_db]
+                st.session_state.limite_linhas_db = limite_linhas_db
+                st.session_state.coluna_ordenacao = coluna_ordenacao
+                st.session_state.direcao_ordenacao = direcao_ordenacao
 
     elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
         st.markdown("#### Parâmetros de Motor (Arquivos)")
@@ -485,15 +501,20 @@ with st.sidebar:
         n_cores_file = st.slider("CPU Arquivos", 1, psutil.cpu_count(logical=True), max(1, psutil.cpu_count(logical=True)-1)) if super_proc_file else 1
 
 
-# --------------------------------------------------
-# MÓDULO 1: BANCOS DE DADOS
-# --------------------------------------------------
 if st.session_state.view_mode == "Bancos de Dados":
     st.markdown("### Monitoramento do Pipeline Estruturado")
     
     if start_btn_db:
         save_progress(STATUS_FILE, "Iniciando Thread Fantasma...", 0, 1, 0, 1, 0, 0, finalizado=False)
-        threading.Thread(target=run_pipeline_background, args=(db_type, src_cfg, dst_cfg, filter_tables, n_cores_db, chunk_size_db, modo, dicionario_regras, st.session_state.colunas_selecionadas_finais), daemon=True).start()
+        threading.Thread(
+            target=run_pipeline_background, 
+            args=(
+                db_type, src_cfg, dst_cfg, filter_tables, n_cores_db, chunk_size_db, 
+                st.session_state.limite_linhas_db, st.session_state.coluna_ordenacao, st.session_state.direcao_ordenacao,
+                modo, dicionario_regras, st.session_state.colunas_selecionadas_finais
+            ), 
+            daemon=True
+        ).start()
         time.sleep(1); st.rerun()   
 
     estado_atual = load_progress(STATUS_FILE)
@@ -522,6 +543,16 @@ if st.session_state.view_mode == "Bancos de Dados":
             c3.metric("Registros Processados", f"{l_proc:,}/{l_tot:,}")
             c4.metric("Mutação Neural", f"{vel:,.0f} reg/s" if vel > 0 else "-", delta=eta, delta_color="off")
             
+            politicas_atuais = estado_atual.get("politicas", {})
+            if politicas_atuais:
+                with st.expander("📊 Radar Top-Down: Decisões de Classificação por Coluna", expanded=True):
+                    st.markdown("<small>Acompanhe em tempo real como o motor Aegis classificou o conteúdo.</small>", unsafe_allow_html=True)
+                    df_politicas = pd.DataFrame(
+                        list(politicas_atuais.items()), 
+                        columns=["Nome da Coluna", "Tag de Anonimização"]
+                    )
+                    st.dataframe(df_politicas, use_container_width=True, hide_index=True)
+
             time.sleep(2); st.rerun()
         else:
             if "Abortado" in estado_atual.get("fase", ""): st.warning("⚠️ Operação Interrompida com Sucesso e Sem Corromper a Base.")
@@ -531,9 +562,6 @@ if st.session_state.view_mode == "Bancos de Dados":
     else:
         st.info("Configure a conexão no menu lateral para iniciar a análise.")
 
-# --------------------------------------------------
-# MÓDULO 2: ARQUIVOS
-# --------------------------------------------------
 elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
     st.markdown("### Processamento de Arquivos em Lote Desacoplado")
     st.markdown("Evita bloqueios na interface e estouros de RAM através de processamento em background (Fatiamento de Chunks).")
@@ -638,22 +666,52 @@ elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
                 if st.button("🧹 Limpar Painel e Processar Novo Lote"): 
                     limpar_sessao(); st.rerun()
 
-# --------------------------------------------------
-# MÓDULO 3: TEXTO LIVRE
-# --------------------------------------------------
 elif st.session_state.view_mode == "Texto Livre":
     st.markdown("### Auditoria Rápida de Fragmentos (Copiar & Colar)")
     
+    if "texto_anonimizado_resultado" not in st.session_state:
+        st.session_state.texto_anonimizado_resultado = None
+
     col1, col2 = st.columns(2)
+    
     with col1:
-        texto_original = st.text_area("Entrada (Dados Suspeitos)", height=400, placeholder="Cole o laudo policial aqui...")
+        texto_original = st.text_area(
+            "Entrada (Dados Suspeitos)", 
+            height=400, 
+            placeholder="Cole o laudo policial ou documento aqui..."
+        )
         btn_txt = st.button("Injetar Máscaras no Texto", type="primary", use_container_width=True)
         
+        if btn_txt and texto_original:
+            with st.spinner("Varrendo PIIs e aplicando DLP..."):
+                st.session_state.texto_anonimizado_resultado = anonymizer.process_raw_text(
+                    texto_original, 
+                    dicionario_regras
+                )
+
     with col2:
         st.markdown("**Saída (Dados Protegidos)**")
-        placeholder_txt = st.empty()
         
-    if btn_txt and texto_original:
-        with st.spinner("Varrendo PIIs..."):
-            texto_limpo = anonymizer.process_raw_text(texto_original, dicionario_regras)
-            placeholder_txt.markdown(f'<div class="texto-seguro">{html.escape(texto_limpo)}</div>', unsafe_allow_html=True)
+        if st.session_state.texto_anonimizado_resultado:
+            texto_limpo = st.session_state.texto_anonimizado_resultado
+            
+            st.caption("📋 Passe o mouse sobre o bloco abaixo e clique no ícone para copiar:")
+            st.code(texto_limpo, language="text")
+            
+            st.divider()
+            
+            col_down, col_clear = st.columns([2, 1])
+            with col_down:
+                st.download_button(
+                    label="📥 Baixar Texto Anonimizado (.txt)",
+                    data=texto_limpo.encode('utf-8'),
+                    file_name="texto_anonimizado.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+            with col_clear:
+                if st.button("🧹 Limpar Resultado", use_container_width=True):
+                    st.session_state.texto_anonimizado_resultado = None
+                    st.rerun()
+        else:
+            st.info("Aguardando inserção e processamento de texto no painel à esquerda.")

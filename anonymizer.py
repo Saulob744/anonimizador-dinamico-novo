@@ -1,18 +1,12 @@
-import os
-import re
-import random
-import string
-import unicodedata
-import hashlib
-import logging
-import requests
-import html
-import hmac
+import os, re, random, string, unicodedata, hashlib, logging, requests, html, hmac, secrets, json
+from datetime import datetime
 from collections import Counter
 from functools import lru_cache
 from faker import Faker
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+MAX_CACHE_SIZE = 50000
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s]: %(message)s')
 logger = logging.getLogger(__name__)
@@ -20,512 +14,272 @@ logger = logging.getLogger(__name__)
 SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "SaltSeguroSESP2026_Producao!")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
+ABORT_FILE = "abort.flag"
 
+# Telemetria Global
 _TELEMETRIA = {
-    "celulas_avaliadas": 0,
-    "celulas_alteradas": 0,
-    "substituicoes_totais": 0,
-    "identidades_protegidas": set(),
+    "inicio": datetime.now().isoformat(),
+    "celulas_avaliadas": 0, 
+    "celulas_alteradas": 0, 
+    "substituicoes_totais": 0, 
+    "identidades_protegidas": set(), 
     "documentos_protegidos": set()
 }
 
-def emitir_relatorio_auditoria():
-    print("\n" + "="*70)
-    print("🛡️  RELATÓRIO DE TELEMETRIA E AUDITORIA (DLP / LGPD) 🛡️")
-    print("="*70)
-    print(f"📊 Células/Textos avaliados:       {_TELEMETRIA['celulas_avaliadas']}")
-    print(f"🔴 Células/Textos alterados:       {_TELEMETRIA['celulas_alteradas']}")
-    print(f"🔀 Total de substituições:         {_TELEMETRIA['substituicoes_totais']}")
-    print(f"👤 Pessoas/Nomes mascarados:       {len(_TELEMETRIA['identidades_protegidas'])}")
-    print(f"📄 Documentos/Dados mascarados:    {len(_TELEMETRIA['documentos_protegidos'])}")
-    print("="*70 + "\n")
+_COLUMN_POLICIES, _OLLAMA_CACHE = {}, {}
+fake = Faker("pt_BR")
 
 try:
     import spacy
     nlp = spacy.load("pt_core_news_lg", disable=["lemmatizer"])
-except ImportError:
-    logger.error("🚨 'spacy' ausente. (pip install spacy)")
-    nlp = None
-except OSError:
-    logger.error("🚨 Modelo ausente. (python -m spacy download pt_core_news_lg)")
+except Exception as e:
+    logger.error(f"🚨 Erro no SpaCy: {e}")
     nlp = None
 
 http_session = requests.Session()
-_retry_strategy = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-_adapter = HTTPAdapter(max_retries=_retry_strategy)
-http_session.mount("http://", _adapter)
-http_session.mount("https://", _adapter)
-
-_MAPPING_CACHE: dict = {}
-_COLUMN_POLICIES: dict = {} 
-_OLLAMA_CACHE: dict = {} 
-fake = Faker("pt_BR")
+http_session.mount("http://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])))
 
 REGEX = {
     "CPF": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){10}\d(?!\d)"),
     "IP": re.compile(r"(?<!\d)(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?!\d)"),
     "CEP": re.compile(r"(?<!\d)\d{5}[-\s]?\d{3}(?!\d)"), 
-    "DATE_TIME": re.compile(r"(?<!\d)(?:(?:3[01]|[12]\d|0?[1-9])[/.-](?:1[0-2]|0?[1-9])[/.-](?:19|20)?\d\d|(?:19|20)\d\d[/.-](?:1[0-2]|0?[1-9])[/.-](?:3[01]|[12]\d|0?[1-9]))(?:[\s_T]+\d{1,2}:\d{2}(?::\d{2})?)?(?!\d)", re.IGNORECASE),    
+    "DATE_TIME": re.compile(r"(?<!\d)(?:(?:3[01]|[12]\d|0?[1-9])[/.-](?:1[0-2]|0?[1-9])[/.-](?:19|20)?\d\d|(?:19|20)\d\d[/.-](?:1[0-2]|0?[1-9])[/.-](?:3[01]|[12]\d|0?[1-9]))(?:[\s_T]+\d{1,2}:\d{2}(?::\d{2})?)?(?!\d)", re.I),    
     "RG": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){4,13}[0-9Xx](?!\d)"), 
     "EMAIL": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
-    "PLATE": re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{3}[-.\s]*[0-9][A-Za-z0-9][0-9]{2}(?![A-Za-z0-9])", re.IGNORECASE),
+    "PLATE": re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{3}[-.\s]*[0-9][A-Za-z0-9][0-9]{2}(?![A-Za-z0-9])", re.I),
     "PHONE": re.compile(r"(?<!\d)(?:\+?55[-.\s_]*)?(?:\(?[0]?\d{2}\)?[-.\s_]*)?(?:9[-.\s_]*)?\d{4,5}[-.\s_]*\d{4}(?!\d)"),
-    "CHASSI": re.compile(r"(?<![A-Za-z0-9])(?:[A-HJ-NPR-Z0-9][\-\s]*){16}[A-HJ-NPR-Z0-9](?![A-Za-z0-9])", re.IGNORECASE), 
+    "CHASSI": re.compile(r"(?<![A-Za-z0-9])[A-HJ-NPR-Z0-9]{17}(?![A-Za-z0-9])", re.I), 
     "COORD": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{3,}[^A-Za-z0-9]+-?\d{1,3}[.,]\d{3,}(?!\d)"), 
     "COORD_SINGLE": re.compile(r"(?<!\d)-?\d{1,3}[.,]\d{3,}(?!\d)"),
-    "GENERIC_CODE": re.compile(r"(?<!\w)(?:[A-Za-z0-9]{1,10}[-/_.]){1,5}[A-Za-z0-9]{1,10}(?!\w)|(?<!\w)[A-Za-z]+\d+[A-Za-z0-9]*(?!\w)")
+    "GENERIC_CODE": re.compile(r"(?<!\w)(?=[A-Za-z0-9-_./]*\d)(?:[A-Za-z0-9]{1,10}[-/_.]){1,5}[A-Za-z0-9]{1,10}(?!\w)|(?<!\w)[A-Za-z]+\d+[A-Za-z0-9]*(?!\w)")
 }
 
-TITLES_TO_STRIP = re.compile(
-    r"\b(cabo|soldado|sargento|tenente|capitao|coronel|delegado|investigador|agente|escrivao|"
-    r"dr|dra|sr|sra|senhor|senhora|vítima|vitima|suspeito|autor|indivíduo|paciente)\b\.?", 
-    re.IGNORECASE
-)
+_TITULOS_BASE = r"\b(?:[Cc]abo|[Ss]oldado|[Ss]argento|[Tt]enente|[Cc]apita[oõ]|[Cc]oronel|[Dd]elegado|[Ii]nvestigador|[Aa]gente|[Ee]scriv[aã]o|[Dd]r|[Dd]ra|[Ss]r|[Ss]ra|[Ss]enhor|[Ss]enhora|[Vv][ií]tima|[Ss]uspeito|[Aa]utor|[Ii]ndiv[ií]duo|[Pp]aciente)\b\.?"
+TITLES_TO_STRIP = re.compile(_TITULOS_BASE, re.I)
+TITLE_NAME_REGEX = re.compile(f"{_TITULOS_BASE}\\s+([A-ZÀ-Ÿ][a-zà-ÿ]{{1,}}(?:\\s+(?:de|da|do|dos|das|e)\\s+)?(?:[A-ZÀ-Ÿ][a-zà-ÿ]{{1,}}\\s*){{1,4}})")
+STOP_WORDS_NAME = re.compile(r"\b(portadora|portador|portadores|portadoras|cpf|rg|chassi|placa|email|telefone|veiculo|celular|residencia|guarnicao|denuncia|abordagem|local|propriedade|processo|relato|inquisitorial|rua|avenida|alameda|ch[aá]cara|fazenda|s[ií]tio|trecho|vereda|rodovia|travessa|beco|pra[cç]a|santa|santo|s[aã]o|hospital|cl[ií]nica|delegacia|batalh[aã]o|estado|munic[ií]pio|cidade|goi[aá]s|paran[aá]|paulo|janeiro)\b", re.I)
+FEMALE_INDICATORS = re.compile(r"\b(dra|sra|senhora|dona|vítima|vitima)\b", re.I)
 
-TITLE_NAME_REGEX = re.compile(
-    r"\b(?:cabo|soldado|sargento|tenente|capitao|coronel|delegado|investigador|agente|escrivao|"
-    r"dr|dra|sr|sra|senhor|senhora|vítima|vitima|suspeito|autor|indivíduo|paciente)\b\.?\s+"
-    r"([A-ZÀ-Ÿa-zà-ÿ]{2,}(?:\s+(?:de|da|do|dos|das|e)\s+)?(?:[A-ZÀ-Ÿa-zà-ÿ]{2,}\s*){1,4})",
-    re.IGNORECASE
-)
+def _sanitize_input(text: str) -> str: return re.sub(r'[^\w\s\.,;:!?@\-\(\)]', ' ', str(text)).strip()
+def _check_abort(): return os.path.exists(ABORT_FILE)
+def _clean_name(name_str: str) -> str: return re.sub(r"^[,.:\-]+|[,.:\-]+$", "", TITLES_TO_STRIP.sub("", name_str)).strip()
 
-STOP_WORDS_NAME = re.compile(
-    r"\b(portadora|portador|portadores|portadoras|cpf|rg|chassi|placa|email|telefone|veiculo|celular|"
-    r"residencia|guarnicao|denuncia|abordagem|local|propriedade|processo|relato|inquisitorial)\b",
-    re.IGNORECASE
-)
+def emitir_relatorio_auditoria():
+    fim = datetime.now()
+    ts_str = fim.strftime("%Y%m%d_%H%M%S")
+    nome_arquivo = f"relatorio_auditoria_{ts_str}.json"
+    
+    relatorio_data = {
+        "inicio_processamento": _TELEMETRIA["inicio"],
+        "fim_processamento": fim.isoformat(),
+        "celulas_avaliadas": _TELEMETRIA["celulas_avaliadas"],
+        "celulas_alteradas": _TELEMETRIA["celulas_alteradas"],
+        "substituicoes_totais": _TELEMETRIA["substituicoes_totais"],
+        "total_identidades_protegidas": len(_TELEMETRIA["identidades_protegidas"]),
+        "total_documentos_protegidos": len(_TELEMETRIA["documentos_protegidos"]),
+        "amostra_identidades": list(_TELEMETRIA["identidades_protegidas"])[:50],
+        "amostra_documentos": list(_TELEMETRIA["documentos_protegidos"])[:50]
+    }
+    
+    try:
+        with open(nome_arquivo, "w", encoding="utf-8") as f:
+            json.dump(relatorio_data, f, indent=4, ensure_ascii=False)
+        logger.info(f"📄 Relatório de auditoria salvo em: {nome_arquivo}")
+    except Exception as e:
+        logger.error(f"🚨 Erro ao gerar arquivo de auditoria: {e}")
 
-FEMALE_INDICATORS = re.compile(r"\b(dra|sra|senhora|dona|vítima|vitima)\b", re.IGNORECASE)
-
-def _clean_name(name_str: str) -> str:
-    cleaned = TITLES_TO_STRIP.sub("", name_str).strip()
-    return re.sub(r"^[,.:\-]+|[,.:\-]+$", "", cleaned).strip()
+    print("\n" + "="*70 + "\n🛡️  RELATÓRIO DE TELEMETRIA E AUDITORIA (DLP / LGPD) 🛡️\n" + "="*70)
+    print(f"📊 Células/Textos avaliados:       {relatorio_data['celulas_avaliadas']}")
+    print(f"🔴 Células/Textos alterados:       {relatorio_data['celulas_alteradas']}")
+    print(f"🔀 Total de substituições:         {relatorio_data['substituicoes_totais']}")
+    print(f"👤 Pessoas/Nomes mascarados:       {relatorio_data['total_identidades_protegidas']}")
+    print(f"📄 Documentos/Dados mascarados:    {relatorio_data['total_documentos_protegidos']}")
+    print(f"📁 Arquivo de Saída:              {nome_arquivo}")
+    print("="*70 + "\n")
 
 def _ask_llm_yes_no(prompt: str, cache_key: str, system_prompt: str = "") -> bool:
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
+    if len(_OLLAMA_CACHE) >= MAX_CACHE_SIZE: _OLLAMA_CACHE.clear() 
     try:
-        payload = {
-            "model": OLLAMA_MODEL, "system": system_prompt, "prompt": prompt, "stream": False,
-            "options": {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "num_predict": 5}
-        }
-        resp = http_session.post(OLLAMA_URL, json=payload, timeout=300)
+        resp = http_session.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "system": system_prompt, "prompt": _sanitize_input(prompt), "stream": False, "options": {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "num_predict": 5}}, timeout=(5, 20))
         if resp.status_code == 200:
-            is_yes = "SIM" in resp.json().get("response", "").strip().upper()
+            is_yes = bool(re.search(r'\bSIM\b', resp.json().get("response", "").strip().upper()))
             _OLLAMA_CACHE[cache_key] = is_yes
             return is_yes
-    except Exception as e:
-        logger.warning(f"Falha LLM [{cache_key}]: {e}")
+    except Exception as e: logger.warning(f"Falha LLM [{cache_key}]: {e}")
     return False
 
 def _ask_llm_batch(candidates: list) -> list:
     if not candidates: return []
-    approved = []
-    instrucao_mestra = (
-        "Sua ÚNICA função é dizer se um termo é ESTRITAMENTE O NOME PRÓPRIO COMPLETO de uma PESSOA HUMANA REAL. "
-        "REGRAS DE REJEIÇÃO ABSOLUTA ('NAO'): "
-        "1. Locais, Fazendas, Ruas, Rodovias, Expressões como 'portadora do CPF', 'guarnição de'. "
-        "2. Cargos, Posições e Papéis. "
-        "3. Dados Demográficos ou nomes incompletos. "
-        "Responda ESTRITAMENTE 'SIM' ou 'NAO'."
-    )
-    for c in set(candidates):
-        if len(c.split()) < 2: continue
-        if STOP_WORDS_NAME.search(c): continue
-        
-        key = f"PER:{c.upper()}"
-        if key in _OLLAMA_CACHE:
-            if _OLLAMA_CACHE[key]: approved.append(c)
-            continue
-        prompt = f"O termo '{c}' representa UMA PESSOA HUMANA REAL (SIM) ou um TERMO/CARGO/OBJETO (NAO)?\nResposta:"
-        if _ask_llm_yes_no(prompt, key, system_prompt=instrucao_mestra): 
-            approved.append(c)
-    return approved
-
-def _ask_llm_column_classification(amostras: list, tipo_suspeito: str) -> bool:
-    amostras_limpas = [str(s).strip() for s in amostras if str(s).strip()][:5]
-    amostras_str = " | ".join(amostras_limpas)
-    instrucao = "Responda EXCLUSIVAMENTE com 'SIM' ou 'NAO'. Não justifique."
-    prompt = f"Analise estas amostras: [{amostras_str}]\nParecem pertencer à categoria '{tipo_suspeito}'?\nResposta:"
-    return _ask_llm_yes_no(prompt, f"COL_VOTE_{tipo_suspeito}_{hash(amostras_str)}", system_prompt=instrucao)
+    instrucao_mestra = "Valide se o fragmento é EXCLUSIVAMENTE nome próprio humano. Rejeite locais, verbos e cargos. Responda 'SIM' ou 'NAO'."
+    return [c for c in set(candidates) if not _check_abort() and len((c_clean := _sanitize_input(c.strip())).split()) >= 2 and not STOP_WORDS_NAME.search(c_clean) and _ask_llm_yes_no(f"Termo: '{c_clean}'\nResposta:", f"PER:{c_clean.upper()}", system_prompt=instrucao_mestra)]
 
 class AegisClassifier:
-    def __init__(self):
-        self.FAST_TRACK_MAP = {
-            "CPF": "CPF", "RG": "RG", "CEP": "CEP", "PLATE": "PLACA", "EMAIL": "EMAIL", "PHONE": "PHONE", 
-            "CHASSI": "CHASSI", "IP": "IP", "COORD": "COORD", "COORD_SINGLE": "COORD_SINGLE", 
-            "TEXTO_LIVRE": "TEXTO_LIVRE", "NOME_SOLTO": "NOME_SOLTO",
-            "DATE_TIME": "IGNORAR",
-            "GENERIC_CODE": "GENERIC_CODE"
-        }
-        self.IGNORE_KEYWORDS = {'cidade', 'estado', 'pais', 'bairro', 'status', 'tipo', 'marca', 'cor', 'latitude', 'longitude'}
-        self.LLM_TAG_NAMES = {
-            "COORD": "Coordenadas Geográficas (GPS)", "CPF": "CPF Brasileiro", "RG": "RG ou Documento Numérico",
-            "PLATE": "Placa de Veículo", "PHONE": "Número de Telefone", "DATE_TIME": "Data, Horário ou Ano",
-            "GENERIC_CODE": "Código Numérico Genérico ou ID"
-        }
-
+    FAST_TRACK_MAP = {"CPF": "CPF", "RG": "RG", "CEP": "CEP", "PLATE": "PLACA", "EMAIL": "EMAIL", "PHONE": "PHONE", "CHASSI": "CHASSI", "IP": "IP", "COORD": "COORD", "COORD_SINGLE": "COORD_SINGLE", "TEXTO_LIVRE": "TEXTO_LIVRE", "NOME_SOLTO": "NOME_SOLTO", "DATE_TIME": "IGNORAR", "GENERIC_CODE": "GENERIC_CODE"}
+    
     def get_column_tag(self, col_name: str, samples: list) -> str:
-        amostras_unicas = list(set(samples))[:50]
-        total = len(amostras_unicas)
-        if total == 0: return "TEXTO_LIVRE"
-        
+        amostras = [str(s).strip() for s in set(samples) if str(s).strip()][:50]
+        if not amostras: return "TEXTO_LIVRE"
         placar = Counter()
-        col_lower = col_name.lower().strip()
-
-        media_palavras = sum(len(str(s).split()) for s in amostras_unicas) / total
-        media_tamanho = sum(len(str(s)) for s in amostras_unicas) / total
-        if media_palavras >= 8 or media_tamanho >= 80:
-            return "TEXTO_LIVRE"
-
-        total_gps = 0
-        for s in amostras_unicas:
-            s_str = str(s).strip()
-            tamanho_string = max(len(s_str), 1)
+        
+        for s in amostras:
+            sz = max(len(s), 1)
+            if (m := REGEX["COORD"].search(s) or REGEX["COORD_SINGLE"].search(s)) and len(m.group()) / sz >= 0.70:
+                placar["COORD"] += 1; continue
             
-            match_c = REGEX["COORD"].search(s_str) or REGEX["COORD_SINGLE"].search(s_str)
-            if match_c and (len(match_c.group()) / tamanho_string) >= 0.8:
-                total_gps += 1
-                continue 
+            matched = False
+            for tag in ["EMAIL", "IP", "PLATE", "PHONE", "CPF", "CEP", "DATE_TIME", "RG", "CHASSI", "GENERIC_CODE"]:
+                if (m := REGEX[tag].search(s)) and len(m.group()) / sz >= 0.70:
+                    placar[tag] += 1; matched = True; break
+            if matched: continue
 
-            for tag, padrao in REGEX.items():
-                if tag in ["COORD", "COORD_SINGLE"]: continue
-                match = padrao.search(s_str)
-                if match and (len(match.group()) / tamanho_string) >= 0.75:
-                    if REGEX["DATE_TIME"].search(s_str):
-                        placar["DATE_TIME"] += 1
-                    elif tag == "GENERIC_CODE" and REGEX["RG"].search(s_str):
-                        placar["RG"] += 1
-                    else:
-                        placar[tag] += 1
+            if len(re.sub(r'[^A-ZÀ-Ÿa-zà-ÿ\s]', '', s)) / sz > 0.85 and 2 <= len(s.split()) <= 7:
+                placar["NOME_SOLTO"] += 1; continue
+            placar["TEXTO_LIVRE" if len(s.split()) >= 8 or re.search(r'[,.!?]\s+[A-Z]', s) or sz > 100 else "IGNORAR"] += 1
 
-        if (total_gps / total) >= 0.5:
-            if not any(REGEX["COORD"].search(str(s)) for s in amostras_unicas): return "COORD_SINGLE"
-            return "COORD"
+        b, col_l = len(amostras) * 0.15, col_name.lower()
+        if 'cpf' in col_l: placar["CPF"] += b
+        if 'rg' in col_l or 'identidade' in col_l: placar["RG"] += b
+        if 'placa' in col_l: placar["PLATE"] += b
+        if any(x in col_l for x in ['nome', 'vitima', 'autor']): placar["NOME_SOLTO"] += b
 
-        bonus = total * 0.20 
-        if 'cpf' in col_lower: placar["CPF"] += bonus
-        if 'rg' in col_lower or 'identidade' in col_lower: placar["RG"] += bonus
-        if 'placa' in col_lower: placar["PLATE"] += bonus
-        if any(k in col_lower for k in ['data', 'date', 'nascimento', 'hora']): placar["DATE_TIME"] += bonus
-
-        if placar:
-            top_candidatos = placar.most_common(2)
-            vencedor_principal, pontuacao = top_candidatos[0]
-            confianca = pontuacao / total
-            
-            if confianca >= 0.6: 
-                return self.FAST_TRACK_MAP.get(vencedor_principal, vencedor_principal)
-            
-            logger.warning(f"Dúvida na coluna '{col_name}' ({confianca*100:.1f}%). Acionando IA...")
-            for candidato, _ in top_candidatos:
-                tipo_humano = self.LLM_TAG_NAMES.get(candidato, candidato)
-                if _ask_llm_column_classification(amostras_unicas, tipo_humano):
-                    decisao_final = self.FAST_TRACK_MAP.get(candidato, candidato)
-                    logger.info(f"✅ IA classificou '{col_name}' como: {decisao_final}")
-                    return decisao_final
-
-        palavras_ignorar = self.IGNORE_KEYWORDS.union({'data', 'ano', 'numero', 'hora', 'date', 'time'})
-        if any(termo in col_lower for termo in palavras_ignorar): return "IGNORAR"
-
-        tem_pontuacao = any(re.search(r'[,.!?]\s+[A-Z]', str(s)) for s in amostras_unicas)
-        if media_palavras >= 3 or tem_pontuacao: return "TEXTO_LIVRE"
-
-        return "IGNORAR"
+        if placar["COORD"] > 0 and not any(REGEX["COORD"].search(s) for s in amostras): placar["COORD_SINGLE"] = placar.pop("COORD")
+        if not placar: return "IGNORAR"
+        
+        vencedor, pts = placar.most_common(1)[0]
+        confianca = pts / (len(amostras) + b)
+        tag_decidida = self.FAST_TRACK_MAP.get(vencedor, vencedor)
+        
+        logger.info(f"⚖️ [JULGAMENTO] Coluna '{col_name}' -> Vencedor: {vencedor} (Confiança: {confianca*100:.1f}%) => Decisão: {tag_decidida}")
+        return tag_decidida
 
 _aegis_engine = AegisClassifier()
 
 def setup_column_policies(rows: list, target_columns: list):
-    if not target_columns or not rows: return
-    for col in target_columns:
+    for col in (target_columns or []):
         if col in _COLUMN_POLICIES: continue
-        
-        valores_validos = []
-        for r in rows:
-            val = r.get(col)
-            if val is not None:
-                val_str = str(val).strip()
-                if val_str and val_str.upper() not in ["NÃO CONSTA", "NULL", "NONE", "", "PREJUDICADO"]:
-                    valores_validos.append(val_str)
-        
-        valores_unicos = list(dict.fromkeys(valores_validos))
-        if not valores_unicos: continue
-            
-        amostra_topo = valores_unicos[:50]
-        decisao = _aegis_engine.get_column_tag(col, amostra_topo)
-        _COLUMN_POLICIES[col] = decisao
-        logger.info(f"📊 [PRO] Radar Top-Down classificou '{col}' como: {decisao}")
+        valores = list({str(r.get(col)).strip() for r in rows if r.get(col) and str(r.get(col)).strip().upper() not in ["NÃO CONSTA", "NULL", "NONE", "", "PREJUDICADO"]})
+        if valores: _COLUMN_POLICIES[col] = _aegis_engine.get_column_tag(col, valores[:50])
 
 @lru_cache(maxsize=100000)
-def _normalize(text: str) -> str:
-    if not text: return ""
-    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).upper().strip()
+def _normalize(text: str) -> str: return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).upper().strip()
+def _imitar_codigo(codigo: str, r: random.Random) -> str: return "".join(str(r.randint(0, 9)) if c.isdigit() else (r.choice(string.ascii_uppercase) if c.isalpha() and c.isupper() else (r.choice(string.ascii_lowercase) if c.isalpha() else c)) for c in codigo)
 
-def _imitar_estrutura_codigo(codigo_real: str, local_rand: random.Random) -> str:
-    falso = ""
-    for char in codigo_real:
-        if char.isdigit(): falso += str(local_rand.randint(0, 9))
-        elif char.isalpha(): 
-            if char.isupper(): falso += local_rand.choice(string.ascii_uppercase)
-            else: falso += local_rand.choice(string.ascii_lowercase)
-        else: falso += char 
-    return falso
-
+@lru_cache(maxsize=MAX_CACHE_SIZE)
 def _get_fake(value: str, typ: str, context_prefix: str = "") -> str:
-    clean_value = html.unescape(re.sub(r'<[^>]+>', '', value)).strip()
-    norm_val = _normalize(clean_value)
-    cache_key = f"{typ}:{norm_val}"
-    if cache_key in _MAPPING_CACHE: return _MAPPING_CACHE[cache_key]
-
-    seed_int = int(hmac.new(SECRET_SALT.encode('utf-8'), norm_val.encode('utf-8'), hashlib.sha256).hexdigest()[:16], 16)
-    fake.seed_instance(seed_int)
-    local_rand = random.Random(seed_int)
+    norm = _normalize(html.unescape(re.sub(r'<[^>]+>', '', value)).strip())
+    s_int = int(hmac.new(SECRET_SALT.encode(), norm.encode(), hashlib.sha256).hexdigest()[:16], 16)
+    fake.seed_instance(s_int)
+    r = random.Random(s_int)
     
-    if typ in ["COORD", "COORD_SINGLE"]:
-        def jitter_match(m):
-            try:
-                coord_str = m.group().replace(',', '.')
-                return f"{float(coord_str) + local_rand.uniform(-0.003, 0.003):.6f}"
-            except:
-                return m.group()
-        val = re.sub(r"-?\d{1,3}[.,]\d{4,}", jitter_match, clean_value)
-        _MAPPING_CACHE[cache_key] = val
-        return val
-
+    if typ in ["COORD", "COORD_SINGLE"]: return re.sub(r"-?\d{1,3}[.,]\d{4,}", lambda m: f"{float(m.group().replace(',', '.')) + r.uniform(-0.003, 0.003):.6f}" if m else m.group(), norm)
     if typ in ["PER", "NOME_SOLTO"]: 
-        is_female = bool(FEMALE_INDICATORS.search(context_prefix))
-        first = fake.first_name_female() if is_female else fake.first_name()
-        val = f"{first} {fake.last_name()}".upper()
-        
-        ultimo_real = norm_val.split()[-1] if norm_val.split() else ""
-        tentativas = 0
-        while val.split()[-1] == ultimo_real and tentativas < 10:
-            seed_int += 1 
-            fake.seed_instance(seed_int)
-            first_name = fake.first_name_female() if is_female else fake.first_name()
-            val = f"{first_name} {fake.last_name()}".upper()
-            tentativas += 1
-        _TELEMETRIA["identidades_protegidas"].add(norm_val)
-    elif typ == "CPF": val = fake.cpf()
-    elif typ in ["RG", "CEP", "GENERIC_CODE"]: val = _imitar_estrutura_codigo(clean_value, local_rand)
-    elif typ in ["PLATE", "PLACA"]: val = fake.license_plate().upper()
-    elif typ == "EMAIL": val = fake.email().lower()
-    elif typ == "PHONE": val = _imitar_estrutura_codigo(clean_value, local_rand)
-    elif typ == "IP": val = fake.ipv4()
-    elif typ == "CHASSI": val = "".join(local_rand.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
-    else: val = fake.word().upper()
-
-    _MAPPING_CACHE[cache_key] = val
-    return val
+        fn = norm.split()[0] if norm.split() else ""
+        is_fem = fn.endswith('A') or fn in {'SUELI', 'GLEICI', 'ISIS'} if fn not in {'LUIZ', 'DAVI', 'IGOR'} else bool(FEMALE_INDICATORS.search(context_prefix))
+        _TELEMETRIA["identidades_protegidas"].add(norm)
+        return f"{fake.first_name_female() if is_fem else fake.first_name_male()} {fake.last_name()}".upper()
+    
+    _TELEMETRIA["documentos_protegidos"].add(norm)
+    if typ == "CPF": return fake.cpf()
+    if typ in ["RG", "CEP", "GENERIC_CODE", "PHONE"]: return _imitar_codigo(norm, r)
+    if typ in ["PLATE", "PLACA"]: return fake.license_plate().upper()
+    if typ == "EMAIL": return fake.email().lower()
+    if typ == "IP": return fake.ipv4()
+    if typ == "CHASSI": return "".join(r.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
+    return fake.word().upper()
 
 def _detect_all(text: str, regras_mascara: dict):
-    found = []
-    TRUSTED_TAGS = set()
-    
-    if regras_mascara.get("CPF", True): TRUSTED_TAGS.add("CPF")
-    if regras_mascara.get("RG", True): TRUSTED_TAGS.update(["RG", "CEP", "GENERIC_CODE"]) 
-    if regras_mascara.get("EMAIL", True): TRUSTED_TAGS.add("EMAIL")
-    if regras_mascara.get("IP", True): TRUSTED_TAGS.add("IP")
-    if regras_mascara.get("PLATE", True): TRUSTED_TAGS.add("PLATE")
-    if regras_mascara.get("CHASSI", True): TRUSTED_TAGS.add("CHASSI")
-    if regras_mascara.get("PHONE", True): TRUSTED_TAGS.add("PHONE")
-    if regras_mascara.get("COORD", True): TRUSTED_TAGS.update(["COORD", "COORD_SINGLE"])
-        
-    suspect_names = []
-    date_spans = [m.span() for m in REGEX["DATE_TIME"].finditer(text)]
+    found, r_get = [], regras_mascara.get
+    tags = {t for t, k in [("CPF", "CPF"), ("RG", "RG"), ("CEP", "RG"), ("GENERIC_CODE", "RG"), ("EMAIL", "EMAIL"), ("IP", "IP"), ("PLATE", "PLATE"), ("CHASSI", "CHASSI"), ("PHONE", "PHONE"), ("COORD", "COORD"), ("COORD_SINGLE", "COORD")] if r_get(k, True)}
+    ds = [m.span() for m in REGEX["DATE_TIME"].finditer(text)]
 
-    for typ, pat in REGEX.items():
-        if typ == "DATE_TIME": continue
-        for match in pat.finditer(text):
-            if typ in TRUSTED_TAGS:
-                if not any(max(match.start(), ds[0]) < min(match.end(), ds[1]) for ds in date_spans):
-                    found.append((match.start(), match.end(), match.group(), typ))
+    for typ in tags:
+        found.extend((m.start(), m.end(), m.group(), typ) for m in REGEX[typ].finditer(text) if not any(max(m.start(), d[0]) < min(m.end(), d[1]) for d in ds))
+    occ = [(i[0], i[1]) for i in found]
 
-    occupied_spans = [(item[0], item[1]) for item in found]
+    for m in TITLE_NAME_REGEX.finditer(text):
+        if _check_abort(): break
+        s, e = m.start(1), m.end(1)
+        val_c = _clean_name(text[s:e])
+        if len(val_c.split()) >= 2 and not STOP_WORDS_NAME.search(val_c) and not any(max(s, o[0]) < min(e, o[1]) for o in occ):
+            found.append((s, e, val_c, "PER"))
 
-    for match in TITLE_NAME_REGEX.finditer(text):
-        val_extraido = match.group(1).strip()
-        val_clean = _clean_name(val_extraido)
-        if len(val_clean.split()) >= 2 and not STOP_WORDS_NAME.search(val_clean):
-            s, e = match.start(1), match.end(1)
-            if not any(max(s, osp[0]) < min(e, osp[1]) for osp in occupied_spans):
-                suspect_names.append((s, e, val_clean))
+    if r_get("NOMES_IA", True) and nlp:
+        doc = nlp(text.title() if text.isupper() else text)
+        cand = {ent.text.strip(".,;:?!() \n'\"") for ent in doc.ents if ent.label_ == "PER"}
+        appr = _ask_llm_batch(list(cand))
+        for s, e, v in [(m.start(), m.end(), m.group()) for a in appr for m in re.finditer(re.escape(a), text, re.I)]:
+            if not any(max(s, o[0]) < min(e, o[1]) for o in occ): found.append((s, e, v, "PER"))
 
-    if regras_mascara.get("NOMES_IA", True) and nlp:
-        doc = nlp(text.title()) 
-        candidatos_nlp = set()
-        
-        for ent in doc.ents:
-            if ent.label_ == "PER":
-                candidatos_nlp.add(ent.text.strip(".,;:?!() \n'\""))
-
-        current_propn = []
-        for token in doc:
-            if TITLES_TO_STRIP.match(token.text) or STOP_WORDS_NAME.search(token.text):
-                if len(current_propn) >= 2:
-                    if nlp(current_propn[-1])[0].pos_ == "ADP":
-                        current_propn.pop()
-                    if len(current_propn) >= 2:
-                        candidatos_nlp.add(" ".join(current_propn))
-                current_propn = []
-                continue
-
-            if token.pos_ == "PROPN":
-                current_propn.append(token.text)
-            elif token.pos_ == "ADP" and current_propn: 
-                current_propn.append(token.text)
-            else:
-                if len(current_propn) >= 2:
-                    if nlp(current_propn[-1])[0].pos_ == "ADP":
-                        current_propn.pop()
-                    if len(current_propn) >= 2:
-                        candidatos_nlp.add(" ".join(current_propn))
-                current_propn = []
-
-        for candidato in candidatos_nlp:
-            val_clean = _clean_name(candidato)
-            if len(val_clean.split()) < 2 or any(c.isdigit() for c in val_clean) or STOP_WORDS_NAME.search(val_clean):
-                continue
-
-            for match_original in re.finditer(re.escape(val_clean), text, re.IGNORECASE):
-                s, e = match_original.start(), match_original.end()
-                
-                while s > 0 and text[s-1].isalpha(): s -= 1
-                while e < len(text) and text[e].isalpha(): e += 1
-                
-                if not any(max(s, osp[0]) < min(e, osp[1]) for osp in occupied_spans):
-                    val_candidato_limpo = text[s:e].strip()
-                    if not STOP_WORDS_NAME.search(val_candidato_limpo):
-                        suspect_names.append((s, e, val_candidato_limpo))
-
-        if suspect_names:
-            unique_names = list(set([item[2] for item in suspect_names if not STOP_WORDS_NAME.search(item[2])]))
-            approved_names = _ask_llm_batch(unique_names)
-            
-            for s, e, v in suspect_names:
-                if any(v.lower() == app_name.lower() for app_name in approved_names):
-                    found.append((s, e, v, "PER"))
-
-    found.sort(key=lambda x: (x[0], -(x[1] - x[0])))
-    
-    clean, last = [], -1
-    for s, e, v, t in found:
-        if s >= last:
-            clean.append((s, e, text[s:e], t))
-            last = e
-            
-    return clean
+    return sorted(found, key=lambda x: (x[0], -(x[1] - x[0])))
 
 def anonymize_value(col_name: str, val, regras_mascara=None):
     try:
-        if val is None or not str(val).strip(): return val, None
-        text = str(val).strip()
-        if isinstance(regras_mascara, bool): regras_mascara = {"COORD": regras_mascara, "COORD_SINGLE": regras_mascara}
-        elif regras_mascara is None: regras_mascara = {}
-            
-        global _TELEMETRIA
-        _TELEMETRIA["celulas_avaliadas"] += 1
-        politica_execucao = _COLUMN_POLICIES.get(col_name, "TEXTO_LIVRE")
+        if not val: return val, None
+        text, r_mask = str(val), regras_mascara or {}
+        if isinstance(r_mask, bool): r_mask = {"COORD": r_mask, "COORD_SINGLE": r_mask}
         
-        if politica_execucao == "IGNORAR": return text, None
-        if politica_execucao in ["COORD", "COORD_SINGLE"] and not regras_mascara.get("COORD", True): return text, None
-            
-        if politica_execucao in ["NOME_SOLTO", "COORD", "COORD_SINGLE", "PLACA", "CPF", "RG", "CEP", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
-            chave_regra = "PLATE" if politica_execucao in ["PLACA", "PLATE"] else ("RG" if politica_execucao in ["CEP", "GENERIC_CODE"] else politica_execucao)
-            if chave_regra not in ["COORD", "COORD_SINGLE"] and not regras_mascara.get(chave_regra, True): return text, None
-                
-            fake_val = _get_fake(text, politica_execucao)
-            if fake_val != text:
+        _TELEMETRIA["celulas_avaliadas"] += 1
+        pol = _COLUMN_POLICIES.get(col_name, "TEXTO_LIVRE")
+        if pol == "IGNORAR" or (pol in ["COORD", "COORD_SINGLE"] and not r_mask.get("COORD", True)): return text, None
+
+        if pol in ["NOME_SOLTO", "COORD", "COORD_SINGLE", "PLACA", "CPF", "RG", "CEP", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
+            fake_v = _get_fake(text, pol)
+            if fake_v != text:
                 _TELEMETRIA["celulas_alteradas"] += 1
                 _TELEMETRIA["substituicoes_totais"] += 1
-            return fake_val, ("TEXT" if fake_val != text else None)
-            
-        if politica_execucao == "TEXTO_LIVRE":
-            entities = _detect_all(text, regras_mascara)
-            if not entities: return text, None
-            
-            result, last = [], 0
-            
-            for s, e, v, t in entities:
-                if s < last: continue
-                contexto_anterior = text[max(0, s-20):s]
-                fake_val = _get_fake(v, t, context_prefix=contexto_anterior)
-                
-                _TELEMETRIA["substituicoes_totais"] += 1
-                result.extend([text[last:s], fake_val])
-                last = e
-                
-            result.append(text[last:])
-            texto_final = "".join(result)
-            
-            if texto_final != text: _TELEMETRIA["celulas_alteradas"] += 1
-            return texto_final, ("TEXT" if texto_final != text else None)
+                if random.random() < 0.05:
+                    logger.info(f"🔎 [TROCA DIRETA | {col_name}] '{text}' ➡️ '{fake_v}'")
+            return fake_v, ("TEXT" if fake_v != text else None)
 
+        if pol == "TEXTO_LIVRE":
+            ents = _detect_all(text, r_mask)
+            if not ents: return text, None
+            
+            res, last = [], 0
+            for s, e, v, t in ents:
+                if s < last: continue
+                fake_v = _get_fake(v, t, text[max(0, s-20):s])
+                _TELEMETRIA["substituicoes_totais"] += 1
+                if random.random() < 0.20 or col_name == "RAW_TEXT_INJECTION":
+                    logger.info(f"🔎 [TROCA NARRATIVA | {col_name}] '{v}' ➡️ '{fake_v}'")
+                res.extend([text[last:s], fake_v])
+                last = e
+            res.append(text[last:])
+            txt_fin = "".join(res)
+            if txt_fin != text: _TELEMETRIA["celulas_alteradas"] += 1
+            return txt_fin, ("TEXT" if txt_fin != text else None)
         return text, None
     except Exception as e:
-        logger.error(f"Erro máscara '{col_name}': {e}")
-        return str(val), None
+        logger.error(f"Erro '{col_name}': {e}")
+        return "[DADO SUPRIMIDO POR SEGURANÇA]", None
 
-def reset_memory():
-    _MAPPING_CACHE.clear()
-    _COLUMN_POLICIES.clear()
-    _OLLAMA_CACHE.clear()
+def reset_memory(): _OLLAMA_CACHE.clear(); _COLUMN_POLICIES.clear(); _get_fake.cache_clear()
+
+def _apply_shield(text, callback, *args):
+    vault = {}
+    def hide(m):
+        tk = f" __SHLD{secrets.token_hex(4)}__ "
+        vault[tk.strip()] = m.group(0)
+        return tk
+    safe_t = re.compile(r"<[^>]+>").sub(hide, html.unescape(str(text)))
+    fin, _ = callback(*args, safe_t)
+    for tk, orig in vault.items(): fin = str(fin).replace(f" {tk} ", orig).replace(tk, orig)
+    return fin
 
 def process_chunk_parallel(rows, modo, regras_mascara, target_columns):
     if modo != "🛡️ Anonimização Total" or not rows: return rows
-    if regras_mascara is None: regras_mascara = {}
+    if (alvo := [c for c in rows[0].keys() if c in target_columns]): setup_column_policies(rows, alvo)
     
-    col_alvo = [c for c in rows[0].keys() if c in target_columns]
-    if col_alvo: setup_column_policies(rows, col_alvo)
-    
-    html_regex = re.compile(r"<[^>]+>")
-    processed = []
-    
-    for r in rows:
-        row_dict = dict(r)
-        for col, old in row_dict.items():
-            if not target_columns or col not in target_columns: continue
-            if old is None or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool']: continue
-
-            try:
-                vault = {}
-                safe_text = html.unescape(str(old).strip())
-                if "<" in safe_text:
-                    def hide(m):
-                        tk = f" __SHLD{len(vault)}__ "
-                        vault[tk.strip()] = m.group(0)
-                        return tk
-                    safe_text = html_regex.sub(hide, safe_text)
-                
-                final_text, _ = anonymize_value(col, safe_text, regras_mascara=regras_mascara)
-                final_text = str(final_text)
-
-                for tk, orig in vault.items():
-                    final_text = final_text.replace(f" {tk} ", orig).replace(tk, orig)
-                row_dict[col] = final_text
-            except Exception as e:
-                logger.error(f"⚠️ Erro coluna '{col}'.")
-                row_dict[col] = str(old)
-        processed.append(row_dict)
-    return processed 
+    for idx, r in enumerate(rows):
+        if idx % 50 == 0 and _check_abort(): break
+        for col, old in dict(r).items():
+            if col not in target_columns or not old or type(old).__name__ in ['date', 'datetime', 'Timestamp', 'bool']: continue
+            try: r[col] = _apply_shield(old, lambda c, s: anonymize_value(c, s, regras_mascara or {}), col)
+            except Exception: r[col] = "[SUPRIMIDO POR FALHA]"
+    return rows 
 
 def process_raw_text(text: str, regras_mascara=None) -> str:
-    if not text or not str(text).strip(): return text
-    if isinstance(regras_mascara, bool): regras_mascara = {"COORD": regras_mascara, "COORD_SINGLE": regras_mascara}
-    elif regras_mascara is None: regras_mascara = {}
-        
-    safe_text = str(text)
-    vault = {}
-    if "<" in safe_text:
-        def hide(m):
-            tk = f" __SHLD{len(vault)}__ "
-            vault[tk.strip()] = m.group(0)
-            return tk
-        safe_text = re.compile(r"<[^>]+>").sub(hide, safe_text)
-        
+    if not text: return text
     _COLUMN_POLICIES["RAW_TEXT_INJECTION"] = "TEXTO_LIVRE"
-    final_text, _ = anonymize_value("RAW_TEXT_INJECTION", safe_text, regras_mascara=regras_mascara)
-    final_text = str(final_text)
-    
-    for tk, orig in vault.items():
-        final_text = final_text.replace(f" {tk} ", orig).replace(tk, orig)
-    return final_text
+    return _apply_shield(text, lambda c, s: anonymize_value(c, s, regras_mascara or {}), "RAW_TEXT_INJECTION")
